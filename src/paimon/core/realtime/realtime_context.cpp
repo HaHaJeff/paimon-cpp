@@ -34,7 +34,8 @@ class RealtimeContext::Impl {
     explicit Impl(const std::shared_ptr<MemIndexerFactory>& factory) : factory_(factory) {}
 
     Result<std::shared_ptr<MemIndexer>> GetOrCreateMemIndexer(
-        const std::string& partition, int32_t bucket, std::unique_ptr<ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& partition, int32_t bucket,
+        std::unique_ptr<ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -79,8 +80,8 @@ RealtimeContext::RealtimeContext(std::unique_ptr<Impl>&& impl) : impl_(std::move
 RealtimeContext::~RealtimeContext() = default;
 
 Result<std::shared_ptr<MemIndexer>> RealtimeContext::GetOrCreateMemIndexer(
-    const std::string& partition, int32_t bucket, std::unique_ptr<ArrowSchema> write_schema,
-    const std::map<std::string, std::string>& options,
+    const std::map<std::string, std::string>& partition, int32_t bucket,
+    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     return impl_->GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
                                         memory_pool);

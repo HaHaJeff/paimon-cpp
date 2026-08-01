@@ -50,7 +50,8 @@ class PAIMON_EXPORT RealtimeContext {
 
     /// Returns the stable indexer associated with a partition and bucket, creating it if needed.
     Result<std::shared_ptr<MemIndexer>> GetOrCreateMemIndexer(
-        const std::string& partition, int32_t bucket, std::unique_ptr<::ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& partition, int32_t bucket,
+        std::unique_ptr<::ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool);
 

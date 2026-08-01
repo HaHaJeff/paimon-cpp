@@ -20,6 +20,7 @@
 
 #include <functional>
 #include <limits>
+#include <map>
 #include <vector>
 
 #include "arrow/c/bridge.h"
@@ -237,13 +238,15 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
         return std::shared_ptr<BatchWriter>(std::move(writer));
     }
 
-    PAIMON_ASSIGN_OR_RAISE(std::string partition_string,
-                           file_store_path_factory_->GetPartitionString(partition));
-    partition_string = PartitionBucket::NormalizePartition(std::move(partition_string));
+    std::vector<std::pair<std::string, std::string>> partition_values;
+    PAIMON_ASSIGN_OR_RAISE(partition_values,
+                           file_store_path_factory_->GeneratePartitionVector(partition));
+    std::map<std::string, std::string> partition_map(partition_values.begin(),
+                                                     partition_values.end());
     auto c_write_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*write_schema_, c_write_schema.get()));
     int64_t next_offset = 0;
-    PartitionBucket partition_bucket(partition_string, bucket);
+    PartitionBucket partition_bucket(partition_map, bucket);
     auto offset_iter = realtime_committed_offsets_.find(partition_bucket);
     if (offset_iter != realtime_committed_offsets_.end()) {
         if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
@@ -252,8 +255,8 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
         next_offset = offset_iter->second + 1;
     }
     return RealtimeAppendOnlyWriter::Create(
-        partition_string, bucket, std::move(c_write_schema), realtime_context_, writer,
-        write_schema_, realtime_write_schema_, options_.ToMap(), next_offset, pool_);
+        partition_map, bucket, std::move(c_write_schema), realtime_context_, writer, write_schema_,
+        realtime_write_schema_, options_.ToMap(), next_offset, pool_);
 }
 
 Result<AppendOnlyFileStoreWrite::WriterFactory> AppendOnlyFileStoreWrite::GetDataFileWriterFactory(

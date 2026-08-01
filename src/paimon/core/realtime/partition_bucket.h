@@ -17,22 +17,16 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 
-#include "paimon/common/utils/path_util.h"
-
 namespace paimon {
 
-/// Identifies one partition-bucket after normalizing the partition path.
+/// Identifies one partition-bucket by its logical partition values.
 struct PartitionBucket {
-    PartitionBucket(std::string partition, int32_t bucket)
-        : partition(NormalizePartition(std::move(partition))), bucket(bucket) {}
-
-    static std::string NormalizePartition(std::string partition) {
-        PathUtil::TrimLastDelim(&partition);
-        return partition;
-    }
+    PartitionBucket(std::map<std::string, std::string> partition, int32_t bucket)
+        : partition(std::move(partition)), bucket(bucket) {}
 
     bool operator<(const PartitionBucket& other) const {
         if (partition != other.partition) {
@@ -45,7 +39,7 @@ struct PartitionBucket {
         return partition == other.partition && bucket == other.bucket;
     }
 
-    std::string partition;
+    std::map<std::string, std::string> partition;
     int32_t bucket = -1;
 };
 

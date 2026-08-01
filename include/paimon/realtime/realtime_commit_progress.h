@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -34,8 +35,8 @@ namespace paimon {
 struct PAIMON_EXPORT RealtimeCommitProgress {
     /// Paimon commit message generated from one sealed segment.
     std::shared_ptr<CommitMessage> commit_message;
-    /// Partition path such as `dt=2`, or an empty string for an unpartitioned table.
-    std::string partition;
+    /// Logical partition values, or an empty map for an unpartitioned table.
+    std::map<std::string, std::string> partition;
     /// Bucket containing the sealed segment.
     int32_t bucket;
     /// Inclusive offset range represented by the commit message.

@@ -38,7 +38,8 @@
 namespace paimon {
 
 Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Create(
-    const std::string& partition, int32_t bucket, std::unique_ptr<::ArrowSchema> write_schema,
+    const std::map<std::string, std::string>& partition, int32_t bucket,
+    std::unique_ptr<::ArrowSchema> write_schema,
     const std::shared_ptr<RealtimeContext>& realtime_context,
     const std::shared_ptr<AppendOnlyWriter>& file_writer,
     const std::shared_ptr<arrow::Schema>& input_schema,

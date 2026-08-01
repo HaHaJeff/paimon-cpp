@@ -31,7 +31,6 @@
 #include "paimon/core/operation/file_system_write_restore.h"
 #include "paimon/core/operation/metrics/compaction_metrics.h"
 #include "paimon/core/operation/restore_files.h"
-#include "paimon/core/realtime/partition_bucket.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/snapshot.h"
 #include "paimon/core/table/bucket_mode.h"
@@ -315,9 +314,11 @@ Result<std::vector<RealtimeCommitProgress>> AbstractFileStoreWrite::PrepareRealt
         if (committable->IsEmpty()) {
             return Status::Invalid("sealed real-time segment produced an empty commit message");
         }
-        PAIMON_ASSIGN_OR_RAISE(std::string partition,
-                               file_store_path_factory_->GetPartitionString(snapshot.partition));
-        partition = PartitionBucket::NormalizePartition(std::move(partition));
+        std::vector<std::pair<std::string, std::string>> partition_values;
+        PAIMON_ASSIGN_OR_RAISE(partition_values, file_store_path_factory_->GeneratePartitionVector(
+                                                     snapshot.partition));
+        std::map<std::string, std::string> partition(partition_values.begin(),
+                                                     partition_values.end());
         result.push_back(RealtimeCommitProgress{committable, std::move(partition), snapshot.bucket,
                                                 increment.GetRealtimeOffsetRange().value()});
     }

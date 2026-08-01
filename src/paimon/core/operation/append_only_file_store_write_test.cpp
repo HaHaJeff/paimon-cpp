@@ -310,7 +310,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteFlushesOffsetColumn) {
     ASSERT_OK_AND_ASSIGN(auto first_prepared,
                          file_store_write->PrepareCommitWithProgress(/*commit_identifier=*/0));
     ASSERT_EQ(1, first_prepared.size());
-    ASSERT_EQ("", first_prepared[0].partition);
+    ASSERT_TRUE(first_prepared[0].partition.empty());
     ASSERT_EQ(0, first_prepared[0].bucket);
     ASSERT_EQ(Range(0, 1), first_prepared[0].offset_range);
     std::shared_ptr<DataFileMeta> first_file = OnlyNewFile({first_prepared[0].commit_message});
@@ -337,7 +337,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteFlushesOffsetColumn) {
     ASSERT_OK_AND_ASSIGN(auto second_prepared,
                          file_store_write->PrepareCommitWithProgress(/*commit_identifier=*/1));
     ASSERT_EQ(1, second_prepared.size());
-    ASSERT_EQ("", second_prepared[0].partition);
+    ASSERT_TRUE(second_prepared[0].partition.empty());
     ASSERT_EQ(0, second_prepared[0].bucket);
     ASSERT_EQ(Range(2, 2), second_prepared[0].offset_range);
     std::shared_ptr<DataFileMeta> second_file = OnlyNewFile({second_prepared[0].commit_message});

@@ -371,7 +371,8 @@ TEST_F(RealtimeWriteInteTest, TestMultiplePartitions) {
                          ReadCommittedOffsets());
     ASSERT_EQ(3, committed_offsets.size());
     for (int64_t partition_index = 0; partition_index < 3; ++partition_index) {
-        std::string partition = "pt=p" + std::to_string(partition_index);
+        std::map<std::string, std::string> partition = {
+            {"pt", "p" + std::to_string(partition_index)}};
         PartitionBucket partition_bucket(partition, /*bucket=*/0);
         ASSERT_EQ(9, committed_offsets.at(partition_bucket));
     }
@@ -406,7 +407,7 @@ TEST_F(RealtimeWriteInteTest, TestRestoreOffsetFromCommittedSnapshot) {
     FinalizeCommitAndCheck(second_writer.get(), std::move(second_commits),
                            /*prepare_identifier=*/1, std::move(expected_rows));
 
-    PartitionBucket partition_bucket("", /*bucket=*/0);
+    PartitionBucket partition_bucket(/*partition=*/{}, /*bucket=*/0);
     ASSERT_OK_AND_ASSIGN(RealtimeSnapshotProperties::OffsetMap second_committed_offsets,
                          ReadCommittedOffsets());
     ASSERT_EQ(4, second_committed_offsets.at(partition_bucket));

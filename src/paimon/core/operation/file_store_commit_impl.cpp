@@ -901,9 +901,8 @@ Status FileStoreCommitImpl::CommitWithProgress(
         if (!commit_message) {
             return Status::Invalid("fail to cast real-time commit message to impl");
         }
-        PAIMON_ASSIGN_OR_RAISE(std::string message_partition,
-                               path_factory_->GetPartitionString(commit_message->Partition()));
-        message_partition = PartitionBucket::NormalizePartition(std::move(message_partition));
+        std::map<std::string, std::string> message_partition;
+        PAIMON_ASSIGN_OR_RAISE(message_partition, PartitionToMap(commit_message->Partition()));
         if (message_partition != realtime_commit.partition ||
             commit_message->Bucket() != realtime_commit.bucket) {
             return Status::Invalid(

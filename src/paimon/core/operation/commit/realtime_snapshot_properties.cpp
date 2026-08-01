@@ -38,7 +38,7 @@ class OffsetEntryJson {
  public:
     OffsetEntryJson() = default;
 
-    OffsetEntryJson(std::string partition, int32_t bucket, int64_t offset)
+    OffsetEntryJson(std::map<std::string, std::string> partition, int32_t bucket, int64_t offset)
         : partition_(std::move(partition)), bucket_(bucket), offset_(offset) {}
 
     rapidjson::Value ToJson(rapidjson::Document::AllocatorType* allocator) const {
@@ -51,12 +51,13 @@ class OffsetEntryJson {
     }
 
     void FromJson(const rapidjson::Value& value) {
-        partition_ = RapidJsonUtil::DeserializeKeyValue<std::string>(value, "partition");
+        partition_ = RapidJsonUtil::DeserializeKeyValue<std::map<std::string, std::string>>(
+            value, "partition");
         bucket_ = RapidJsonUtil::DeserializeKeyValue<int32_t>(value, "bucket");
         offset_ = RapidJsonUtil::DeserializeKeyValue<int64_t>(value, "offset");
     }
 
-    const std::string& Partition() const {
+    const std::map<std::string, std::string>& Partition() const {
         return partition_;
     }
 
@@ -69,7 +70,7 @@ class OffsetEntryJson {
     }
 
  private:
-    std::string partition_;
+    std::map<std::string, std::string> partition_;
     int32_t bucket_ = -1;
     int64_t offset_ = -1;
 };
@@ -95,10 +96,8 @@ class OffsetsJson {
                     fmt::format("invalid bucket {} in offsets", partition_bucket.bucket));
             }
             if (offset < 0) {
-                throw std::invalid_argument(
-                    fmt::format("invalid offset {} for partition '{}' "
-                                "bucket {}",
-                                offset, partition_bucket.partition, partition_bucket.bucket));
+                throw std::invalid_argument(fmt::format("invalid offset {} for bucket {}", offset,
+                                                        partition_bucket.bucket));
             }
             entries.emplace_back(partition_bucket.partition, partition_bucket.bucket, offset);
         }
@@ -126,8 +125,7 @@ class OffsetsJson {
             PartitionBucket partition_bucket(entry.Partition(), entry.Bucket());
             if (!offsets_.emplace(std::move(partition_bucket), entry.Offset()).second) {
                 throw std::invalid_argument(
-                    fmt::format("duplicate partition '{}' bucket {} in offsets", entry.Partition(),
-                                entry.Bucket()));
+                    fmt::format("duplicate partition-bucket {} in offsets", entry.Bucket()));
             }
         }
     }
@@ -182,8 +180,7 @@ RealtimeSnapshotProperties::ValidateProgress(const std::vector<RealtimeCommitPro
         if (previous_offset == std::numeric_limits<int64_t>::max() ||
             commit.offset_range.from != previous_offset + 1) {
             return Status::Invalid(fmt::format(
-                "real-time commit offsets for partition '{}' bucket {} are not contiguous",
-                commit.partition, commit.bucket));
+                "real-time commit offsets for bucket {} are not contiguous", commit.bucket));
         }
 
         last_offsets[partition_bucket] = commit.offset_range.to;
