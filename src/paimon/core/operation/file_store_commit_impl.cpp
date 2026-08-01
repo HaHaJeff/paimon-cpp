@@ -66,6 +66,7 @@
 #include "paimon/core/operation/commit/commit_changes_provider.h"
 #include "paimon/core/operation/commit/compacted_changelog_path_resolver.h"
 #include "paimon/core/operation/commit/conflict_detection.h"
+#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
 #include "paimon/core/operation/commit/row_tracking_commit_utils.h"
 #include "paimon/core/operation/commit/sequence_snapshot_properties.h"
 #include "paimon/core/operation/expire_snapshots.h"
@@ -80,6 +81,7 @@
 #include "paimon/core/utils/duration.h"
 #include "paimon/core/utils/file_store_path_factory.h"
 #include "paimon/core/utils/snapshot_manager.h"
+#include "paimon/file_store_write.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/logging.h"
 #include "paimon/metrics.h"
@@ -383,7 +385,8 @@ Result<int32_t> FileStoreCommitImpl::FilterAndCommit(
     std::optional<int64_t> watermark) {
     std::vector<std::shared_ptr<ManifestCommittable>> committables;
     for (const auto& [identifier, msgs] : commit_identifier_and_messages) {
-        committables.push_back(CreateManifestCommittable(identifier, msgs, watermark));
+        committables.push_back(
+            CreateManifestCommittable(identifier, msgs, watermark, /*properties=*/{}));
     }
 
     std::vector<std::shared_ptr<ManifestCommittable>> sorted_committables = committables;
@@ -535,7 +538,7 @@ Status FileStoreCommitImpl::Overwrite(
     const std::vector<std::shared_ptr<CommitMessage>>& commit_messages, int64_t identifier,
     std::optional<int64_t> watermark) {
     std::shared_ptr<ManifestCommittable> committable =
-        CreateManifestCommittable(identifier, commit_messages, watermark);
+        CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
     PAIMON_LOG_INFO(logger_, "Ready to overwrite to table %s, number of commit messages: %zu",
                     table_name_.c_str(), committable->FileCommittables().size());
     PAIMON_ASSIGN_OR_RAISE(std::string committable_str, committable->ToString());
@@ -576,7 +579,7 @@ Result<int32_t> FileStoreCommitImpl::FilterAndOverwrite(
     const std::vector<std::shared_ptr<CommitMessage>>& commit_messages, int64_t identifier,
     std::optional<int64_t> watermark) {
     std::shared_ptr<ManifestCommittable> committable =
-        CreateManifestCommittable(identifier, commit_messages, watermark);
+        CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
     PAIMON_LOG_INFO(logger_, "Ready to overwrite to table %s, number of commit messages: %zu",
                     table_name_.c_str(), committable->FileCommittables().size());
     PAIMON_ASSIGN_OR_RAISE(std::string committable_str, committable->ToString());
@@ -872,7 +875,51 @@ Status FileStoreCommitImpl::Commit(
     const std::vector<std::shared_ptr<CommitMessage>>& commit_messages, int64_t identifier,
     std::optional<int64_t> watermark) {
     std::shared_ptr<ManifestCommittable> committable =
-        CreateManifestCommittable(identifier, commit_messages, watermark);
+        CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
+    return Commit(committable, /*check_append_files=*/false);
+}
+
+Status FileStoreCommitImpl::CommitWithProgress(
+    const std::vector<RealtimeCommitProgress>& realtime_commits, int64_t identifier,
+    std::optional<int64_t> watermark) {
+    PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
+                           snapshot_manager_->LatestSnapshot());
+    PAIMON_ASSIGN_OR_RAISE(RealtimeSnapshotProperties::OffsetMap committed_offsets,
+                           RealtimeSnapshotProperties::ReadOffsets(latest_snapshot, fs_));
+    PAIMON_ASSIGN_OR_RAISE(
+        RealtimeSnapshotProperties::ValidatedCommitProgress validated_progress,
+        RealtimeSnapshotProperties::ValidateProgress(realtime_commits, committed_offsets));
+
+    std::vector<std::shared_ptr<CommitMessage>> commit_messages;
+    commit_messages.reserve(validated_progress.ordered_commits.size());
+    for (const RealtimeCommitProgress& realtime_commit : validated_progress.ordered_commits) {
+        if (!realtime_commit.commit_message) {
+            return Status::Invalid("real-time commit message is null");
+        }
+        auto commit_message =
+            std::dynamic_pointer_cast<CommitMessageImpl>(realtime_commit.commit_message);
+        if (!commit_message) {
+            return Status::Invalid("fail to cast real-time commit message to impl");
+        }
+        PAIMON_ASSIGN_OR_RAISE(std::string message_partition,
+                               path_factory_->GetPartitionString(commit_message->Partition()));
+        message_partition = PartitionBucket::NormalizePartition(std::move(message_partition));
+        if (message_partition != realtime_commit.partition ||
+            commit_message->Bucket() != realtime_commit.bucket) {
+            return Status::Invalid(
+                "real-time commit progress does not match commit message partition and bucket");
+        }
+        commit_messages.push_back(realtime_commit.commit_message);
+    }
+
+    std::map<std::string, std::string> properties;
+    if (!validated_progress.delta_offsets.empty()) {
+        PAIMON_ASSIGN_OR_RAISE(
+            properties[RealtimeSnapshotProperties::kOffsetsDeltaKey],
+            RealtimeSnapshotProperties::SerializeOffsets(validated_progress.delta_offsets));
+    }
+    std::shared_ptr<ManifestCommittable> committable =
+        CreateManifestCommittable(identifier, commit_messages, watermark, properties);
     return Commit(committable, /*check_append_files=*/false);
 }
 
@@ -1193,7 +1240,12 @@ Result<bool> FileStoreCommitImpl::TryCommitOnce(
         statistics = std::nullopt;
     }
 
-    std::map<std::string, std::string> snapshot_properties = properties;
+    using SnapshotProperties = std::map<std::string, std::string>;
+    PAIMON_ASSIGN_OR_RAISE(
+        SnapshotProperties snapshot_properties,
+        RealtimeSnapshotProperties::MergeOffsets(
+            properties, latest_snapshot, fs_,
+            RealtimeSnapshotProperties::OffsetsDirectory(root_path_, snapshot_manager_->Branch())));
     if (options_.WriteSequenceNumberInitMode() == CoreOptions::SequenceNumberInitMode::SNAPSHOT) {
         PAIMON_ASSIGN_OR_RAISE(std::optional<int64_t> latest_max_sequence_number,
                                SequenceSnapshotProperties::MaxSequenceNumber(latest_snapshot));
@@ -1316,12 +1368,9 @@ void FileStoreCommitImpl::CleanUpTmpManifests(
 
 std::shared_ptr<ManifestCommittable> FileStoreCommitImpl::CreateManifestCommittable(
     int64_t identifier, const std::vector<std::shared_ptr<CommitMessage>>& commit_messages,
-    std::optional<int64_t> watermark) {
-    auto committable = std::make_shared<ManifestCommittable>(identifier, watermark);
-    for (const auto& commit_message : commit_messages) {
-        committable->AddFileCommittable(commit_message);
-    }
-    return committable;
+    std::optional<int64_t> watermark, const std::map<std::string, std::string>& properties) {
+    return std::make_shared<ManifestCommittable>(identifier, watermark, properties,
+                                                 commit_messages);
 }
 
 Result<ManifestEntryChanges> FileStoreCommitImpl::CollectChanges(

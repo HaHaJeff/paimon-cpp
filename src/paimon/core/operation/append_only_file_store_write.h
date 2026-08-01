@@ -32,6 +32,7 @@
 #include "paimon/core/core_options.h"
 #include "paimon/core/deletionvectors/deletion_vector.h"
 #include "paimon/core/operation/abstract_file_store_write.h"
+#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
 #include "paimon/core/table/bucket_mode.h"
 #include "paimon/file_store_write.h"
 #include "paimon/logging.h"
@@ -81,6 +82,8 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
         const std::shared_ptr<BucketedDvMaintainer::Factory>& dv_maintainer_factory,
         const std::shared_ptr<IOManager>& io_manager, const CoreOptions& options,
         bool ignore_previous_files, bool is_streaming_mode, bool ignore_num_bucket_check,
+        const std::shared_ptr<RealtimeContext>& realtime_context,
+        const RealtimeSnapshotProperties::OffsetMap& realtime_committed_offsets,
         const std::shared_ptr<Executor>& executor, const std::shared_ptr<MemoryPool>& pool);
     ~AppendOnlyFileStoreWrite() override;
 
@@ -110,6 +113,10 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
     Result<std::unique_ptr<FileStoreScan>> CreateFileStoreScan(
         const std::shared_ptr<ScanFilter>& filter) const override;
 
+    bool IsRealtimeWrite() const override {
+        return realtime_context_ != nullptr;
+    }
+
     Result<WriterFactory> GetDataFileWriterFactory(
         const std::shared_ptr<DataFilePathFactory>& data_file_path_factory,
         const std::shared_ptr<arrow::Schema>& schema,
@@ -121,6 +128,9 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
         const std::vector<std::shared_ptr<DataFileMeta>>& files) const;
 
     std::optional<std::vector<std::string>> write_cols_;
+    std::shared_ptr<arrow::Schema> realtime_write_schema_;
+    std::shared_ptr<RealtimeContext> realtime_context_;
+    RealtimeSnapshotProperties::OffsetMap realtime_committed_offsets_;
     std::unique_ptr<Logger> logger_;
 };
 

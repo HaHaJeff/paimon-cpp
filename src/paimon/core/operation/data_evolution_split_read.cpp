@@ -458,9 +458,8 @@ Result<std::unique_ptr<DataEvolutionFileReader>> DataEvolutionSplitRead::CreateU
         if (schema_id != data_schema->Id()) {
             PAIMON_ASSIGN_OR_RAISE(data_schema, schema_manager_->ReadSchema(schema_id));
         }
-        PAIMON_ASSIGN_OR_RAISE(
-            std::vector<DataField> data_fields,
-            ProjectFieldsForRowTrackingAndDataEvolution(data_schema, first_file->write_cols));
+        PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> data_fields,
+                               BuildDataFieldsForFieldMapping(data_schema, first_file->write_cols));
         std::vector<int32_t> data_field_ids = DataField::GetAllFieldIds(data_fields);
         std::vector<DataField> read_fields_in_file;
         for (int32_t read_field_idx = 0;

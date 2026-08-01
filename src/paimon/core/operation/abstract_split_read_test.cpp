@@ -48,7 +48,7 @@ TEST(AbstractSplitReadTest, TestNeedCompleteRowTrackingFields) {
                                                                   arrow::schema(fields)));
 }
 
-TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
+TEST(AbstractSplitReadTest, TestBuildDataFieldsForFieldMapping) {
     {
         // test no partition
         std::vector<DataField> fields = {DataField(0, arrow::field("name", arrow::utf8())),
@@ -62,10 +62,10 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
 
         {
             // test write_cols is std::nullopt
-            ASSERT_OK_AND_ASSIGN(auto result,
-                                 AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                     table_schema, /*write_cols=*/std::nullopt));
-            std::vector<DataField> expected = fields;
+            ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
+                                                  table_schema, /*write_cols=*/std::nullopt));
+            std::vector<DataField> expected = {SpecialFields::Offset()};
+            expected.insert(expected.end(), fields.begin(), fields.end());
             expected.push_back(SpecialFields::RowId());
             expected.push_back(SpecialFields::SequenceNumber());
             ASSERT_EQ(result, expected);
@@ -73,9 +73,8 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
         {
             // test with write_cols
             std::vector<std::string> write_cols = {"name", "age"};
-            ASSERT_OK_AND_ASSIGN(auto result,
-                                 AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                     table_schema, write_cols));
+            ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
+                                                  table_schema, write_cols));
             std::vector<DataField> expected = {fields[0], fields[2], SpecialFields::RowId(),
                                                SpecialFields::SequenceNumber()};
             ASSERT_EQ(result, expected);
@@ -83,9 +82,9 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
         {
             // test with empty write_cols
             std::vector<std::string> write_cols = {};
-            ASSERT_NOK_WITH_MSG(AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                    table_schema, write_cols),
-                                "write cols cannot be empty");
+            ASSERT_NOK_WITH_MSG(
+                AbstractSplitRead::BuildDataFieldsForFieldMapping(table_schema, write_cols),
+                "write cols cannot be empty");
         }
     }
     {
@@ -102,10 +101,10 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
 
         {
             // test write_cols is std::nullopt
-            ASSERT_OK_AND_ASSIGN(auto result,
-                                 AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                     table_schema, /*write_cols=*/std::nullopt));
-            std::vector<DataField> expected = fields;
+            ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
+                                                  table_schema, /*write_cols=*/std::nullopt));
+            std::vector<DataField> expected = {SpecialFields::Offset()};
+            expected.insert(expected.end(), fields.begin(), fields.end());
             expected.push_back(SpecialFields::RowId());
             expected.push_back(SpecialFields::SequenceNumber());
             ASSERT_EQ(result, expected);
@@ -113,9 +112,8 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
         {
             // test with write_cols and write_cols not contain partition fields
             std::vector<std::string> write_cols = {"name", "age"};
-            ASSERT_OK_AND_ASSIGN(auto result,
-                                 AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                     table_schema, write_cols));
+            ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
+                                                  table_schema, write_cols));
             std::vector<DataField> expected = {fields[0], fields[3], fields[1],
                                                SpecialFields::RowId(),
                                                SpecialFields::SequenceNumber()};
@@ -124,9 +122,8 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
         {
             // test with write_cols and write_cols contain partition fields
             std::vector<std::string> write_cols = {"age", "name", "ds"};
-            ASSERT_OK_AND_ASSIGN(auto result,
-                                 AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                     table_schema, write_cols));
+            ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
+                                                  table_schema, write_cols));
             std::vector<DataField> expected = {fields[3], fields[0], fields[1],
                                                SpecialFields::RowId(),
                                                SpecialFields::SequenceNumber()};
@@ -140,9 +137,8 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
                 SpecialFields::RowId().Name(),
                 SpecialFields::SequenceNumber().Name(),
             };
-            ASSERT_OK_AND_ASSIGN(auto result,
-                                 AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                     table_schema, write_cols));
+            ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
+                                                  table_schema, write_cols));
             std::vector<DataField> expected = {fields[3], fields[0], fields[1],
                                                SpecialFields::RowId(),
                                                SpecialFields::SequenceNumber()};
@@ -151,9 +147,9 @@ TEST(AbstractSplitReadTest, TestProjectFieldsForRowTrackingAndDataEvolution) {
         {
             // test with empty write_cols
             std::vector<std::string> write_cols = {};
-            ASSERT_NOK_WITH_MSG(AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
-                                    table_schema, write_cols),
-                                "write cols cannot be empty");
+            ASSERT_NOK_WITH_MSG(
+                AbstractSplitRead::BuildDataFieldsForFieldMapping(table_schema, write_cols),
+                "write cols cannot be empty");
         }
     }
 }

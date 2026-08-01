@@ -49,6 +49,12 @@ TEST(SpecialFieldsTest, TestRowIdField) {
     ASSERT_EQ(SpecialFields::RowId().Type()->id(), arrow::Type::INT64);
 }
 
+TEST(SpecialFieldsTest, TestOffsetField) {
+    ASSERT_EQ(SpecialFields::Offset().Id(), std::numeric_limits<int32_t>::max() - 10000 - 2);
+    ASSERT_EQ(SpecialFields::Offset().Name(), "_OFFSET");
+    ASSERT_EQ(SpecialFields::Offset().Type()->id(), arrow::Type::INT64);
+}
+
 TEST(SpecialFieldsTest, TestIndexScore) {
     ASSERT_EQ(SpecialFields::IndexScore().Id(), std::numeric_limits<int32_t>::max() - 10000 - 1);
     ASSERT_EQ(SpecialFields::IndexScore().Name(), "_INDEX_SCORE");
@@ -65,6 +71,7 @@ TEST(SpecialFieldsTest, TestIsSystemField) {
     ASSERT_FALSE(SpecialFields::IsSystemField("VALUE_KIND"));
     ASSERT_TRUE(SpecialFields::IsSystemField("rowkind"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_ROW_ID"));
+    ASSERT_TRUE(SpecialFields::IsSystemField("_OFFSET"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_INDEX_SCORE"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_KEY_0"));
 }

@@ -40,6 +40,9 @@ class MemoryPool;
 /// @see WriteContextBuilder
 class PAIMON_EXPORT WriteContext {
  public:
+    /// Constructs a write context with an optional real-time write context.
+    ///
+    /// Prefer `WriteContextBuilder`.
     WriteContext(const std::string& root_path, const std::string& commit_user,
                  bool is_streaming_mode, bool ignore_num_bucket_check, bool ignore_previous_files,
                  bool enable_multi_thread_spill, const std::optional<int32_t>& write_id,
@@ -48,6 +51,7 @@ class PAIMON_EXPORT WriteContext {
                  const std::shared_ptr<Executor>& executor, const std::string& temp_directory,
                  const std::shared_ptr<FileSystem>& specific_file_system,
                  const std::map<std::string, std::string>& fs_scheme_to_identifier_map,
+                 const std::shared_ptr<RealtimeContext>& realtime_context,
                  const std::map<std::string, std::string>& options);
 
     ~WriteContext();
@@ -112,6 +116,11 @@ class PAIMON_EXPORT WriteContext {
         return enable_multi_thread_spill_;
     }
 
+    /// Returns the configured real-time context, or `nullptr` when real-time writing is disabled.
+    std::shared_ptr<RealtimeContext> GetRealtimeContext() const {
+        return realtime_context_;
+    }
+
  private:
     std::string root_path_;
     std::string commit_user_;
@@ -127,6 +136,7 @@ class PAIMON_EXPORT WriteContext {
     std::string temp_directory_;
     std::shared_ptr<FileSystem> specific_file_system_;
     std::map<std::string, std::string> fs_scheme_to_identifier_map_;
+    std::shared_ptr<RealtimeContext> realtime_context_;
     std::map<std::string, std::string> options_;
 };
 
@@ -209,6 +219,12 @@ class PAIMON_EXPORT WriteContextBuilder {
     /// @return Reference to this builder for method chaining.
     /// @note If not set, use default file system (configured in `Options::FILE_SYSTEM`)
     WriteContextBuilder& WithFileSystem(const std::shared_ptr<FileSystem>& file_system);
+
+    /// Enables the real-time write path with the provided shared context.
+    /// @param realtime_context Non-null context that owns the real-time indexers.
+    /// @return Reference to this builder for method chaining.
+    WriteContextBuilder& WithRealtimeContext(
+        const std::shared_ptr<RealtimeContext>& realtime_context);
 
     /// Sets a mapping from URI schemes (e.g., "file", "oss") to registered file system
     /// identifiers. This allows selecting different pre-registered file system implementations

@@ -333,6 +333,7 @@ set(PAIMON_CORE_SRCS
     core/operation/commit/commit_changes_provider.cpp
     core/operation/commit/compacted_changelog_path_resolver.cpp
     core/operation/commit/overwrite_changes_provider.cpp
+    core/operation/commit/realtime_snapshot_properties.cpp
     core/operation/commit/row_id_column_conflict_checker.cpp
     core/operation/commit/manifest_entry_changes.cpp
     core/operation/commit/row_tracking_commit_utils.cpp
@@ -358,6 +359,10 @@ set(PAIMON_CORE_SRCS
     core/manifest/snapshot_live_manifest_entries.cpp
     core/operation/write_context.cpp
     core/operation/write_restore.cpp
+    core/realtime/arrow_mem_indexer.cpp
+    core/realtime/arrow_mem_indexer_factory.cpp
+    core/realtime/realtime_append_only_writer.cpp
+    core/realtime/realtime_context.cpp
     core/postpone/postpone_bucket_writer.cpp
     core/schema/arrow_schema_validator.cpp
     core/schema/schema_manager.cpp
@@ -794,6 +799,7 @@ if(PAIMON_BUILD_TESTS)
                     core/operation/commit/overwrite_changes_provider_test.cpp
                     core/operation/commit/row_id_column_conflict_checker_test.cpp
                     core/operation/commit/row_tracking_commit_utils_test.cpp
+                    core/operation/commit/realtime_snapshot_properties_test.cpp
                     core/operation/commit/sequence_snapshot_properties_test.cpp
                     core/operation/commit/retry_waiter_test.cpp
                     core/operation/key_value_file_store_write_test.cpp

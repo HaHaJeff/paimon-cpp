@@ -136,6 +136,9 @@ std::optional<DataField> InternalReadContext::TryResolveSpecialFieldById(
         }
         return std::nullopt;
     }
+    if (field_id == SpecialFields::Offset().Id()) {
+        return SpecialFields::Offset();
+    }
     if (field_id == SpecialFields::IndexScore().Id()) {
         if (core_options.DataEvolutionEnabled()) {
             return SpecialFields::IndexScore();
@@ -161,6 +164,9 @@ std::optional<DataField> InternalReadContext::TryResolveSpecialFieldByName(
             return SpecialFields::SequenceNumber();
         }
         return std::nullopt;
+    }
+    if (name == SpecialFields::Offset().Name()) {
+        return SpecialFields::Offset();
     }
     if (name == SpecialFields::IndexScore().Name()) {
         if (core_options.DataEvolutionEnabled()) {
