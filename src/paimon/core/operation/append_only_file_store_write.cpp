@@ -106,6 +106,29 @@ AppendOnlyFileStoreWrite::AppendOnlyFileStoreWrite(
 
 AppendOnlyFileStoreWrite::~AppendOnlyFileStoreWrite() = default;
 
+Status AppendOnlyFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {
+    if (!realtime_context_) {
+        return Status::Invalid("refresh committed snapshot requires a real-time writer");
+    }
+    PAIMON_ASSIGN_OR_RAISE(Snapshot snapshot, snapshot_manager_->LoadSnapshot(snapshot_id));
+    PAIMON_ASSIGN_OR_RAISE(
+        RealtimeSnapshotProperties::OffsetMap committed_offsets,
+        RealtimeSnapshotProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
+                                                options_.GetFileSystem()));
+    std::vector<RealtimePartitionBucketOffset> progress;
+    progress.reserve(committed_offsets.size());
+    for (const auto& [partition_bucket, offset] : committed_offsets) {
+        progress.push_back(RealtimePartitionBucketOffset{partition_bucket.partition,
+                                                         partition_bucket.bucket, offset});
+    }
+    PAIMON_RETURN_NOT_OK(realtime_context_->AdvanceCommittedProgress(snapshot_id, progress));
+    {
+        std::lock_guard<std::mutex> lock(realtime_offsets_mutex_);
+        realtime_committed_offsets_ = std::move(committed_offsets);
+    }
+    return Status::OK();
+}
+
 Result<std::unique_ptr<FileStoreScan>> AppendOnlyFileStoreWrite::CreateFileStoreScan(
     const std::shared_ptr<ScanFilter>& scan_filter) const {
     PAIMON_ASSIGN_OR_RAISE(
@@ -247,12 +270,15 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*write_schema_, c_write_schema.get()));
     int64_t next_offset = 0;
     PartitionBucket partition_bucket(partition_map, bucket);
-    auto offset_iter = realtime_committed_offsets_.find(partition_bucket);
-    if (offset_iter != realtime_committed_offsets_.end()) {
-        if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
-            return Status::Invalid("real-time offset has reached INT64_MAX");
+    {
+        std::lock_guard<std::mutex> lock(realtime_offsets_mutex_);
+        auto offset_iter = realtime_committed_offsets_.find(partition_bucket);
+        if (offset_iter != realtime_committed_offsets_.end()) {
+            if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
+                return Status::Invalid("real-time offset has reached INT64_MAX");
+            }
+            next_offset = offset_iter->second + 1;
         }
-        next_offset = offset_iter->second + 1;
     }
     return RealtimeAppendOnlyWriter::Create(
         partition_map, bucket, std::move(c_write_schema), realtime_context_, writer, write_schema_,

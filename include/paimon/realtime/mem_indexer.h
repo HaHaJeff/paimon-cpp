@@ -34,6 +34,7 @@ struct ArrowSchema;
 namespace paimon {
 
 class MemoryPool;
+class Predicate;
 
 /// A record batch and the contiguous offset range assigned to its rows.
 ///
@@ -57,6 +58,34 @@ class PAIMON_EXPORT RealtimeSegmentHandle {
 
     /// Returns the inclusive offset range covered by this segment.
     virtual Range GetOffsetRange() const = 0;
+};
+
+/// Opaque immutable view of the rows visible from one `MemIndexer`.
+///
+/// A view pins all referenced resources until the readers created from it are closed. Later
+/// writes, seals, and committed-offset reclamation do not change the contents of an existing view.
+class PAIMON_EXPORT MemReadView {
+ public:
+    virtual ~MemReadView() = default;
+
+    /// Returns the inclusive offset range visible in this view, or no range when it is empty.
+    virtual std::optional<Range> GetOffsetRange() const = 0;
+};
+
+/// Parameters used by a `MemIndexer` to create readers for a query.
+struct PAIMON_EXPORT MemQueryContext {
+    /// Requested output fields before the mandatory leading `_VALUE_KIND` field is added.
+    ///
+    /// The schema uses the Arrow C Data Interface and is valid only during
+    /// `CreateQueryReaders`. An implementation may consume it with an Arrow importer.
+    ::ArrowSchema* read_schema;
+    /// Predicate using field indexes from `read_schema`.
+    std::shared_ptr<Predicate> predicate;
+    /// Whether exact predicate filtering is enabled for the returned readers.
+    ///
+    /// Keep this disabled for primary-key merge-on-read. Filtering memory before PK merge may
+    /// remove the newest row and incorrectly expose an older disk row.
+    bool enable_predicate_filter;
 };
 
 /// Plugin interface for buffering real-time writes before Paimon data-file generation.
@@ -87,7 +116,27 @@ class PAIMON_EXPORT MemIndexer {
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
-    /// Returns the number of bytes currently retained by the building segment.
+    /// Acquires an immutable view containing the current sealed and building rows.
+    ///
+    /// This method may be called concurrently with query-reader creation and reclamation. It must
+    /// also provide a consistent snapshot when a write or seal is in progress.
+    virtual Result<std::shared_ptr<MemReadView>> AcquireReadView() = 0;
+
+    /// Creates readers over rows in `view` whose offsets are greater than
+    /// `offset_lower_exclusive`.
+    ///
+    /// Each output batch contains `_VALUE_KIND` first, followed by the fields requested by
+    /// `context.read_schema` except a duplicate `_VALUE_KIND`. `_OFFSET` is returned when requested
+    /// by the read schema. Concatenating all returned readers must produce every matching row once.
+    virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
+        const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
+        const MemQueryContext& context) = 0;
+
+    /// Releases this indexer's ownership of sealed segments fully covered by the committed offset.
+    /// Existing read views continue to keep their referenced resources alive.
+    virtual Status Reclaim(int64_t committed_offset) = 0;
+
+    /// Returns the number of bytes currently retained by building and sealed segments.
     virtual uint64_t GetMemoryUsage() const = 0;
 
     /// Releases resources owned by this indexer and rejects subsequent writes or seals.

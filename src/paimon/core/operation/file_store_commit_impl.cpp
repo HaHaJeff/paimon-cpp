@@ -401,7 +401,8 @@ Result<int32_t> FileStoreCommitImpl::FilterAndCommit(
     if (!retry_committables.empty()) {
         PAIMON_RETURN_NOT_OK(CheckFilesExistence(retry_committables));
         for (const auto& committable : retry_committables) {
-            PAIMON_RETURN_NOT_OK(Commit(committable, /*check_append_files=*/true));
+            PAIMON_RETURN_NOT_OK(Commit(committable, /*check_append_files=*/true,
+                                        /*retry_on_conflict=*/true));
         }
     }
     return retry_committables.size();
@@ -707,7 +708,8 @@ Status FileStoreCommitImpl::ExecuteOverwrite(
                                TryCommit(changes->compact_table_files, /*changelog_files=*/{},
                                          changes->compact_index_files, identifier, watermark,
                                          committable->Properties(), Snapshot::CommitKind::Compact(),
-                                         /*detect_conflicts=*/true));
+                                         /*detect_conflicts=*/true,
+                                         /*retry_on_conflict=*/true));
         *attempt += cnt;
         *generated_snapshot += 1;
     }
@@ -808,11 +810,12 @@ Result<int32_t> FileStoreCommitImpl::TryOverwrite(
     std::shared_ptr<CommitChangesProvider> changes_provider =
         commit_scanner_->OverwriteChangesProvider(partitions, changes, index_entries);
     return TryCommit(changes_provider, commit_identifier, watermark, properties,
-                     Snapshot::CommitKind::Overwrite(), /*detect_conflicts=*/true);
+                     Snapshot::CommitKind::Overwrite(), /*detect_conflicts=*/true,
+                     /*retry_on_conflict=*/true);
 }
 
 Status FileStoreCommitImpl::Commit(const std::shared_ptr<ManifestCommittable>& committable,
-                                   bool check_append_files) {
+                                   bool check_append_files, bool retry_on_conflict) {
     PAIMON_LOG_INFO(logger_, "Ready to commit to table %s, number of commit messages: %zu",
                     table_name_.c_str(), committable->FileCommittables().size());
     PAIMON_ASSIGN_OR_RAISE(std::string committable_str, committable->ToString());
@@ -853,7 +856,7 @@ Status FileStoreCommitImpl::Commit(const std::shared_ptr<ManifestCommittable>& c
             int32_t cnt, TryCommit(changes.append_table_files, changes.append_changelog,
                                    changes.append_index_files, committable->Identifier(),
                                    committable->Watermark(), committable->Properties(), commit_kind,
-                                   check_append_files));
+                                   check_append_files, retry_on_conflict));
         attempt += cnt;
         generated_snapshot += 1;
     }
@@ -864,7 +867,7 @@ Status FileStoreCommitImpl::Commit(const std::shared_ptr<ManifestCommittable>& c
                                          changes.compact_index_files, committable->Identifier(),
                                          committable->Watermark(), committable->Properties(),
                                          Snapshot::CommitKind::Compact(),
-                                         /*detect_conflicts=*/true));
+                                         /*detect_conflicts=*/true, retry_on_conflict));
         attempt += cnt;
         generated_snapshot += 1;
     }
@@ -876,7 +879,7 @@ Status FileStoreCommitImpl::Commit(
     std::optional<int64_t> watermark) {
     std::shared_ptr<ManifestCommittable> committable =
         CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
-    return Commit(committable, /*check_append_files=*/false);
+    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/true);
 }
 
 Status FileStoreCommitImpl::CommitWithProgress(
@@ -919,7 +922,7 @@ Status FileStoreCommitImpl::CommitWithProgress(
     }
     std::shared_ptr<ManifestCommittable> committable =
         CreateManifestCommittable(identifier, commit_messages, watermark, properties);
-    return Commit(committable, /*check_append_files=*/false);
+    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/false);
 }
 
 Result<int32_t> FileStoreCommitImpl::TryCommit(const std::vector<ManifestEntry>& delta_files,
@@ -928,17 +931,17 @@ Result<int32_t> FileStoreCommitImpl::TryCommit(const std::vector<ManifestEntry>&
                                                int64_t identifier, std::optional<int64_t> watermark,
                                                const std::map<std::string, std::string>& properties,
                                                Snapshot::CommitKind commit_kind,
-                                               bool detect_conflicts) {
+                                               bool detect_conflicts, bool retry_on_conflict) {
     std::shared_ptr<CommitChangesProvider> changes_provider =
         CommitChangesProvider::Provider(delta_files, changelog_files, index_entries);
     return TryCommit(changes_provider, identifier, watermark, properties, commit_kind,
-                     detect_conflicts);
+                     detect_conflicts, retry_on_conflict);
 }
 
 Result<int32_t> FileStoreCommitImpl::TryCommit(
     const std::shared_ptr<CommitChangesProvider>& changes_provider, int64_t identifier,
     std::optional<int64_t> watermark, const std::map<std::string, std::string>& properties,
-    Snapshot::CommitKind commit_kind, bool detect_conflicts) {
+    Snapshot::CommitKind commit_kind, bool detect_conflicts, bool retry_on_conflict) {
     int32_t retry_count = 0;
     int64_t start_millis = DateTimeUtils::GetCurrentUTCTimeUs() / 1000;
     while (true) {
@@ -953,6 +956,10 @@ Result<int32_t> FileStoreCommitImpl::TryCommit(
                           commit_kind, latest_snapshot, detect_conflicts));
         if (commit_success) {
             break;
+        }
+        if (!retry_on_conflict) {
+            // TODO(xinyu.lxy): Support failure recovery and idempotent retry for real-time commits.
+            return Status::Invalid("real-time commit failed due to snapshot conflict");
         }
         int64_t current_millis = DateTimeUtils::GetCurrentUTCTimeUs() / 1000;
         if (current_millis - start_millis > options_.GetCommitTimeout() ||

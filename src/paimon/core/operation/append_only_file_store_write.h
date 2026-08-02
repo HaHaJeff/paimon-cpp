@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -87,6 +88,8 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
         const std::shared_ptr<Executor>& executor, const std::shared_ptr<MemoryPool>& pool);
     ~AppendOnlyFileStoreWrite() override;
 
+    Status RefreshCommittedSnapshot(int64_t snapshot_id) override;
+
     /// Rewrites the given files into new compacted files.
     ///
     /// @param partition The partition of the files.
@@ -130,6 +133,7 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
     std::optional<std::vector<std::string>> write_cols_;
     std::shared_ptr<arrow::Schema> realtime_write_schema_;
     std::shared_ptr<RealtimeContext> realtime_context_;
+    mutable std::mutex realtime_offsets_mutex_;
     RealtimeSnapshotProperties::OffsetMap realtime_committed_offsets_;
     std::unique_ptr<Logger> logger_;
 };

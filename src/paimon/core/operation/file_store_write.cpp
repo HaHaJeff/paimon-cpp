@@ -60,6 +60,10 @@ Result<std::vector<RealtimeCommitProgress>> FileStoreWrite::PrepareCommitWithPro
     return Status::Invalid("prepare commit with progress requires a real-time writer");
 }
 
+Status FileStoreWrite::RefreshCommittedSnapshot(int64_t) {
+    return Status::Invalid("refresh committed snapshot requires a real-time writer");
+}
+
 Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<WriteContext> ctx) {
     if (ctx == nullptr) {
         return Status::Invalid("write context is null pointer");
@@ -177,12 +181,13 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                 std::make_shared<BucketedDvMaintainer::Factory>(index_file_handler);
         }
 
-        return std::make_unique<AppendOnlyFileStoreWrite>(
+        auto file_store_write = std::make_unique<AppendOnlyFileStoreWrite>(
             file_store_path_factory, snapshot_manager, schema_manager, ctx->GetCommitUser(),
             ctx->GetRootPath(), schema, arrow_schema, write_schema, partition_schema,
             dv_maintainer_factory, io_manager, options, ignore_previous_files,
             ctx->IsStreamingMode(), ctx->IgnoreNumBucketCheck(), ctx->GetRealtimeContext(),
             realtime_committed_offsets, ctx->GetExecutor(), ctx->GetMemoryPool());
+        return std::unique_ptr<FileStoreWrite>(std::move(file_store_write));
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {

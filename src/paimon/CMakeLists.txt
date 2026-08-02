@@ -391,6 +391,7 @@ set(PAIMON_CORE_SRCS
     core/table/source/merge_tree_split_generator.cpp
     core/table/source/data_evolution_split_generator.cpp
     core/table/source/plan_impl.cpp
+    core/table/source/realtime_table_scan.cpp
     core/table/source/snapshot/snapshot_reader.cpp
     core/table/source/startup_mode.cpp
     core/table/source/table_read.cpp

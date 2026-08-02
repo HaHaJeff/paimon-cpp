@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "paimon/result.h"
 #include "paimon/visibility.h"
@@ -30,13 +31,36 @@ namespace paimon {
 
 class MemIndexer;
 class MemIndexerFactory;
+class MemReadView;
 class MemoryPool;
+
+/// One partition-bucket and the immutable plugin view captured for a table scan.
+struct PAIMON_EXPORT RealtimePartitionBucketView {
+    /// Logical partition values, before partition-path escaping.
+    std::map<std::string, std::string> partition;
+    /// Fixed bucket id.
+    int32_t bucket;
+    /// Plugin instance that creates readers from `read_view`.
+    std::shared_ptr<MemIndexer> indexer;
+    /// Immutable rows pinned for one query plan.
+    std::shared_ptr<MemReadView> read_view;
+};
+
+/// Committed progress for one partition-bucket loaded from a Paimon snapshot.
+struct PAIMON_EXPORT RealtimePartitionBucketOffset {
+    /// Logical partition values, before partition-path escaping.
+    std::map<std::string, std::string> partition;
+    /// Fixed bucket id.
+    int32_t bucket;
+    /// Largest `_OFFSET` committed for this partition-bucket.
+    int64_t offset;
+};
 
 /// Shared context that owns the `MemIndexer` instances used by a real-time writer.
 ///
-/// Applications attach one context to `WriteContext`. The context uses either the default Arrow
-/// implementation or an application-provided factory and keeps each created indexer available
-/// across multiple writes and prepare-commit operations.
+/// Applications share one context between `WriteContext` and `ScanContext`. The context uses
+/// either the default Arrow implementation or an application-provided factory and keeps each
+/// created indexer available across writes, prepare-commit operations, and process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
     /// Creates a context backed by Paimon's default Arrow `MemIndexer`.
@@ -54,6 +78,20 @@ class PAIMON_EXPORT RealtimeContext {
         std::unique_ptr<::ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool);
+
+    /// Captures an immutable read view from every currently registered indexer.
+    ///
+    /// The indexer registry is fixed during this call and each returned plugin view is stable. New
+    /// partition-buckets registered after this call are not visible in that query.
+    Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews();
+
+    /// Advances the committed progress visible to the registered memory indexers.
+    ///
+    /// Calls are idempotent for the same snapshot and must advance snapshot ids monotonically.
+    /// Each indexer may release sealed data covered by its committed offset. Existing read views
+    /// continue to pin referenced resources until their readers are closed.
+    Status AdvanceCommittedProgress(
+        int64_t snapshot_id, const std::vector<RealtimePartitionBucketOffset>& committed_offsets);
 
     ~RealtimeContext();
 

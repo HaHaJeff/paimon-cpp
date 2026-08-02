@@ -36,7 +36,7 @@ Result<std::shared_ptr<MemIndexer>> ArrowMemIndexerFactory::Create(
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> imported_schema,
                                       arrow::ImportSchema(write_schema));
     std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(memory_pool);
-    return std::make_shared<ArrowMemIndexer>(imported_schema, arrow_pool);
+    return std::make_shared<ArrowMemIndexer>(imported_schema, memory_pool, arrow_pool);
 }
 
 }  // namespace paimon

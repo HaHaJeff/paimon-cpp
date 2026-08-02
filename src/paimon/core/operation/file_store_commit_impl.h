@@ -147,7 +147,7 @@ class FileStoreCommitImpl : public FileStoreCommit {
 
  private:
     Status Commit(const std::shared_ptr<ManifestCommittable>& manifest_committable,
-                  bool check_append_files);
+                  bool check_append_files, bool retry_on_conflict);
 
     Result<int32_t> TryOverwrite(const std::vector<std::map<std::string, std::string>>& partition,
                                  const std::vector<ManifestEntry>& changes,
@@ -188,12 +188,14 @@ class FileStoreCommitImpl : public FileStoreCommit {
                               const std::vector<IndexManifestEntry>& index_entries,
                               int64_t identifier, std::optional<int64_t> watermark,
                               const std::map<std::string, std::string>& properties,
-                              Snapshot::CommitKind commit_kind, bool detect_conflicts);
+                              Snapshot::CommitKind commit_kind, bool detect_conflicts,
+                              bool retry_on_conflict);
 
     Result<int32_t> TryCommit(const std::shared_ptr<CommitChangesProvider>& changes_provider,
                               int64_t identifier, std::optional<int64_t> watermark,
                               const std::map<std::string, std::string>& properties,
-                              Snapshot::CommitKind commit_kind, bool detect_conflicts);
+                              Snapshot::CommitKind commit_kind, bool detect_conflicts,
+                              bool retry_on_conflict);
 
     Result<bool> TryCommitOnce(const std::vector<ManifestEntry>& delta_files,
                                const std::vector<ManifestEntry>& changelog_files,

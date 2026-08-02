@@ -18,7 +18,9 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include "paimon/arrow/abi.h"
 #include "paimon/core/realtime/partition_bucket.h"
@@ -57,10 +59,51 @@ class RealtimeContext::Impl {
         return indexer;
     }
 
+    Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<RealtimePartitionBucketView> result;
+        result.reserve(indexers_.size());
+        for (const auto& [partition_bucket, indexer] : indexers_) {
+            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemReadView> read_view,
+                                   indexer->AcquireReadView());
+            result.push_back(RealtimePartitionBucketView{
+                partition_bucket.partition, partition_bucket.bucket, indexer,
+                std::move(read_view)});
+        }
+        return result;
+    }
+
+    Status AdvanceCommittedProgress(
+        int64_t snapshot_id,
+        const std::vector<RealtimePartitionBucketOffset>& committed_offsets) {
+        if (snapshot_id < 0) {
+            return Status::Invalid("real-time refresh snapshot id must not be negative");
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (last_refreshed_snapshot_id_ && snapshot_id < last_refreshed_snapshot_id_.value()) {
+            return Status::Invalid("real-time committed snapshot cannot move backwards");
+        }
+        if (last_refreshed_snapshot_id_ && snapshot_id == last_refreshed_snapshot_id_.value()) {
+            return Status::OK();
+        }
+        for (const RealtimePartitionBucketOffset& committed : committed_offsets) {
+            if (committed.bucket < 0 || committed.offset < 0) {
+                return Status::Invalid("invalid partition-bucket committed offset");
+            }
+            auto iter = indexers_.find(PartitionBucket(committed.partition, committed.bucket));
+            if (iter != indexers_.end()) {
+                PAIMON_RETURN_NOT_OK(iter->second->Reclaim(committed.offset));
+            }
+        }
+        last_refreshed_snapshot_id_ = snapshot_id;
+        return Status::OK();
+    }
+
  private:
     std::shared_ptr<MemIndexerFactory> factory_;
     std::mutex mutex_;
     std::map<PartitionBucket, std::shared_ptr<MemIndexer>> indexers_;
+    std::optional<int64_t> last_refreshed_snapshot_id_;
 };
 
 Result<std::shared_ptr<RealtimeContext>> RealtimeContext::Create() {
@@ -85,6 +128,16 @@ Result<std::shared_ptr<MemIndexer>> RealtimeContext::GetOrCreateMemIndexer(
     const std::shared_ptr<MemoryPool>& memory_pool) {
     return impl_->GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
                                         memory_pool);
+}
+
+Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadViews() {
+    return impl_->AcquireReadViews();
+}
+
+Status RealtimeContext::AdvanceCommittedProgress(
+    int64_t snapshot_id,
+    const std::vector<RealtimePartitionBucketOffset>& committed_offsets) {
+    return impl_->AdvanceCommittedProgress(snapshot_id, committed_offsets);
 }
 
 }  // namespace paimon

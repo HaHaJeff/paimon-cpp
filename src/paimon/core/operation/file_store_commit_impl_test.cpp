@@ -1773,7 +1773,8 @@ TEST_F(FileStoreCommitImplTest, TestFilterCommitted) {
     ASSERT_EQ(filtered_committables.size(), committables.size());
 
     // Test with a previous snapshot
-    ASSERT_OK(commit_impl->Commit(committable, /*check_append_files=*/false));
+    ASSERT_OK(commit_impl->Commit(committable, /*check_append_files=*/false,
+                                  /*retry_on_conflict=*/true));
     ASSERT_OK_AND_ASSIGN(filtered_committables, commit_impl->FilterCommitted(committables));
     ASSERT_EQ(filtered_committables.size(), 0);
 }
@@ -1812,7 +1813,8 @@ TEST_F(FileStoreCommitImplTest, TestFilterCommittedWithMultipleCommittables) {
     ASSERT_EQ(filtered_committables.size(), committables.size());
 
     // Test with a previous snapshot
-    ASSERT_OK(commit_impl->Commit(committable1, /*check_append_files=*/false));
+    ASSERT_OK(commit_impl->Commit(committable1, /*check_append_files=*/false,
+                                  /*retry_on_conflict=*/true));
     ASSERT_OK_AND_ASSIGN(filtered_committables, commit_impl->FilterCommitted(committables));
     ASSERT_EQ(filtered_committables.size(), 1);
     ASSERT_EQ(filtered_committables[0]->Identifier(), committable2->Identifier());

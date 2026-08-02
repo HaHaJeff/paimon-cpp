@@ -103,6 +103,12 @@ class PAIMON_EXPORT FileStoreWrite {
     virtual Result<std::vector<RealtimeCommitProgress>> PrepareCommitWithProgress(
         int64_t commit_identifier);
 
+    /// Refreshes a real-time writer after `snapshot_id` has committed successfully.
+    ///
+    /// The writer loads the snapshot's partition-bucket offsets and releases sealed memory that is
+    /// fully covered by disk. Calling this method on a non-real-time writer returns an error.
+    virtual Status RefreshCommittedSnapshot(int64_t snapshot_id);
+
     virtual std::shared_ptr<Metrics> GetMetrics() const = 0;
     virtual Status Close() = 0;
 };
