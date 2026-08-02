@@ -66,16 +66,15 @@ class RealtimeContext::Impl {
         for (const auto& [partition_bucket, indexer] : indexers_) {
             PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemReadView> read_view,
                                    indexer->AcquireReadView());
-            result.push_back(RealtimePartitionBucketView{
-                partition_bucket.partition, partition_bucket.bucket, indexer,
-                std::move(read_view)});
+            result.push_back(RealtimePartitionBucketView{partition_bucket.partition,
+                                                         partition_bucket.bucket, indexer,
+                                                         std::move(read_view)});
         }
         return result;
     }
 
     Status AdvanceCommittedProgress(
-        int64_t snapshot_id,
-        const std::vector<RealtimePartitionBucketOffset>& committed_offsets) {
+        int64_t snapshot_id, const std::vector<RealtimePartitionBucketOffset>& committed_offsets) {
         if (snapshot_id < 0) {
             return Status::Invalid("real-time refresh snapshot id must not be negative");
         }
@@ -135,8 +134,7 @@ Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadVie
 }
 
 Status RealtimeContext::AdvanceCommittedProgress(
-    int64_t snapshot_id,
-    const std::vector<RealtimePartitionBucketOffset>& committed_offsets) {
+    int64_t snapshot_id, const std::vector<RealtimePartitionBucketOffset>& committed_offsets) {
     return impl_->AdvanceCommittedProgress(snapshot_id, committed_offsets);
 }
 

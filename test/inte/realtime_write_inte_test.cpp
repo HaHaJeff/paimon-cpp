@@ -265,9 +265,10 @@ class RealtimeWriteInteTest : public ::testing::Test {
         return scan->CreatePlan();
     }
 
-    Result<CollectedReadResult> ReadPlan(
-        const std::shared_ptr<Plan>& plan, const std::vector<std::string>& read_fields,
-        const std::shared_ptr<Predicate>& predicate, bool enable_predicate_filter) const {
+    Result<CollectedReadResult> ReadPlan(const std::shared_ptr<Plan>& plan,
+                                         const std::vector<std::string>& read_fields,
+                                         const std::shared_ptr<Predicate>& predicate,
+                                         bool enable_predicate_filter) const {
         ReadContextBuilder read_builder(table_path_);
         read_builder.SetOptions(options_)
             .SetReadFieldNames(read_fields)
@@ -618,10 +619,9 @@ TEST_F(RealtimeWriteInteTest, TestDiskPredicatePushdownWithoutMemoryFiltering) {
     ASSERT_OK(writer->Write(std::move(memory_batch)));
 
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan, CreatePlan(realtime_context, predicate));
-    ASSERT_OK_AND_ASSIGN(
-        CollectedReadResult result,
-        ReadPlan(plan, {"id", "payload", "pt"}, predicate,
-                 /*enable_predicate_filter=*/false));
+    ASSERT_OK_AND_ASSIGN(CollectedReadResult result,
+                         ReadPlan(plan, {"id", "payload", "pt"}, predicate,
+                                  /*enable_predicate_filter=*/false));
     std::shared_ptr<arrow::DataType> result_type = arrow::struct_(
         {arrow::field("_VALUE_KIND", arrow::int8()), arrow::field("id", arrow::int64()),
          arrow::field("payload", arrow::utf8()), arrow::field("pt", arrow::utf8())});
@@ -816,8 +816,8 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
 
     std::thread write_thread([&]() {
         state.WaitForStart();
-        for (int64_t batch_index = 0;
-             batch_index < kBatchCount && !state.ShouldStop(); ++batch_index) {
+        for (int64_t batch_index = 0; batch_index < kBatchCount && !state.ShouldStop();
+             ++batch_index) {
             std::vector<Row> rows =
                 MakeRows(batch_index * kRowsPerBatch, kRowsPerBatch, /*partition=*/"p0");
             Result<std::unique_ptr<RecordBatch>> batch_result =
@@ -833,13 +833,11 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
             // Pause midway until one refresh completes to guarantee write and refresh overlap.
             if (batch_index + 1 == kBatchCount / 2) {
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-                while (refresh_count.load(std::memory_order_acquire) == 0 &&
-                       !state.ShouldStop() &&
+                while (refresh_count.load(std::memory_order_acquire) == 0 && !state.ShouldStop() &&
                        std::chrono::steady_clock::now() < deadline) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
-                if (refresh_count.load(std::memory_order_acquire) == 0 &&
-                    !state.ShouldStop()) {
+                if (refresh_count.load(std::memory_order_acquire) == 0 && !state.ShouldStop()) {
                     state.RecordError("timed out waiting for a refresh while writing");
                     break;
                 }
@@ -863,8 +861,7 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
                 }
                 enqueue_prepared_commits(std::move(result).value());
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            } while (!writer_done.load(std::memory_order_acquire) &&
-                     !state.ShouldStop());
+            } while (!writer_done.load(std::memory_order_acquire) && !state.ShouldStop());
         });
     }
 
@@ -877,8 +874,7 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
             {
                 std::unique_lock<std::mutex> lock(state.mutex);
                 state.progress_cv.wait(lock, [&]() {
-                    return state.ShouldStop() ||
-                           pending_commits.count(next_offset) > 0 ||
+                    return state.ShouldStop() || pending_commits.count(next_offset) > 0 ||
                            prepare_done.load(std::memory_order_acquire);
                 });
                 if (state.ShouldStop()) {
@@ -963,8 +959,7 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
     for (int32_t thread_index = 0; thread_index < kReadThreadCount; ++thread_index) {
         read_threads.emplace_back([&, thread_index]() {
             state.WaitForStart();
-            while (!refresh_done.load(std::memory_order_acquire) &&
-                   !state.ShouldStop()) {
+            while (!refresh_done.load(std::memory_order_acquire) && !state.ShouldStop()) {
                 Result<std::vector<ReadRow>> result = ReadRows(realtime_context);
                 ++read_call_counts[thread_index];
                 if (state.RecordErrorIfNotOk(result)) {
@@ -1002,8 +997,7 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
         thread.join();
     }
 
-    ASSERT_TRUE(state.Errors().empty())
-        << (state.Errors().empty() ? "" : state.Errors().front());
+    ASSERT_TRUE(state.Errors().empty()) << (state.Errors().empty() ? "" : state.Errors().front());
     for (int32_t call_count : prepare_call_counts) {
         ASSERT_GT(call_count, 0);
     }
@@ -1079,13 +1073,11 @@ TEST_F(RealtimeWriteInteTest, TestMultipleBucketsRestoreIndependentOffsets) {
     CreateTable(/*partition_keys=*/{});
 
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer, CreateRealtimeWriter());
-    std::vector<Row> bucket0_disk_rows =
-        MakeRows(/*first_id=*/0, /*count=*/2, /*partition=*/"p0");
+    std::vector<Row> bucket0_disk_rows = MakeRows(/*first_id=*/0, /*count=*/2, /*partition=*/"p0");
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> bucket0_disk_batch,
                          MakeBatch(bucket0_disk_rows, /*partitioned=*/false, /*bucket=*/0));
     ASSERT_OK(first_writer->Write(std::move(bucket0_disk_batch)));
-    std::vector<Row> bucket1_disk_rows =
-        MakeRows(/*first_id=*/10, /*count=*/3, /*partition=*/"p0");
+    std::vector<Row> bucket1_disk_rows = MakeRows(/*first_id=*/10, /*count=*/3, /*partition=*/"p0");
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> bucket1_disk_batch,
                          MakeBatch(bucket1_disk_rows, /*partitioned=*/false, /*bucket=*/1));
     ASSERT_OK(first_writer->Write(std::move(bucket1_disk_batch)));
@@ -1120,8 +1112,8 @@ TEST_F(RealtimeWriteInteTest, TestMultipleBucketsRestoreIndependentOffsets) {
     ASSERT_EQ(Range(3, 3), prepared_ranges.at(1));
 
     ASSERT_OK_AND_ASSIGN(std::vector<ReadRow> actual_rows, ReadRows(realtime_context));
-    std::map<int64_t, int64_t> expected_offsets = {
-        {0, 0}, {1, 1}, {2, 2}, {10, 0}, {11, 1}, {12, 2}, {13, 3}};
+    std::map<int64_t, int64_t> expected_offsets = {{0, 0},  {1, 1},  {2, 2}, {10, 0},
+                                                   {11, 1}, {12, 2}, {13, 3}};
     ASSERT_EQ(expected_offsets.size(), actual_rows.size());
     for (const ReadRow& row : actual_rows) {
         const auto& [offset, id, payload, partition] = row;
