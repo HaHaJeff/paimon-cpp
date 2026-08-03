@@ -24,7 +24,6 @@
 #include "arrow/c/bridge.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/reader/complete_row_kind_batch_reader.h"
-#include "paimon/common/reader/predicate_batch_reader.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/row_kind.h"
 #include "paimon/common/utils/arrow/status_utils.h"
@@ -360,20 +359,13 @@ Result<std::vector<std::unique_ptr<BatchReader>>> ArrowMemIndexer::CreateQueryRe
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> read_schema,
                                       arrow::ImportSchema(context.read_schema));
-    // TODO(xinyu.lxy): support batch stats
-    // Now, the default Arrow indexer has no batch statistics or index metadata yet, so its inner
-    // query reader intentionally ignores context.predicate instead of using it for candidate
-    // pruning.
+    // TODO(xinyu.lxy): Support predicate pushdown after adding batch statistics or index metadata.
+    // The default Arrow indexer currently ignores context.predicate and
+    // context.enable_predicate_pushdown, and returns all offset-matching rows as candidates.
     std::vector<std::unique_ptr<BatchReader>> readers;
     if (arrow_view->GetOffsetRange() && arrow_view->GetOffsetRange()->to > offset_lower_exclusive) {
         std::unique_ptr<BatchReader> reader = std::make_unique<QueryBatchReader>(
             arrow_view, offset_lower_exclusive, read_schema, arrow_pool_);
-        if (context.enable_predicate_filter && context.predicate) {
-            PAIMON_ASSIGN_OR_RAISE(
-                std::unique_ptr<PredicateBatchReader> predicate_reader,
-                PredicateBatchReader::Create(std::move(reader), context.predicate, memory_pool_));
-            reader = std::move(predicate_reader);
-        }
         readers.push_back(
             std::make_unique<CompleteRowKindBatchReader>(std::move(reader), memory_pool_));
     }

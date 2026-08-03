@@ -24,6 +24,7 @@
 
 #include "arrow/c/bridge.h"
 #include "paimon/common/reader/concat_batch_reader.h"
+#include "paimon/common/reader/predicate_batch_reader.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
@@ -81,12 +82,18 @@ Result<std::unique_ptr<BatchReader>> AppendOnlyTableRead::CreateReader(
         }
     });
     MemQueryContext query_context{c_read_schema.get(), context_->GetPredicate(),
-                                  context_->EnablePredicateFilter()};
+                                  /*enable_predicate_pushdown=*/true};
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<std::unique_ptr<BatchReader>> memory_readers,
         realtime_split->Indexer()->CreateQueryReaders(
             realtime_split->ReadView(), realtime_split->CommittedOffset(), query_context));
+
     for (std::unique_ptr<BatchReader>& memory_reader : memory_readers) {
+        if (context_->EnablePredicateFilter() && context_->GetPredicate()) {
+            PAIMON_ASSIGN_OR_RAISE(memory_reader, PredicateBatchReader::Create(
+                                                      std::move(memory_reader),
+                                                      context_->GetPredicate(), GetMemoryPool()));
+        }
         readers.push_back(std::move(memory_reader));
     }
     return std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());

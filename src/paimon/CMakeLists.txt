@@ -743,6 +743,8 @@ if(PAIMON_BUILD_TESTS)
                     core/manifest/index_manifest_entry_serializer_test.cpp
                     core/manifest/index_manifest_file_handler_test.cpp
                     core/memory/writer_memory_manager_test.cpp
+                    core/realtime/arrow_mem_indexer_test.cpp
+                    core/realtime/realtime_context_test.cpp
                     core/mergetree/levels_test.cpp
                     core/mergetree/lookup_file_test.cpp
                     core/mergetree/lookup_levels_test.cpp

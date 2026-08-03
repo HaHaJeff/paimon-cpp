@@ -81,11 +81,12 @@ struct PAIMON_EXPORT MemQueryContext {
     ::ArrowSchema* read_schema;
     /// Predicate using field indexes from `read_schema`.
     std::shared_ptr<Predicate> predicate;
-    /// Whether exact predicate filtering is enabled for the returned readers.
+    /// Whether the plugin may use `predicate` to prune candidate rows.
     ///
-    /// Keep this disabled for primary-key merge-on-read. Filtering memory before PK merge may
-    /// remove the newest row and incorrectly expose an older disk row.
-    bool enable_predicate_filter;
+    /// Keep this disabled for primary-key merge-on-read. Pruning memory before PK merge may remove
+    /// the newest row and incorrectly expose an older disk row. Exact predicate filtering, when
+    /// requested, is applied by the Paimon read framework after plugin reader creation.
+    bool enable_predicate_pushdown;
 };
 
 /// Plugin interface for buffering real-time writes before Paimon data-file generation.
