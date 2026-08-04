@@ -60,12 +60,6 @@ struct SpecialFields {
         return data_field;
     }
 
-    static const DataField& Offset() {
-        static const DataField data_field =
-            DataField(SpecialFieldIds::OFFSET, arrow::field("_OFFSET", arrow::int64()));
-        return data_field;
-    }
-
     static const DataField& IndexScore() {
         static const DataField data_field =
             DataField(SpecialFieldIds::INDEX_SCORE, arrow::field("_INDEX_SCORE", arrow::float32()));
@@ -78,7 +72,7 @@ struct SpecialFields {
         }
         return field_name == SequenceNumber().Name() || field_name == ValueKind().Name() ||
                field_name == RowKind().Name() || field_name == RowId().Name() ||
-               field_name == Offset().Name() || field_name == IndexScore().Name();
+               field_name == IndexScore().Name();
     }
 
     // TODO(xinyu.lxy): add a func to complete row-tracking fields

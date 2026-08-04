@@ -141,7 +141,9 @@ class RealtimeWriteInteTest : public ::testing::Test {
         dir_ = UniqueTestDirectory::Create("local");
         ASSERT_NE(nullptr, dir_);
         table_path_ = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
-        fields_ = {arrow::field("id", arrow::int64()), arrow::field("payload", arrow::utf8()),
+        fields_ = {arrow::field(RealtimeContext::kOffsetFieldName, arrow::int64(),
+                                /*nullable=*/false),
+                   arrow::field("id", arrow::int64()), arrow::field("payload", arrow::utf8()),
                    arrow::field("pt", arrow::utf8())};
         schema_ = arrow::schema(fields_);
         options_ = {
@@ -156,13 +158,16 @@ class RealtimeWriteInteTest : public ::testing::Test {
     }
 
     void CreateTable(const std::vector<std::string>& partition_keys) const {
-        ArrowSchema c_schema;
-        ASSERT_TRUE(arrow::ExportSchema(*schema_, &c_schema).ok());
+        auto logical_schema = std::make_unique<ArrowSchema>();
+        arrow::FieldVector logical_fields(fields_.begin() + 1, fields_.end());
+        ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(logical_fields), logical_schema.get()).ok());
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ArrowSchema> realtime_schema,
+                             RealtimeContext::BuildRealtimeSchema(std::move(logical_schema)));
         ASSERT_OK_AND_ASSIGN(std::unique_ptr<Catalog> catalog,
                              Catalog::Create(dir_->Str(), options_));
         ASSERT_OK(catalog->CreateDatabase("foo", {}, /*ignore_if_exists=*/false));
-        ASSERT_OK(catalog->CreateTable(Identifier("foo", "bar"), &c_schema, partition_keys,
-                                       /*primary_keys=*/{}, options_,
+        ASSERT_OK(catalog->CreateTable(Identifier("foo", "bar"), realtime_schema.get(),
+                                       partition_keys, /*primary_keys=*/{}, options_,
                                        /*ignore_if_exists=*/false));
     }
 
@@ -191,6 +196,12 @@ class RealtimeWriteInteTest : public ::testing::Test {
             return Status::Invalid("cannot create an empty test batch");
         }
         const std::string& partition = std::get<2>(rows.front());
+        const PartitionBucket partition_bucket(
+            partitioned ? std::map<std::string, std::string>{{"pt", partition}}
+                        : std::map<std::string, std::string>{},
+            bucket);
+        int64_t first_offset = next_offsets_[partition_bucket];
+        next_offsets_[partition_bucket] += static_cast<int64_t>(rows.size());
         std::string json = "[";
         for (size_t i = 0; i < rows.size(); ++i) {
             const auto& [id, payload, pt] = rows[i];
@@ -200,7 +211,8 @@ class RealtimeWriteInteTest : public ::testing::Test {
             if (i > 0) {
                 json += ",";
             }
-            json += "[" + std::to_string(id) + ",\"" + payload + "\",\"" + pt + "\"]";
+            json += "[" + std::to_string(first_offset + static_cast<int64_t>(i)) + "," +
+                    std::to_string(id) + ",\"" + payload + "\",\"" + pt + "\"]";
         }
         json += "]";
 
@@ -295,7 +307,8 @@ class RealtimeWriteInteTest : public ::testing::Test {
     Result<std::vector<ReadRow>> ReadRows(const std::shared_ptr<Plan>& plan) const {
         PAIMON_ASSIGN_OR_RAISE(
             CollectedReadResult read_result,
-            ReadPlan(plan, {"_OFFSET", "id", "payload", "pt"}, /*predicate=*/nullptr,
+            ReadPlan(plan, {RealtimeContext::kOffsetFieldName, "id", "payload", "pt"},
+                     /*predicate=*/nullptr,
                      /*enable_predicate_filter=*/false));
         const std::shared_ptr<arrow::ChunkedArray>& result = read_result.data;
 
@@ -405,6 +418,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
     std::shared_ptr<arrow::Schema> schema_;
     std::map<std::string, std::string> options_;
     std::shared_ptr<MemoryPool> pool_;
+    mutable std::map<PartitionBucket, int64_t> next_offsets_;
 };
 
 TEST_F(RealtimeWriteInteTest, TestAppendCommitAndRead) {
@@ -415,6 +429,18 @@ TEST_F(RealtimeWriteInteTest, TestAppendCommitAndRead) {
                          MakeBatch(rows, /*partitioned=*/false));
     ASSERT_OK(writer->Write(std::move(batch)));
     FinalizeCommitAndCheck(writer.get(), /*realtime_commits=*/{}, /*prepare_identifier=*/0, rows);
+}
+
+TEST_F(RealtimeWriteInteTest, TestRejectsOffsetNotContinuingFromCommittedProgress) {
+    CreateTable(/*partition_keys=*/{});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer, CreateRealtimeWriter());
+    next_offsets_[PartitionBucket(/*partition=*/{}, /*bucket=*/0)] = 1;
+    std::vector<Row> rows = MakeRows(/*first_id=*/0, /*count=*/2, /*partition=*/"p0");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(rows, /*partitioned=*/false));
+    ASSERT_NOK_WITH_MSG(writer->Write(std::move(batch)),
+                        "_OFFSET values do not match the expected contiguous range");
+    ASSERT_OK(writer->Close());
 }
 
 TEST_F(RealtimeWriteInteTest, TestRollingFilesPreserveOffsets) {
@@ -534,7 +560,7 @@ TEST_F(RealtimeWriteInteTest, TestProjectionAndPredicateForMemoryAndDisk) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
     std::shared_ptr<Predicate> scan_predicate =
-        PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"id", FieldType::BIGINT,
+        PredicateBuilder::GreaterThan(/*field_index=*/1, /*field_name=*/"id", FieldType::BIGINT,
                                       Literal(static_cast<int64_t>(1)));
     std::shared_ptr<Predicate> read_predicate =
         PredicateBuilder::GreaterThan(/*field_index=*/1, /*field_name=*/"id", FieldType::BIGINT,
@@ -602,7 +628,7 @@ TEST_F(RealtimeWriteInteTest, TestDiskPredicatePushdownWithoutMemoryFiltering) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
     std::shared_ptr<Predicate> predicate =
-        PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"id", FieldType::BIGINT,
+        PredicateBuilder::Equal(/*field_index=*/1, /*field_name=*/"id", FieldType::BIGINT,
                                 Literal(static_cast<int64_t>(1)));
 
     std::vector<Row> disk_rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
@@ -620,17 +646,19 @@ TEST_F(RealtimeWriteInteTest, TestDiskPredicatePushdownWithoutMemoryFiltering) {
 
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan, CreatePlan(realtime_context, predicate));
     ASSERT_OK_AND_ASSIGN(CollectedReadResult result,
-                         ReadPlan(plan, {"id", "payload", "pt"}, predicate,
-                                  /*enable_predicate_filter=*/false));
-    std::shared_ptr<arrow::DataType> result_type = arrow::struct_(
-        {arrow::field("_VALUE_KIND", arrow::int8()), arrow::field("id", arrow::int64()),
-         arrow::field("payload", arrow::utf8()), arrow::field("pt", arrow::utf8())});
+                         ReadPlan(plan, {RealtimeContext::kOffsetFieldName, "id", "payload", "pt"},
+                                  predicate, /*enable_predicate_filter=*/false));
+    std::shared_ptr<arrow::DataType> result_type =
+        arrow::struct_({arrow::field("_VALUE_KIND", arrow::int8()),
+                        arrow::field(RealtimeContext::kOffsetFieldName, arrow::int64()),
+                        arrow::field("id", arrow::int64()), arrow::field("payload", arrow::utf8()),
+                        arrow::field("pt", arrow::utf8())});
     std::shared_ptr<arrow::Array> expected =
         arrow::ipc::internal::json::ArrayFromJSON(result_type, R"([
-            [0, 1, "value-1", "p0"],
-            [0, 3, "value-3", "p0"],
-            [0, 4, "value-4", "p0"],
-            [0, 5, "value-5", "p0"]
+            [0, 1, 1, "value-1", "p0"],
+            [0, 3, 3, "value-3", "p0"],
+            [0, 4, 4, "value-4", "p0"],
+            [0, 5, 5, "value-5", "p0"]
         ])")
             .ValueOrDie();
     ASSERT_NE(nullptr, result.data);

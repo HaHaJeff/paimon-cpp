@@ -36,11 +36,10 @@ namespace paimon {
 class MemoryPool;
 class Predicate;
 
-/// A record batch and the contiguous offset range assigned to its rows.
+/// A record batch and the contiguous offset range read from its rows.
 ///
-/// The batch contains only the table write fields. `_OFFSET` is carried separately by
-/// `offset_range`; row `i` corresponds to `offset_range.from + i`. Paimon adds the physical
-/// `_OFFSET` column when the sealed segment is written to data files.
+/// The batch contains all table write fields, including the required `_OFFSET` field. Paimon
+/// validates that row `i` contains `offset_range.from + i` before calling `MemIndexer::Write`.
 struct PAIMON_EXPORT RealtimeWriteBatch {
     /// Input batch whose ownership is transferred to `MemIndexer::Write`.
     std::unique_ptr<RecordBatch> batch;
@@ -101,7 +100,7 @@ class PAIMON_EXPORT MemIndexer {
 
     /// Adds a batch to the current building segment.
     ///
-    /// The number of rows must equal the size of `offset_range`.
+    /// The number and `_OFFSET` values of the rows match the derived `offset_range`.
     virtual Status Write(RealtimeWriteBatch&& batch) = 0;
 
     /// Seals the current building data and opens a new building segment.
@@ -113,7 +112,7 @@ class PAIMON_EXPORT MemIndexer {
     ///
     /// Concatenating the returned readers must produce every sealed row exactly once and in write
     /// order. Each output batch contains `_VALUE_KIND` followed by all fields from the factory's
-    /// `write_schema`; it does not contain `_OFFSET`.
+    /// `write_schema`, including `_OFFSET`.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -133,9 +132,11 @@ class PAIMON_EXPORT MemIndexer {
         const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
         const MemQueryContext& context) = 0;
 
-    /// Releases this indexer's ownership of sealed segments fully covered by the committed offset.
-    /// Existing read views continue to keep their referenced resources alive.
-    virtual Status Reclaim(int64_t committed_offset) = 0;
+    /// Notifies the indexer that its partition-bucket committed offset has advanced.
+    ///
+    /// An implementation may reclaim covered segments immediately, defer destruction, spill them,
+    /// or retain them. Existing read views continue to keep referenced resources alive.
+    virtual Status AdvanceCommittedOffset(int64_t committed_offset) = 0;
 
     /// Returns the number of bytes currently retained by building and sealed segments.
     virtual uint64_t GetMemoryUsage() const = 0;
@@ -151,11 +152,11 @@ class PAIMON_EXPORT MemIndexerFactory {
 
     /// Creates an indexer configured with the supplied schema, options, and memory pool.
     ///
-    /// `write_schema` uses the Arrow C Data Interface and contains the table fields accepted by
-    /// `Write`. It is valid only during this call. An implementation may consume its contents by
-    /// using an Arrow C Data Interface importer; otherwise Paimon releases them after this method
-    /// returns.
-    /// @param write_schema Table write schema without Paimon-generated real-time fields.
+    /// `write_schema` uses the Arrow C Data Interface and contains all table fields accepted by
+    /// `Write`, including `_OFFSET`. It is valid only during this call. An implementation may
+    /// consume its contents by using an Arrow C Data Interface importer; otherwise Paimon releases
+    /// them after this method returns.
+    /// @param write_schema Complete table write schema.
     /// @param options Effective table options available to the indexer.
     /// @param memory_pool Memory pool provided by the write context.
     virtual Result<std::shared_ptr<MemIndexer>> Create(

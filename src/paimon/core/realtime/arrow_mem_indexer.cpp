@@ -213,35 +213,10 @@ class ArrowMemIndexer::QueryBatchReader : public BatchReader {
 
  private:
     Result<std::shared_ptr<arrow::StructArray>> BuildOutput(const StoredBatch& stored) {
-        std::shared_ptr<arrow::Array> source = stored.data;
-        if (read_schema_->GetFieldByName(SpecialFields::Offset().Name())) {
-            int64_t row_count = stored.data->length();
-            arrow::Int64Builder offset_builder(arrow_pool_.get());
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(offset_builder.Reserve(row_count));
-            for (int64_t i = 0; i < row_count; ++i) {
-                offset_builder.UnsafeAppend(stored.offset_range.from + i);
-            }
-            std::shared_ptr<arrow::Array> offsets;
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(offset_builder.Finish(&offsets));
-
-            arrow::ArrayVector source_arrays = {offsets};
-            source_arrays.insert(source_arrays.end(), stored.data->fields().begin(),
-                                 stored.data->fields().end());
-            arrow::FieldVector source_fields = {
-                DataField::ConvertDataFieldToArrowField(SpecialFields::Offset())};
-            source_fields.insert(source_fields.end(), stored.data->struct_type()->fields().begin(),
-                                 stored.data->struct_type()->fields().end());
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                std::shared_ptr<arrow::StructArray> source_with_offset,
-                arrow::StructArray::Make(source_arrays, source_fields, stored.data->null_bitmap(),
-                                         stored.data->null_count(), stored.data->offset()));
-            source = std::move(source_with_offset);
-        }
-
         PAIMON_ASSIGN_OR_RAISE(
             std::shared_ptr<arrow::Array> projected,
             NestedProjectionUtils::AlignArrayToReadType(
-                source, arrow::struct_(read_schema_->fields()), arrow_pool_.get()));
+                stored.data, arrow::struct_(read_schema_->fields()), arrow_pool_.get()));
         std::shared_ptr<arrow::StructArray> projected_struct =
             std::dynamic_pointer_cast<arrow::StructArray>(projected);
         if (!projected_struct) {
@@ -372,7 +347,7 @@ Result<std::vector<std::unique_ptr<BatchReader>>> ArrowMemIndexer::CreateQueryRe
     return readers;
 }
 
-Status ArrowMemIndexer::Reclaim(int64_t committed_offset) {
+Status ArrowMemIndexer::AdvanceCommittedOffset(int64_t committed_offset) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_) {
         return Status::Invalid("mem indexer is closed");

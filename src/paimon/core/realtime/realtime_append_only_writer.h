@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,7 +28,6 @@
 struct ArrowSchema;
 
 namespace arrow {
-class MemoryPool;
 class Schema;
 }  // namespace arrow
 
@@ -46,8 +45,7 @@ class RealtimeAppendOnlyWriter : public BatchWriter {
         const std::shared_ptr<RealtimeContext>& realtime_context,
         const std::shared_ptr<AppendOnlyWriter>& file_writer,
         const std::shared_ptr<arrow::Schema>& input_schema,
-        const std::shared_ptr<arrow::Schema>& realtime_write_schema,
-        const std::map<std::string, std::string>& options, int64_t next_offset,
+        const std::map<std::string, std::string>& options, int64_t expected_offset,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
@@ -72,18 +70,17 @@ class RealtimeAppendOnlyWriter : public BatchWriter {
     RealtimeAppendOnlyWriter(const std::shared_ptr<MemIndexer>& mem_indexer,
                              const std::shared_ptr<AppendOnlyWriter>& file_writer,
                              const std::shared_ptr<arrow::Schema>& input_schema,
-                             const std::shared_ptr<arrow::Schema>& realtime_write_schema,
-                             int64_t next_offset, const std::shared_ptr<MemoryPool>& memory_pool);
+                             int64_t expected_offset,
+                             const std::shared_ptr<MemoryPool>& memory_pool);
 
     Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment);
 
     std::shared_ptr<MemoryPool> memory_pool_;
-    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     std::shared_ptr<MemIndexer> mem_indexer_;
     std::shared_ptr<AppendOnlyWriter> file_writer_;
     std::shared_ptr<arrow::Schema> input_schema_;
-    std::shared_ptr<arrow::Schema> realtime_write_schema_;
-    std::atomic<int64_t> next_offset_;
+    int64_t expected_offset_;
+    bool offset_exhausted_ = false;
     std::mutex mem_indexer_mutex_;
     std::mutex prepare_mutex_;
 };

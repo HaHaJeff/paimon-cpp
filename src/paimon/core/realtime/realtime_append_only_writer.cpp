@@ -16,6 +16,8 @@
 
 #include "paimon/core/realtime/realtime_append_only_writer.h"
 
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -24,18 +26,44 @@
 #include "arrow/c/bridge.h"
 #include "paimon/common/reader/concat_batch_reader.h"
 #include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/common/types/row_kind.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
-#include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/append/append_only_writer.h"
+#include "paimon/core/realtime/realtime_offset.h"
 #include "paimon/core/utils/commit_increment.h"
 #include "paimon/macros.h"
 #include "paimon/realtime/realtime_context.h"
 
 namespace paimon {
+namespace {
+
+Result<Range> ValidateOffsets(const std::shared_ptr<arrow::StructArray>& array,
+                              int64_t expected_offset) {
+    std::shared_ptr<arrow::Array> offsets =
+        array->GetFieldByName(RealtimeContext::kOffsetFieldName);
+    if (!offsets || offsets->type_id() != arrow::Type::INT64) {
+        return Status::Invalid("real-time data must contain an INT64 _OFFSET field");
+    }
+    std::shared_ptr<arrow::Int64Array> int64_offsets =
+        std::static_pointer_cast<arrow::Int64Array>(offsets);
+    if (int64_offsets->length() <= 0) {
+        return Status::Invalid("real-time _OFFSET array must not be empty");
+    }
+    if (int64_offsets->length() - 1 > std::numeric_limits<int64_t>::max() - expected_offset) {
+        return Status::Invalid("real-time _OFFSET range exceeds INT64_MAX");
+    }
+    for (int64_t i = 0; i < int64_offsets->length(); ++i) {
+        if (int64_offsets->IsNull(i) || int64_offsets->Value(i) != expected_offset + i) {
+            return Status::Invalid(
+                "real-time _OFFSET values do not match the expected contiguous range");
+        }
+    }
+    return Range(expected_offset, expected_offset + int64_offsets->length() - 1);
+}
+
+}  // namespace
 
 Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Create(
     const std::map<std::string, std::string>& partition, int32_t bucket,
@@ -43,35 +71,34 @@ Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Crea
     const std::shared_ptr<RealtimeContext>& realtime_context,
     const std::shared_ptr<AppendOnlyWriter>& file_writer,
     const std::shared_ptr<arrow::Schema>& input_schema,
-    const std::shared_ptr<arrow::Schema>& realtime_write_schema,
-    const std::map<std::string, std::string>& options, int64_t next_offset,
+    const std::map<std::string, std::string>& options, int64_t expected_offset,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     if (!realtime_context) {
         return Status::Invalid("real-time context is null");
     }
-    if (next_offset < 0) {
-        return Status::Invalid("next real-time offset must be non-negative");
+    if (expected_offset < 0) {
+        return Status::Invalid("expected real-time offset must be non-negative");
+    }
+    if (input_schema->GetFieldIndex(RealtimeContext::kOffsetFieldName) < 0) {
+        return Status::Invalid("real-time write schema does not contain the _OFFSET field");
     }
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> mem_indexer,
                            realtime_context->GetOrCreateMemIndexer(
                                partition, bucket, std::move(write_schema), options, memory_pool));
     return std::shared_ptr<RealtimeAppendOnlyWriter>(new RealtimeAppendOnlyWriter(
-        mem_indexer, file_writer, input_schema, realtime_write_schema, next_offset, memory_pool));
+        mem_indexer, file_writer, input_schema, expected_offset, memory_pool));
 }
 
 RealtimeAppendOnlyWriter::RealtimeAppendOnlyWriter(
     const std::shared_ptr<MemIndexer>& mem_indexer,
     const std::shared_ptr<AppendOnlyWriter>& file_writer,
-    const std::shared_ptr<arrow::Schema>& input_schema,
-    const std::shared_ptr<arrow::Schema>& realtime_write_schema, int64_t next_offset,
+    const std::shared_ptr<arrow::Schema>& input_schema, int64_t expected_offset,
     const std::shared_ptr<MemoryPool>& memory_pool)
     : memory_pool_(memory_pool),
-      arrow_pool_(GetArrowPool(memory_pool)),
       mem_indexer_(mem_indexer),
       file_writer_(file_writer),
       input_schema_(input_schema),
-      realtime_write_schema_(realtime_write_schema),
-      next_offset_(next_offset) {}
+      expected_offset_(expected_offset) {}
 
 Status RealtimeAppendOnlyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
     for (RecordBatch::RowKind row_kind : batch->GetRowKind()) {
@@ -83,14 +110,31 @@ Status RealtimeAppendOnlyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
         }
     }
 
-    int64_t row_count = batch->GetData()->length;
-    if (row_count == 0) {
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+        std::shared_ptr<arrow::Array> imported,
+        arrow::ImportArray(batch->GetData(), arrow::struct_(input_schema_->fields())));
+    std::shared_ptr<arrow::StructArray> struct_array =
+        std::dynamic_pointer_cast<arrow::StructArray>(imported);
+    if (!struct_array) {
+        return Status::Invalid("real-time write batch must contain a StructArray");
+    }
+    if (struct_array->length() == 0) {
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*struct_array, batch->GetData()));
         return Status::OK();
     }
-    int64_t first_offset = next_offset_.fetch_add(row_count);
-    Range range(first_offset, first_offset + row_count - 1);
     std::lock_guard<std::mutex> lock(mem_indexer_mutex_);
-    return mem_indexer_->Write(RealtimeWriteBatch{std::move(batch), range});
+    if (offset_exhausted_) {
+        return Status::Invalid("real-time _OFFSET has reached INT64_MAX");
+    }
+    PAIMON_ASSIGN_OR_RAISE(Range range, ValidateOffsets(struct_array, expected_offset_));
+    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*struct_array, batch->GetData()));
+    PAIMON_RETURN_NOT_OK(mem_indexer_->Write(RealtimeWriteBatch{std::move(batch), range}));
+    if (range.to == std::numeric_limits<int64_t>::max()) {
+        offset_exhausted_ = true;
+    } else {
+        expected_offset_ = range.to + 1;
+    }
+    return Status::OK();
 }
 
 Result<CommitIncrement> RealtimeAppendOnlyWriter::PrepareCommit(bool wait_compaction) {
@@ -160,27 +204,9 @@ Status RealtimeAppendOnlyWriter::FlushSegment(
             return Status::Invalid(
                 "mem indexer commit readers returned more rows than the sealed offset range");
         }
-        arrow::Int64Builder offset_builder(arrow_pool_.get());
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(offset_builder.Reserve(row_count));
-        for (int64_t i = 0; i < row_count; ++i) {
-            offset_builder.UnsafeAppend(offset_range.from + emitted_rows + i);
-        }
-        std::shared_ptr<arrow::Array> offset_array;
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(offset_builder.Finish(&offset_array));
-
-        arrow::ArrayVector arrays = struct_array->fields();
-        arrays.insert(arrays.begin(), offset_array);
-        arrow::FieldVector fields = struct_array->struct_type()->fields();
-        fields.insert(fields.begin(),
-                      DataField::ConvertDataFieldToArrowField(SpecialFields::Offset()));
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            struct_array,
-            arrow::StructArray::Make(arrays, fields, struct_array->null_bitmap(),
-                                     struct_array->null_count(), struct_array->offset()));
-        if (!struct_array->type()->Equals(arrow::struct_(realtime_write_schema_->fields()))) {
-            return Status::Invalid("failed to build the real-time data-file write schema");
-        }
-        emitted_rows += row_count;
+        PAIMON_ASSIGN_OR_RAISE(Range batch_offset_range,
+                               ValidateOffsets(struct_array, offset_range.from + emitted_rows));
+        emitted_rows += batch_offset_range.Count();
 
         auto output = std::make_unique<ArrowArray>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*struct_array, output.get()));

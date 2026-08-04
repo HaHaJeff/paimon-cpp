@@ -131,7 +131,6 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
         const std::vector<std::shared_ptr<DataFileMeta>>& files) const;
 
     std::optional<std::vector<std::string>> write_cols_;
-    std::shared_ptr<arrow::Schema> realtime_write_schema_;
     std::shared_ptr<RealtimeContext> realtime_context_;
     mutable std::mutex realtime_offsets_mutex_;
     RealtimeSnapshotProperties::OffsetMap realtime_committed_offsets_;

@@ -53,7 +53,7 @@ class ArrowMemIndexer : public MemIndexer {
         const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
         const MemQueryContext& context) override;
 
-    Status Reclaim(int64_t committed_offset) override;
+    Status AdvanceCommittedOffset(int64_t committed_offset) override;
 
     uint64_t GetMemoryUsage() const override;
 

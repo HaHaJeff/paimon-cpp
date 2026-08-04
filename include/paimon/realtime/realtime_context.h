@@ -63,6 +63,17 @@ struct PAIMON_EXPORT RealtimePartitionBucketOffset {
 /// created indexer available across writes, prepare-commit operations, and process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
+    /// Required non-null BIGINT field carrying partition-bucket real-time progress.
+    inline static constexpr char kOffsetFieldName[] = "_OFFSET";
+
+    /// Prepends the required `_OFFSET` field to a table schema.
+    ///
+    /// Ownership of `schema` is transferred to this method. The returned Arrow C schema preserves
+    /// the input fields and schema metadata. An input schema that already contains
+    /// `kOffsetFieldName` is rejected.
+    static Result<std::unique_ptr<::ArrowSchema>> BuildRealtimeSchema(
+        std::unique_ptr<::ArrowSchema> schema);
+
     /// Creates a context backed by Paimon's default Arrow `MemIndexer`.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 
@@ -88,8 +99,9 @@ class PAIMON_EXPORT RealtimeContext {
     /// Advances the committed progress visible to the registered memory indexers.
     ///
     /// Calls are idempotent for the same snapshot and must advance snapshot ids monotonically.
-    /// Each indexer may release sealed data covered by its committed offset. Existing read views
-    /// continue to pin referenced resources until their readers are closed.
+    /// Each indexer is notified outside the context's registry lock and may choose how and when to
+    /// release sealed data covered by its committed offset. Existing read views continue to pin
+    /// referenced resources until their readers are closed.
     Status AdvanceCommittedProgress(
         int64_t snapshot_id, const std::vector<RealtimePartitionBucketOffset>& committed_offsets);
 

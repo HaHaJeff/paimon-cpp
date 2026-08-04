@@ -64,8 +64,7 @@ TEST(AbstractSplitReadTest, TestBuildDataFieldsForFieldMapping) {
             // test write_cols is std::nullopt
             ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
                                                   table_schema, /*write_cols=*/std::nullopt));
-            std::vector<DataField> expected = {SpecialFields::Offset()};
-            expected.insert(expected.end(), fields.begin(), fields.end());
+            std::vector<DataField> expected = fields;
             expected.push_back(SpecialFields::RowId());
             expected.push_back(SpecialFields::SequenceNumber());
             ASSERT_EQ(result, expected);
@@ -103,8 +102,7 @@ TEST(AbstractSplitReadTest, TestBuildDataFieldsForFieldMapping) {
             // test write_cols is std::nullopt
             ASSERT_OK_AND_ASSIGN(auto result, AbstractSplitRead::BuildDataFieldsForFieldMapping(
                                                   table_schema, /*write_cols=*/std::nullopt));
-            std::vector<DataField> expected = {SpecialFields::Offset()};
-            expected.insert(expected.end(), fields.begin(), fields.end());
+            std::vector<DataField> expected = fields;
             expected.push_back(SpecialFields::RowId());
             expected.push_back(SpecialFields::SequenceNumber());
             ASSERT_EQ(result, expected);

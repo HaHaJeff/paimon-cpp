@@ -28,7 +28,6 @@
 #include "paimon/common/data/binary_row.h"
 #include "paimon/common/data/shredding/shredding_write_plan_factories.h"
 #include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/core/append/append_only_writer.h"
 #include "paimon/core/append/bucketed_append_compact_manager.h"
@@ -97,10 +96,6 @@ AppendOnlyFileStoreWrite::AppendOnlyFileStoreWrite(
     }
     if (realtime_context_) {
         writer_memory_manager_ = std::make_unique<NoopWriterMemoryManager>();
-        arrow::FieldVector fields = write_schema->fields();
-        fields.insert(fields.begin(),
-                      DataField::ConvertDataFieldToArrowField(SpecialFields::Offset()));
-        realtime_write_schema_ = arrow::schema(fields);
     }
 }
 
@@ -252,10 +247,8 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
             compaction_metrics_->CreateReporter(partition, bucket), cancellation_controller);
     }
 
-    const std::shared_ptr<arrow::Schema>& file_write_schema =
-        realtime_context_ ? realtime_write_schema_ : write_schema_;
     auto writer = std::make_shared<AppendOnlyWriter>(
-        options_, table_schema_->Id(), file_write_schema, write_cols_, restore_max_seq_number,
+        options_, table_schema_->Id(), write_schema_, write_cols_, restore_max_seq_number,
         data_file_path_factory, compact_manager, pool_);
     if (!realtime_context_) {
         return std::shared_ptr<BatchWriter>(std::move(writer));
@@ -268,7 +261,7 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
                                                      partition_values.end());
     auto c_write_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*write_schema_, c_write_schema.get()));
-    int64_t next_offset = 0;
+    int64_t expected_offset = 0;
     PartitionBucket partition_bucket(partition_map, bucket);
     {
         std::lock_guard<std::mutex> lock(realtime_offsets_mutex_);
@@ -277,12 +270,12 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
             if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
                 return Status::Invalid("real-time offset has reached INT64_MAX");
             }
-            next_offset = offset_iter->second + 1;
+            expected_offset = offset_iter->second + 1;
         }
     }
-    return RealtimeAppendOnlyWriter::Create(
-        partition_map, bucket, std::move(c_write_schema), realtime_context_, writer, write_schema_,
-        realtime_write_schema_, options_.ToMap(), next_offset, pool_);
+    return RealtimeAppendOnlyWriter::Create(partition_map, bucket, std::move(c_write_schema),
+                                            realtime_context_, writer, write_schema_,
+                                            options_.ToMap(), expected_offset, pool_);
 }
 
 Result<AppendOnlyFileStoreWrite::WriterFactory> AppendOnlyFileStoreWrite::GetDataFileWriterFactory(

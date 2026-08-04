@@ -335,7 +335,6 @@ Result<std::vector<DataField>> AbstractSplitRead::BuildDataFieldsForFieldMapping
     const std::vector<std::string>& partition_keys = data_schema->PartitionKeys();
     if (write_cols == std::nullopt) {
         projected_fields = data_schema->Fields();
-        projected_fields.insert(projected_fields.begin(), SpecialFields::Offset());
     } else {
         if (write_cols.value().empty()) {
             return Status::Invalid("write cols cannot be empty");

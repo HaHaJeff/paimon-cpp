@@ -266,7 +266,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestWriteWithInvalidBatch) {
     }
 }
 
-TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteFlushesOffsetColumn) {
+TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWritePreservesOffsetColumn) {
     std::map<std::string, std::string> options = {
         {"file.format", "parquet"},
         {"write-only", "true"},
@@ -274,7 +274,8 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteFlushesOffsetColumn) {
         {"bucket-key", "id"},
     };
     auto logical_schema =
-        arrow::schema({arrow::field("id", arrow::int32()), arrow::field("name", arrow::utf8())});
+        arrow::schema({arrow::field("_OFFSET", arrow::int64(), /*nullable=*/false),
+                       arrow::field("id", arrow::int32()), arrow::field("name", arrow::utf8())});
     auto dir = UniqueTestDirectory::Create();
     ASSERT_TRUE(dir);
     CreateTable(dir->Str(), logical_schema, options);
@@ -301,8 +302,8 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteFlushesOffsetColumn) {
     ASSERT_OK_AND_ASSIGN(auto file_store_write, FileStoreWrite::Create(std::move(write_context)));
 
     ASSERT_OK(file_store_write->Write(MakeBatch(logical_schema, R"([
-        [1, "a"],
-        [2, "b"]
+        [0, 1, "a"],
+        [1, 2, "b"]
     ])")));
     ASSERT_NOK_WITH_MSG(
         file_store_write->PrepareCommit(/*wait_compaction=*/false, /*commit_identifier=*/0),
@@ -332,7 +333,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteFlushesOffsetColumn) {
     ASSERT_TRUE(first_array->Equals(*expected_first_array)) << first_array->ToString();
 
     ASSERT_OK(file_store_write->Write(MakeBatch(logical_schema, R"([
-        [3, "c"]
+        [2, 3, "c"]
     ])")));
     ASSERT_OK_AND_ASSIGN(auto second_prepared,
                          file_store_write->PrepareCommitWithProgress(/*commit_identifier=*/1));
