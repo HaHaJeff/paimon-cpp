@@ -77,14 +77,12 @@ AppendOnlyFileStoreWrite::AppendOnlyFileStoreWrite(
     const std::shared_ptr<IOManager>& io_manager, const CoreOptions& options,
     bool ignore_previous_files, bool is_streaming_mode, bool ignore_num_bucket_check,
     const std::shared_ptr<RealtimeContext>& realtime_context,
-    const RealtimeSnapshotProperties::OffsetMap& realtime_committed_offsets,
     const std::shared_ptr<Executor>& executor, const std::shared_ptr<MemoryPool>& pool)
     : AbstractFileStoreWrite(file_store_path_factory, snapshot_manager, schema_manager, commit_user,
                              root_path, table_schema, schema, write_schema, partition_schema,
                              dv_maintainer_factory, io_manager, options, ignore_previous_files,
                              is_streaming_mode, ignore_num_bucket_check, executor, pool),
       realtime_context_(realtime_context),
-      realtime_committed_offsets_(realtime_committed_offsets),
       logger_(Logger::GetLogger("AppendOnlyFileStoreWrite")) {
     write_cols_ = write_schema->field_names();
     // optimize write_cols to null in following cases:
@@ -107,20 +105,11 @@ Status AppendOnlyFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {
     }
     PAIMON_ASSIGN_OR_RAISE(Snapshot snapshot, snapshot_manager_->LoadSnapshot(snapshot_id));
     PAIMON_ASSIGN_OR_RAISE(
-        RealtimeSnapshotProperties::OffsetMap committed_offsets,
+        RealtimeOffsetMap committed_offsets,
         RealtimeSnapshotProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
                                                 options_.GetFileSystem()));
-    std::vector<RealtimePartitionBucketOffset> progress;
-    progress.reserve(committed_offsets.size());
-    for (const auto& [partition_bucket, offset] : committed_offsets) {
-        progress.push_back(RealtimePartitionBucketOffset{partition_bucket.partition,
-                                                         partition_bucket.bucket, offset});
-    }
-    PAIMON_RETURN_NOT_OK(realtime_context_->AdvanceCommittedProgress(snapshot_id, progress));
-    {
-        std::lock_guard<std::mutex> lock(realtime_offsets_mutex_);
-        realtime_committed_offsets_ = std::move(committed_offsets);
-    }
+    PAIMON_RETURN_NOT_OK(
+        realtime_context_->AdvanceCommittedProgress(snapshot_id, committed_offsets));
     return Status::OK();
 }
 
@@ -261,21 +250,9 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
                                                      partition_values.end());
     auto c_write_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*write_schema_, c_write_schema.get()));
-    int64_t next_offset = 0;
-    PartitionBucket partition_bucket(partition_map, bucket);
-    {
-        std::lock_guard<std::mutex> lock(realtime_offsets_mutex_);
-        auto offset_iter = realtime_committed_offsets_.find(partition_bucket);
-        if (offset_iter != realtime_committed_offsets_.end()) {
-            if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
-                return Status::Invalid("real-time offset has reached INT64_MAX");
-            }
-            next_offset = offset_iter->second + 1;
-        }
-    }
     return RealtimeAppendOnlyWriter::Create(partition_map, bucket, std::move(c_write_schema),
                                             realtime_context_, writer, write_schema_,
-                                            options_.ToMap(), next_offset, pool_);
+                                            options_.ToMap(), pool_);
 }
 
 Result<AppendOnlyFileStoreWrite::WriterFactory> AppendOnlyFileStoreWrite::GetDataFileWriterFactory(

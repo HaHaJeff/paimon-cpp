@@ -93,9 +93,10 @@ class AbstractSplitRead : public SplitRead {
         const std::optional<std::vector<Range>>& row_ranges,
         const std::shared_ptr<DataFilePathFactory>& data_file_path_factory) const = 0;
 
-    // Builds the fields used to create a file field mapping from write columns, partition columns,
-    // and internal fields.
-    static Result<std::vector<DataField>> BuildDataFieldsForFieldMapping(
+    // 1. project write cols to data schema
+    // 2. add partition fields (if write cols not contain)
+    // 3. add row tracking fields
+    static Result<std::vector<DataField>> ProjectFieldsForRowTrackingAndDataEvolution(
         const std::shared_ptr<TableSchema>& data_schema,
         const std::optional<std::vector<std::string>>& write_cols);
 

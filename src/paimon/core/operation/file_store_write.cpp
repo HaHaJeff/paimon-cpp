@@ -112,15 +112,6 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                                      options.IndexFileInDataFileDir(), ctx->GetMemoryPool()));
     auto snapshot_manager =
         std::make_shared<SnapshotManager>(options.GetFileSystem(), ctx->GetRootPath(), branch);
-    RealtimeSnapshotProperties::OffsetMap realtime_committed_offsets;
-    if (ctx->GetRealtimeContext()) {
-        PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
-                               snapshot_manager->LatestSnapshot());
-        PAIMON_ASSIGN_OR_RAISE(
-            realtime_committed_offsets,
-            RealtimeSnapshotProperties::ReadOffsets(latest_snapshot, options.GetFileSystem()));
-    }
-
     std::shared_ptr<IOManager> io_manager;
     const auto& io_temp_dir = ctx->GetTempDirectory();
     if (!io_temp_dir.empty()) {
@@ -147,6 +138,15 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
             }
             if (options.DeletionVectorsEnabled()) {
                 return Status::Invalid("real-time append write does not support deletion vectors");
+            }
+            PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
+                                   snapshot_manager->LatestSnapshot());
+            if (latest_snapshot) {
+                PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap realtime_committed_offsets,
+                                       RealtimeSnapshotProperties::ReadOffsets(
+                                           latest_snapshot, options.GetFileSystem()));
+                PAIMON_RETURN_NOT_OK(ctx->GetRealtimeContext()->AdvanceCommittedProgress(
+                    latest_snapshot->Id(), realtime_committed_offsets));
             }
         }
         std::shared_ptr<arrow::Schema> write_schema = arrow_schema;
@@ -186,7 +186,7 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
             ctx->GetRootPath(), schema, arrow_schema, write_schema, partition_schema,
             dv_maintainer_factory, io_manager, options, ignore_previous_files,
             ctx->IsStreamingMode(), ctx->IgnoreNumBucketCheck(), ctx->GetRealtimeContext(),
-            realtime_committed_offsets, ctx->GetExecutor(), ctx->GetMemoryPool());
+            ctx->GetExecutor(), ctx->GetMemoryPool());
         return std::unique_ptr<FileStoreWrite>(std::move(file_store_write));
     } else {
         // pk table

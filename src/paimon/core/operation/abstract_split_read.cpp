@@ -191,8 +191,9 @@ Result<std::unique_ptr<FileBatchReader>> AbstractSplitRead::CreateFieldMappingRe
         PAIMON_ASSIGN_OR_RAISE(field_mapping,
                                field_mapping_builder->CreateFieldMapping(file_fields));
     } else {
-        PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> projected_data_fields,
-                               BuildDataFieldsForFieldMapping(data_schema, file_meta->write_cols));
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<DataField> projected_data_fields,
+            ProjectFieldsForRowTrackingAndDataEvolution(data_schema, file_meta->write_cols));
         auto converted_fields =
             BlobUtils::ConvertBlobInlineDataFields(projected_data_fields, blob_inline_fields);
         PAIMON_ASSIGN_OR_RAISE(field_mapping,
@@ -328,7 +329,7 @@ Result<std::unique_ptr<FileBatchReader>> AbstractSplitRead::ApplyVariantShreddin
     return std::move(file_reader);
 }
 
-Result<std::vector<DataField>> AbstractSplitRead::BuildDataFieldsForFieldMapping(
+Result<std::vector<DataField>> AbstractSplitRead::ProjectFieldsForRowTrackingAndDataEvolution(
     const std::shared_ptr<TableSchema>& data_schema,
     const std::optional<std::vector<std::string>>& write_cols) {
     std::vector<DataField> projected_fields;

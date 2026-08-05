@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "paimon/result.h"
@@ -37,26 +38,50 @@ class MemIndexerFactory;
 class MemReadView;
 class MemoryPool;
 
-/// One partition-bucket and the immutable plugin view captured for a table scan.
-struct PAIMON_EXPORT RealtimePartitionBucketView {
+/// Identifies one partition-bucket by its logical partition values.
+struct PAIMON_EXPORT RealtimePartitionBucket {
+    /// Creates a key from logical partition values and a fixed bucket id.
+    RealtimePartitionBucket(std::map<std::string, std::string> partition, int32_t bucket)
+        : partition(std::move(partition)), bucket(bucket) {}
+
+    /// Orders keys by partition values and then bucket id.
+    bool operator<(const RealtimePartitionBucket& other) const {
+        if (partition != other.partition) {
+            return partition < other.partition;
+        }
+        return bucket < other.bucket;
+    }
+
+    /// Returns whether both partition values and bucket id are equal.
+    bool operator==(const RealtimePartitionBucket& other) const {
+        return partition == other.partition && bucket == other.bucket;
+    }
+
     /// Logical partition values, before partition-path escaping.
     std::map<std::string, std::string> partition;
     /// Fixed bucket id.
-    int32_t bucket;
+    int32_t bucket = -1;
+};
+
+/// Largest committed offset for each partition-bucket.
+using RealtimeOffsetMap = std::map<RealtimePartitionBucket, int64_t>;
+
+/// Memory indexer and its initial offset resolved from the same committed progress.
+struct PAIMON_EXPORT RealtimeMemIndexerState {
+    /// Plugin instance associated with the requested partition-bucket.
+    std::shared_ptr<MemIndexer> indexer;
+    /// First offset available to a newly created writer.
+    int64_t initial_offset;
+};
+
+/// One partition-bucket and the immutable plugin view captured for a table scan.
+struct PAIMON_EXPORT RealtimePartitionBucketView {
+    /// Partition-bucket associated with this view.
+    RealtimePartitionBucket partition_bucket;
     /// Plugin instance that creates readers from `read_view`.
     std::shared_ptr<MemIndexer> indexer;
     /// Immutable rows pinned for one query plan.
     std::shared_ptr<MemReadView> read_view;
-};
-
-/// Committed progress for one partition-bucket loaded from a Paimon snapshot.
-struct PAIMON_EXPORT RealtimePartitionBucketOffset {
-    /// Logical partition values, before partition-path escaping.
-    std::map<std::string, std::string> partition;
-    /// Fixed bucket id.
-    int32_t bucket;
-    /// Largest internal offset committed for this partition-bucket.
-    int64_t offset;
 };
 
 /// Shared context that owns the `MemIndexer` instances used by a real-time writer.
@@ -75,8 +100,10 @@ class PAIMON_EXPORT RealtimeContext {
     static Result<std::shared_ptr<RealtimeContext>> Create(
         const std::shared_ptr<MemIndexerFactory>& factory);
 
-    /// Returns the stable indexer associated with a partition and bucket, creating it if needed.
-    Result<std::shared_ptr<MemIndexer>> GetOrCreateMemIndexer(
+    /// Returns the stable indexer and initial offset associated with a partition-bucket.
+    ///
+    /// The indexer lookup and initial offset resolution use the same committed progress view.
+    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
         const std::map<std::string, std::string>& partition, int32_t bucket,
         std::unique_ptr<::ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
@@ -94,8 +121,8 @@ class PAIMON_EXPORT RealtimeContext {
     /// Each indexer is notified outside the context's registry lock and may choose how and when to
     /// release sealed data covered by its committed offset. Existing read views continue to pin
     /// referenced resources until their readers are closed.
-    Status AdvanceCommittedProgress(
-        int64_t snapshot_id, const std::vector<RealtimePartitionBucketOffset>& committed_offsets);
+    Status AdvanceCommittedProgress(int64_t snapshot_id,
+                                    const RealtimeOffsetMap& committed_offsets);
 
     ~RealtimeContext();
 

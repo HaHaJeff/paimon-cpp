@@ -161,7 +161,6 @@ std::unique_ptr<AppendOnlyFileStoreWrite> CreateFileStoreWrite(
     const std::shared_ptr<arrow::Schema>& arrow_schema,
     const std::shared_ptr<arrow::Schema>& partition_schema, const CoreOptions& core_options,
     const std::shared_ptr<Executor>& executor, const std::shared_ptr<MemoryPool>& pool) {
-    const RealtimeSnapshotProperties::OffsetMap realtime_committed_offsets;
     return std::make_unique<AppendOnlyFileStoreWrite>(
         path_factory, snapshot_manager, schema_manager,
         /*commit_user=*/"compact-coordinator",
@@ -172,7 +171,7 @@ std::unique_ptr<AppendOnlyFileStoreWrite> CreateFileStoreWrite(
         /*ignore_previous_files=*/true,
         /*is_streaming_mode=*/false,
         /*ignore_num_bucket_check=*/false,
-        /*realtime_context=*/nullptr, realtime_committed_offsets, executor, pool);
+        /*realtime_context=*/nullptr, executor, pool);
 }
 
 /// Load schema from table path and merge user options with schema options.

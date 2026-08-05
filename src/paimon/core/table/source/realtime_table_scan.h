@@ -24,8 +24,6 @@
 #include <string>
 #include <vector>
 
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
-#include "paimon/core/realtime/partition_bucket.h"
 #include "paimon/realtime/realtime_context.h"
 #include "paimon/result.h"
 #include "paimon/table/source/table_scan.h"
@@ -50,24 +48,22 @@ class RealtimeTableScan : public TableScan {
     Result<std::shared_ptr<Plan>> CreatePlan() override;
 
  private:
-    using MemoryViewMap = std::map<PartitionBucket, RealtimePartitionBucketView>;
+    using MemoryViewMap = std::map<RealtimePartitionBucket, RealtimePartitionBucketView>;
 
-    static int64_t GetCommittedOffset(
-        const RealtimeSnapshotProperties::OffsetMap& committed_offsets,
-        const PartitionBucket& partition_bucket);
+    static int64_t GetCommittedOffset(const RealtimeOffsetMap& committed_offsets,
+                                      const RealtimePartitionBucket& partition_bucket);
 
     bool MatchPartition(const std::map<std::string, std::string>& partition) const;
 
-    Result<RealtimeSnapshotProperties::OffsetMap> LoadCommittedOffsets(
-        const std::shared_ptr<Plan>& disk_plan) const;
+    Result<RealtimeOffsetMap> LoadCommittedOffsets(const std::shared_ptr<Plan>& disk_plan) const;
 
     Result<MemoryViewMap> CollectActiveMemoryViews(
         std::vector<RealtimePartitionBucketView>&& memory_views,
-        const RealtimeSnapshotProperties::OffsetMap& committed_offsets) const;
+        const RealtimeOffsetMap& committed_offsets) const;
 
     Result<std::vector<std::shared_ptr<Split>>> CreateRealtimeSplits(
         const std::vector<std::shared_ptr<Split>>& disk_splits, MemoryViewMap&& active_memory,
-        const RealtimeSnapshotProperties::OffsetMap& committed_offsets) const;
+        const RealtimeOffsetMap& committed_offsets) const;
 
     std::unique_ptr<TableScan> disk_scan_;
     std::shared_ptr<RealtimeContext> realtime_context_;

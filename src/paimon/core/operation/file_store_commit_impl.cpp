@@ -887,11 +887,11 @@ Status FileStoreCommitImpl::CommitWithProgress(
     std::optional<int64_t> watermark) {
     PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
                            snapshot_manager_->LatestSnapshot());
-    PAIMON_ASSIGN_OR_RAISE(RealtimeSnapshotProperties::OffsetMap committed_offsets,
+    PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap committed_offsets,
                            RealtimeSnapshotProperties::ReadOffsets(latest_snapshot, fs_));
     PAIMON_ASSIGN_OR_RAISE(
         RealtimeSnapshotProperties::ValidatedCommitProgress validated_progress,
-        RealtimeSnapshotProperties::ValidateProgress(realtime_commits, committed_offsets));
+        RealtimeSnapshotProperties::SortAndValidate(realtime_commits, committed_offsets));
 
     std::vector<std::shared_ptr<CommitMessage>> commit_messages;
     commit_messages.reserve(validated_progress.ordered_commits.size());

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "paimon/common/reader/concat_batch_reader.h"
 #include "paimon/common/reader/predicate_batch_reader.h"
 #include "paimon/common/utils/arrow/status_utils.h"
@@ -76,11 +77,7 @@ Result<std::unique_ptr<BatchReader>> AppendOnlyTableRead::CreateReader(
     auto c_read_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(
         arrow::ExportSchema(*context_->GetReadSchema(), c_read_schema.get()));
-    ScopeGuard schema_guard([schema = c_read_schema.get()]() {
-        if (schema->release) {
-            schema->release(schema);
-        }
-    });
+    ScopeGuard schema_guard([schema = c_read_schema.get()]() { ArrowSchemaRelease(schema); });
     MemQueryContext query_context{c_read_schema.get(), context_->GetPredicate(),
                                   /*enable_predicate_pushdown=*/true};
     PAIMON_ASSIGN_OR_RAISE(

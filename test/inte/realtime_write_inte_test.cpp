@@ -361,7 +361,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
         return Status::OK();
     }
 
-    Result<RealtimeSnapshotProperties::OffsetMap> ReadCommittedOffsets() const {
+    Result<RealtimeOffsetMap> ReadCommittedOffsets() const {
         PAIMON_ASSIGN_OR_RAISE(CoreOptions options, CoreOptions::FromMap(options_));
         SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
         PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> snapshot, snapshot_manager.LatestSnapshot());
@@ -994,10 +994,9 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
     ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows(realtime_context));
     ASSERT_EQ(kTotalRows, static_cast<int64_t>(final_rows.size()));
     ASSERT_OK(ValidateReadPrefix(final_rows, kTotalRows));
-    ASSERT_OK_AND_ASSIGN(RealtimeSnapshotProperties::OffsetMap committed_offsets,
-                         ReadCommittedOffsets());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
     ASSERT_EQ(kTotalRows - 1,
-              committed_offsets.at(PartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+              committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
     ASSERT_OK_AND_ASSIGN(uint64_t memory_usage, GetRealtimeMemoryUsage(realtime_context));
     ASSERT_EQ(0, memory_usage);
     ASSERT_OK(writer->Close());
@@ -1040,16 +1039,15 @@ TEST_F(RealtimeWriteInteTest, TestMultiplePartitions) {
     ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
     ASSERT_EQ(expected_rows, actual_rows);
 
-    ASSERT_OK_AND_ASSIGN(RealtimeSnapshotProperties::OffsetMap committed_offsets,
-                         ReadCommittedOffsets());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
     ASSERT_EQ(2, committed_offsets.size());
     for (int64_t partition_index = 0; partition_index < 2; ++partition_index) {
-        PartitionBucket partition_bucket({{"pt", "p" + std::to_string(partition_index)}},
-                                         /*bucket=*/0);
+        RealtimePartitionBucket partition_bucket({{"pt", "p" + std::to_string(partition_index)}},
+                                                 /*bucket=*/0);
         ASSERT_EQ(9, committed_offsets.at(partition_bucket));
     }
     ASSERT_EQ(committed_offsets.end(),
-              committed_offsets.find(PartitionBucket({{"pt", "p2"}}, /*bucket=*/0)));
+              committed_offsets.find(RealtimePartitionBucket({{"pt", "p2"}}, /*bucket=*/0)));
     ASSERT_OK(writer->Close());
 }
 
@@ -1109,11 +1107,10 @@ TEST_F(RealtimeWriteInteTest, TestMultipleBucketsRestoreIndependentOffsets) {
 
     ASSERT_OK(Commit(second_commits, /*commit_identifier=*/1));
     ASSERT_OK(second_writer->Close());
-    ASSERT_OK_AND_ASSIGN(RealtimeSnapshotProperties::OffsetMap committed_offsets,
-                         ReadCommittedOffsets());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
     ASSERT_EQ(2, committed_offsets.size());
-    ASSERT_EQ(2, committed_offsets.at(PartitionBucket(/*partition=*/{}, /*bucket=*/0)));
-    ASSERT_EQ(3, committed_offsets.at(PartitionBucket(/*partition=*/{}, /*bucket=*/1)));
+    ASSERT_EQ(2, committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_EQ(3, committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/1)));
 }
 
 TEST_F(RealtimeWriteInteTest, TestRestoreOffsetFromCommittedSnapshot) {
@@ -1145,9 +1142,8 @@ TEST_F(RealtimeWriteInteTest, TestRestoreOffsetFromCommittedSnapshot) {
     FinalizeCommitAndCheck(second_writer.get(), std::move(second_commits),
                            /*prepare_identifier=*/1, std::move(expected_rows));
 
-    PartitionBucket partition_bucket(/*partition=*/{}, /*bucket=*/0);
-    ASSERT_OK_AND_ASSIGN(RealtimeSnapshotProperties::OffsetMap second_committed_offsets,
-                         ReadCommittedOffsets());
+    RealtimePartitionBucket partition_bucket(/*partition=*/{}, /*bucket=*/0);
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap second_committed_offsets, ReadCommittedOffsets());
     ASSERT_EQ(4, second_committed_offsets.at(partition_bucket));
 }
 

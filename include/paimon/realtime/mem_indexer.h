@@ -77,9 +77,6 @@ class PAIMON_EXPORT MemReadView {
 /// Parameters used by a `MemIndexer` to create readers for a query.
 struct PAIMON_EXPORT MemQueryContext {
     /// Requested output fields before the mandatory leading `_VALUE_KIND` field is added.
-    ///
-    /// The schema uses the Arrow C Data Interface and is valid only during
-    /// `CreateQueryReaders`. An implementation may consume it with an Arrow importer.
     ::ArrowSchema* read_schema;
     /// Predicate using field indexes from `read_schema`.
     std::shared_ptr<Predicate> predicate;
@@ -154,11 +151,6 @@ class PAIMON_EXPORT MemIndexerFactory {
     virtual ~MemIndexerFactory() = default;
 
     /// Creates an indexer configured with the supplied schema, options, and memory pool.
-    ///
-    /// `write_schema` uses the Arrow C Data Interface and contains all table fields accepted by
-    /// `Write`. It is valid only during this call. An implementation may consume its contents by
-    /// using an Arrow C Data Interface importer; otherwise Paimon releases it after this method
-    /// returns.
     /// @param write_schema Complete table write schema.
     /// @param options Effective table options available to the indexer.
     /// @param memory_pool Memory pool provided by the write context.

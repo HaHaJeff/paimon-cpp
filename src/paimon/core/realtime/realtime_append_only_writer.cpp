@@ -46,19 +46,17 @@ Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Crea
     const std::shared_ptr<RealtimeContext>& realtime_context,
     const std::shared_ptr<AppendOnlyWriter>& file_writer,
     const std::shared_ptr<arrow::Schema>& input_schema,
-    const std::map<std::string, std::string>& options, int64_t next_offset,
+    const std::map<std::string, std::string>& options,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     if (!realtime_context) {
         return Status::Invalid("real-time context is null");
     }
-    if (next_offset < 0) {
-        return Status::Invalid("next real-time offset must be non-negative");
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> mem_indexer,
+    PAIMON_ASSIGN_OR_RAISE(RealtimeMemIndexerState indexer_state,
                            realtime_context->GetOrCreateMemIndexer(
                                partition, bucket, std::move(write_schema), options, memory_pool));
-    return std::shared_ptr<RealtimeAppendOnlyWriter>(new RealtimeAppendOnlyWriter(
-        mem_indexer, file_writer, input_schema, next_offset, memory_pool));
+    return std::shared_ptr<RealtimeAppendOnlyWriter>(
+        new RealtimeAppendOnlyWriter(indexer_state.indexer, file_writer, input_schema,
+                                     indexer_state.initial_offset, memory_pool));
 }
 
 RealtimeAppendOnlyWriter::RealtimeAppendOnlyWriter(

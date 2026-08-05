@@ -82,8 +82,7 @@ class OffsetsJson {
  public:
     OffsetsJson() = default;
 
-    explicit OffsetsJson(const RealtimeSnapshotProperties::OffsetMap& offsets)
-        : offsets_(offsets) {}
+    explicit OffsetsJson(const RealtimeOffsetMap& offsets) : offsets_(offsets) {}
 
     rapidjson::Value ToJson(rapidjson::Document::AllocatorType* allocator) const {
         rapidjson::Value value(rapidjson::kObjectType);
@@ -109,11 +108,11 @@ class OffsetsJson {
     }
 
     void FromJson(const rapidjson::Value& value) {
-        int32_t version = RapidJsonUtil::DeserializeKeyValue<int32_t>(value, "version");
+        auto version = RapidJsonUtil::DeserializeKeyValue<int32_t>(value, "version");
         if (version != RealtimeSnapshotProperties::kOffsetsVersion) {
             throw std::invalid_argument(fmt::format("unsupported offsets version {}", version));
         }
-        std::vector<OffsetEntryJson> entries =
+        auto entries =
             RapidJsonUtil::DeserializeKeyValue<std::vector<OffsetEntryJson>>(value, "offsets");
         offsets_.clear();
         for (const OffsetEntryJson& entry : entries) {
@@ -125,7 +124,7 @@ class OffsetsJson {
                 throw std::invalid_argument(
                     fmt::format("invalid offset {} in offsets", entry.Offset()));
             }
-            PartitionBucket partition_bucket(entry.Partition(), entry.Bucket());
+            RealtimePartitionBucket partition_bucket(entry.Partition(), entry.Bucket());
             if (!offsets_.emplace(std::move(partition_bucket), entry.Offset()).second) {
                 throw std::invalid_argument(
                     fmt::format("duplicate partition-bucket {} in offsets", entry.Bucket()));
@@ -133,19 +132,19 @@ class OffsetsJson {
         }
     }
 
-    const RealtimeSnapshotProperties::OffsetMap& Offsets() const {
+    const RealtimeOffsetMap& Offsets() const {
         return offsets_;
     }
 
  private:
-    RealtimeSnapshotProperties::OffsetMap offsets_;
+    RealtimeOffsetMap offsets_;
 };
 
 }  // namespace
 
 Result<RealtimeSnapshotProperties::ValidatedCommitProgress>
-RealtimeSnapshotProperties::ValidateProgress(const std::vector<RealtimeCommitProgress>& commits,
-                                             const OffsetMap& committed_offsets) {
+RealtimeSnapshotProperties::SortAndValidate(const std::vector<RealtimeCommitProgress>& commits,
+                                            const RealtimeOffsetMap& committed_offsets) {
     ValidatedCommitProgress result;
     result.ordered_commits = commits;
     std::stable_sort(result.ordered_commits.begin(), result.ordered_commits.end(),
@@ -159,7 +158,7 @@ RealtimeSnapshotProperties::ValidateProgress(const std::vector<RealtimeCommitPro
                          return lhs.offset_range.from < rhs.offset_range.from;
                      });
 
-    OffsetMap last_offsets;
+    RealtimeOffsetMap last_offsets;
     for (const RealtimeCommitProgress& commit : result.ordered_commits) {
         if (commit.bucket < 0) {
             return Status::Invalid(
@@ -169,7 +168,7 @@ RealtimeSnapshotProperties::ValidateProgress(const std::vector<RealtimeCommitPro
             return Status::Invalid("real-time commit offset range is invalid");
         }
 
-        PartitionBucket partition_bucket(commit.partition, commit.bucket);
+        RealtimePartitionBucket partition_bucket(commit.partition, commit.bucket);
         auto last_iter = last_offsets.find(partition_bucket);
         int64_t previous_offset = -1;
         if (last_iter != last_offsets.end()) {
@@ -197,15 +196,15 @@ std::string RealtimeSnapshotProperties::OffsetsDirectory(const std::string& tabl
     return PathUtil::JoinPath(BranchManager::BranchPath(table_root, branch), "metadata");
 }
 
-Result<RealtimeSnapshotProperties::OffsetMap> RealtimeSnapshotProperties::ReadOffsets(
+Result<RealtimeOffsetMap> RealtimeSnapshotProperties::ReadOffsets(
     const std::optional<Snapshot>& snapshot, const std::shared_ptr<FileSystem>& file_system) {
     if (!snapshot || !snapshot->Properties()) {
-        return OffsetMap{};
+        return RealtimeOffsetMap{};
     }
     const std::map<std::string, std::string>& properties = snapshot->Properties().value();
     auto iter = properties.find(kOffsetsKey);
     if (iter == properties.end()) {
-        return OffsetMap{};
+        return RealtimeOffsetMap{};
     }
     if (file_system == nullptr) {
         return Status::Invalid("file system is null when reading real-time offsets");
@@ -215,7 +214,7 @@ Result<RealtimeSnapshotProperties::OffsetMap> RealtimeSnapshotProperties::ReadOf
     return ParseOffsets(content);
 }
 
-Result<std::string> RealtimeSnapshotProperties::SerializeOffsets(const OffsetMap& offsets) {
+Result<std::string> RealtimeSnapshotProperties::SerializeOffsets(const RealtimeOffsetMap& offsets) {
     std::string result;
     PAIMON_RETURN_NOT_OK(RapidJsonUtil::ToJsonString(OffsetsJson(offsets), &result));
     return result;
@@ -240,8 +239,9 @@ Result<std::map<std::string, std::string>> RealtimeSnapshotProperties::MergeOffs
         return merged_properties;
     }
 
-    PAIMON_ASSIGN_OR_RAISE(OffsetMap merged_offsets, ReadOffsets(latest_snapshot, file_system));
-    PAIMON_ASSIGN_OR_RAISE(OffsetMap delta_offsets, ParseOffsets(delta_iter->second));
+    PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap merged_offsets,
+                           ReadOffsets(latest_snapshot, file_system));
+    PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap delta_offsets, ParseOffsets(delta_iter->second));
     for (const auto& [key, offset] : delta_offsets) {
         auto merged_iter = merged_offsets.find(key);
         if (merged_iter == merged_offsets.end()) {
@@ -258,7 +258,7 @@ Result<std::map<std::string, std::string>> RealtimeSnapshotProperties::MergeOffs
 }
 
 Result<std::string> RealtimeSnapshotProperties::WriteOffsets(
-    const OffsetMap& offsets, const std::shared_ptr<FileSystem>& file_system,
+    const RealtimeOffsetMap& offsets, const std::shared_ptr<FileSystem>& file_system,
     const std::string& offsets_directory) {
     if (file_system == nullptr) {
         return Status::Invalid("file system is null when writing real-time offsets");
@@ -277,8 +277,7 @@ Result<std::string> RealtimeSnapshotProperties::WriteOffsets(
     return path;
 }
 
-Result<RealtimeSnapshotProperties::OffsetMap> RealtimeSnapshotProperties::ParseOffsets(
-    const std::string& value) {
+Result<RealtimeOffsetMap> RealtimeSnapshotProperties::ParseOffsets(const std::string& value) {
     OffsetsJson offsets_json;
     PAIMON_RETURN_NOT_OK(RapidJsonUtil::FromJsonString(value, &offsets_json));
     return offsets_json.Offsets();

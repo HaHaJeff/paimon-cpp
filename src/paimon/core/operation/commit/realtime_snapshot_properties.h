@@ -26,9 +26,9 @@
 #include <string>
 #include <vector>
 
-#include "paimon/core/realtime/partition_bucket.h"
 #include "paimon/core/snapshot.h"
 #include "paimon/realtime/realtime_commit_progress.h"
+#include "paimon/realtime/realtime_context.h"
 #include "paimon/result.h"
 
 namespace paimon {
@@ -37,12 +37,10 @@ class FileSystem;
 
 class RealtimeSnapshotProperties {
  public:
-    using OffsetMap = std::map<PartitionBucket, int64_t>;
-
     /// Ordered commit progress and the latest offset contributed by each partition-bucket.
     struct ValidatedCommitProgress {
         std::vector<RealtimeCommitProgress> ordered_commits;
-        OffsetMap delta_offsets;
+        RealtimeOffsetMap delta_offsets;
     };
 
     RealtimeSnapshotProperties() = delete;
@@ -52,15 +50,16 @@ class RealtimeSnapshotProperties {
     static constexpr int32_t kOffsetsVersion = 1;
 
     /// Orders progress entries and verifies they form a contiguous prefix after committed offsets.
-    static Result<ValidatedCommitProgress> ValidateProgress(
-        const std::vector<RealtimeCommitProgress>& commits, const OffsetMap& committed_offsets);
+    static Result<ValidatedCommitProgress> SortAndValidate(
+        const std::vector<RealtimeCommitProgress>& commits,
+        const RealtimeOffsetMap& committed_offsets);
 
     static std::string OffsetsDirectory(const std::string& table_root, const std::string& branch);
 
-    static Result<OffsetMap> ReadOffsets(const std::optional<Snapshot>& snapshot,
-                                         const std::shared_ptr<FileSystem>& file_system);
+    static Result<RealtimeOffsetMap> ReadOffsets(const std::optional<Snapshot>& snapshot,
+                                                 const std::shared_ptr<FileSystem>& file_system);
 
-    static Result<std::string> SerializeOffsets(const OffsetMap& offsets);
+    static Result<std::string> SerializeOffsets(const RealtimeOffsetMap& offsets);
 
     static Result<std::map<std::string, std::string>> MergeOffsets(
         const std::map<std::string, std::string>& properties,
@@ -68,11 +67,11 @@ class RealtimeSnapshotProperties {
         const std::shared_ptr<FileSystem>& file_system, const std::string& offsets_directory);
 
  private:
-    static Result<std::string> WriteOffsets(const OffsetMap& offsets,
+    static Result<std::string> WriteOffsets(const RealtimeOffsetMap& offsets,
                                             const std::shared_ptr<FileSystem>& file_system,
                                             const std::string& offsets_directory);
 
-    static Result<OffsetMap> ParseOffsets(const std::string& value);
+    static Result<RealtimeOffsetMap> ParseOffsets(const std::string& value);
 };
 
 }  // namespace paimon

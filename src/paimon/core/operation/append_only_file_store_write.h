@@ -20,7 +20,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -33,11 +32,11 @@
 #include "paimon/core/core_options.h"
 #include "paimon/core/deletionvectors/deletion_vector.h"
 #include "paimon/core/operation/abstract_file_store_write.h"
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
 #include "paimon/core/table/bucket_mode.h"
 #include "paimon/file_store_write.h"
 #include "paimon/logging.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/realtime/realtime_context.h"
 #include "paimon/result.h"
 #include "paimon/type_fwd.h"
 
@@ -84,7 +83,6 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
         const std::shared_ptr<IOManager>& io_manager, const CoreOptions& options,
         bool ignore_previous_files, bool is_streaming_mode, bool ignore_num_bucket_check,
         const std::shared_ptr<RealtimeContext>& realtime_context,
-        const RealtimeSnapshotProperties::OffsetMap& realtime_committed_offsets,
         const std::shared_ptr<Executor>& executor, const std::shared_ptr<MemoryPool>& pool);
     ~AppendOnlyFileStoreWrite() override;
 
@@ -132,8 +130,6 @@ class AppendOnlyFileStoreWrite : public AbstractFileStoreWrite {
 
     std::optional<std::vector<std::string>> write_cols_;
     std::shared_ptr<RealtimeContext> realtime_context_;
-    mutable std::mutex realtime_offsets_mutex_;
-    RealtimeSnapshotProperties::OffsetMap realtime_committed_offsets_;
     std::unique_ptr<Logger> logger_;
 };
 

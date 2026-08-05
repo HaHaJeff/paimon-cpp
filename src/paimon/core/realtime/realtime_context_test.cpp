@@ -114,32 +114,33 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
                          RealtimeContext::Create(factory));
     std::shared_ptr<MemoryPool> pool = GetDefaultPool();
 
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemIndexer> first,
+    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState first_state,
                          context->GetOrCreateMemIndexer({{"dt", "2026-08-02"}}, 0,
                                                         MakeWriteSchema(), {{"k", "v"}}, pool));
+    ASSERT_EQ(0, first_state.initial_offset);
     ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<MemIndexer> first_again,
+        RealtimeMemIndexerState first_again_state,
         context->GetOrCreateMemIndexer({{"dt", "2026-08-02"}}, 0, MakeWriteSchema(), {}, pool));
-    ASSERT_EQ(first, first_again);
+    ASSERT_EQ(first_state.indexer, first_again_state.indexer);
+    ASSERT_EQ(0, first_again_state.initial_offset);
     ASSERT_EQ(1, factory->indexers.size());
 
     ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<MemIndexer> second,
+        RealtimeMemIndexerState second_state,
         context->GetOrCreateMemIndexer({{"dt", "2026-08-02"}}, 1, MakeWriteSchema(), {}, pool));
     ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<MemIndexer> third,
+        RealtimeMemIndexerState third_state,
         context->GetOrCreateMemIndexer({{"dt", "2026-08-03"}}, 0, MakeWriteSchema(), {}, pool));
-    ASSERT_NE(first, second);
-    ASSERT_NE(first, third);
+    ASSERT_NE(first_state.indexer, second_state.indexer);
+    ASSERT_NE(first_state.indexer, third_state.indexer);
     ASSERT_EQ(3, factory->indexers.size());
 
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
                          context->AcquireReadViews());
     ASSERT_EQ(3, views.size());
-    const std::map<std::string, std::string> expected_partition = {{"dt", "2026-08-02"}};
-    ASSERT_EQ(expected_partition, views[0].partition);
-    ASSERT_EQ(0, views[0].bucket);
-    ASSERT_EQ(first, views[0].indexer);
+    const RealtimePartitionBucket expected_partition_bucket({{"dt", "2026-08-02"}}, 0);
+    ASSERT_EQ(expected_partition_bucket, views[0].partition_bucket);
+    ASSERT_EQ(first_state.indexer, views[0].indexer);
     ASSERT_TRUE(views[0].read_view);
     ASSERT_EQ(1, factory->indexers[0]->acquire_count);
     ASSERT_EQ(1, factory->indexers[1]->acquire_count);
@@ -159,29 +160,33 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
 
     ASSERT_NOK_WITH_MSG(context->AdvanceCommittedProgress(-1, {}),
                         "snapshot id must not be negative");
-    ASSERT_NOK_WITH_MSG(
-        context->AdvanceCommittedProgress(
-            4, {RealtimePartitionBucketOffset{partition, /*bucket=*/-1, /*offset=*/3}}),
-        "invalid partition-bucket committed offset");
+    ASSERT_NOK_WITH_MSG(context->AdvanceCommittedProgress(
+                            4, {{RealtimePartitionBucket(partition, /*bucket=*/-1), /*offset=*/3}}),
+                        "invalid partition-bucket committed offset");
     ASSERT_TRUE(factory->indexers[0]->committed_offsets.empty());
     ASSERT_TRUE(factory->indexers[1]->committed_offsets.empty());
 
     ASSERT_OK(context->AdvanceCommittedProgress(
-        5, {RealtimePartitionBucketOffset{partition, /*bucket=*/0, /*offset=*/7},
-            RealtimePartitionBucketOffset{{{"dt", "unknown"}},
-                                          /*bucket=*/0,
-                                          /*offset=*/9}}));
+        5, {{RealtimePartitionBucket(partition, /*bucket=*/0), /*offset=*/7},
+            {RealtimePartitionBucket({{"dt", "unknown"}}, /*bucket=*/0), /*offset=*/9}}));
     ASSERT_EQ(std::vector<int64_t>({7}), factory->indexers[0]->committed_offsets);
     ASSERT_TRUE(factory->indexers[1]->committed_offsets.empty());
 
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeMemIndexerState restored_state,
+        context->GetOrCreateMemIndexer({{"dt", "unknown"}}, 0, MakeWriteSchema(), {}, pool));
+    ASSERT_EQ(10, restored_state.initial_offset);
+
     ASSERT_OK(context->AdvanceCommittedProgress(
-        5, {RealtimePartitionBucketOffset{partition, /*bucket=*/0, /*offset=*/10}}));
+        5, {{RealtimePartitionBucket(partition, /*bucket=*/0), /*offset=*/10}}));
     ASSERT_EQ(std::vector<int64_t>({7}), factory->indexers[0]->committed_offsets);
     ASSERT_NOK_WITH_MSG(context->AdvanceCommittedProgress(4, {}),
                         "committed snapshot cannot move backwards");
 
     ASSERT_OK(context->AdvanceCommittedProgress(
-        6, {RealtimePartitionBucketOffset{partition, /*bucket=*/1, /*offset=*/8}}));
+        6, {{RealtimePartitionBucket(partition, /*bucket=*/0), /*offset=*/7},
+            {RealtimePartitionBucket(partition, /*bucket=*/1), /*offset=*/8},
+            {RealtimePartitionBucket({{"dt", "unknown"}}, /*bucket=*/0), /*offset=*/9}}));
     ASSERT_EQ(std::vector<int64_t>({7}), factory->indexers[0]->committed_offsets);
     ASSERT_EQ(std::vector<int64_t>({8}), factory->indexers[1]->committed_offsets);
 }
