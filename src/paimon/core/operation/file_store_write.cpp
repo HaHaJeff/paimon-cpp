@@ -36,7 +36,6 @@
 #include "paimon/core/operation/key_value_file_store_write.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/postpone/postpone_bucket_file_store_write.h"
-#include "paimon/core/realtime/realtime_offset.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/table/bucket_mode.h"
@@ -140,7 +139,6 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                 fmt::format("not support bucket {} in append table", options.GetBucket()));
         }
         if (ctx->GetRealtimeContext()) {
-            PAIMON_RETURN_NOT_OK(RealtimeOffset::ValidateTableSchema(*schema));
             if (options.GetBucket() <= 0) {
                 return Status::Invalid("real-time append write requires fixed bucket mode");
             }

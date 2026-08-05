@@ -52,7 +52,7 @@ struct PAIMON_EXPORT RealtimePartitionBucketOffset {
     std::map<std::string, std::string> partition;
     /// Fixed bucket id.
     int32_t bucket;
-    /// Largest `_OFFSET` committed for this partition-bucket.
+    /// Largest internal offset committed for this partition-bucket.
     int64_t offset;
 };
 
@@ -63,17 +63,6 @@ struct PAIMON_EXPORT RealtimePartitionBucketOffset {
 /// created indexer available across writes, prepare-commit operations, and process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
-    /// Required non-null BIGINT field carrying partition-bucket real-time progress.
-    inline static constexpr char kOffsetFieldName[] = "_OFFSET";
-
-    /// Prepends the required `_OFFSET` field to a table schema.
-    ///
-    /// Ownership of `schema` is transferred to this method. The returned Arrow C schema preserves
-    /// the input fields and schema metadata. An input schema that already contains
-    /// `kOffsetFieldName` is rejected.
-    static Result<std::unique_ptr<::ArrowSchema>> BuildRealtimeSchema(
-        std::unique_ptr<::ArrowSchema> schema);
-
     /// Creates a context backed by Paimon's default Arrow `MemIndexer`.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 

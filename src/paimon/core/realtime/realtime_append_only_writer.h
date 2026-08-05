@@ -45,7 +45,7 @@ class RealtimeAppendOnlyWriter : public BatchWriter {
         const std::shared_ptr<RealtimeContext>& realtime_context,
         const std::shared_ptr<AppendOnlyWriter>& file_writer,
         const std::shared_ptr<arrow::Schema>& input_schema,
-        const std::map<std::string, std::string>& options, int64_t expected_offset,
+        const std::map<std::string, std::string>& options, int64_t next_offset,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
@@ -70,8 +70,7 @@ class RealtimeAppendOnlyWriter : public BatchWriter {
     RealtimeAppendOnlyWriter(const std::shared_ptr<MemIndexer>& mem_indexer,
                              const std::shared_ptr<AppendOnlyWriter>& file_writer,
                              const std::shared_ptr<arrow::Schema>& input_schema,
-                             int64_t expected_offset,
-                             const std::shared_ptr<MemoryPool>& memory_pool);
+                             int64_t next_offset, const std::shared_ptr<MemoryPool>& memory_pool);
 
     Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment);
 
@@ -79,8 +78,7 @@ class RealtimeAppendOnlyWriter : public BatchWriter {
     std::shared_ptr<MemIndexer> mem_indexer_;
     std::shared_ptr<AppendOnlyWriter> file_writer_;
     std::shared_ptr<arrow::Schema> input_schema_;
-    int64_t expected_offset_;
-    bool offset_exhausted_ = false;
+    int64_t next_offset_;
     std::mutex mem_indexer_mutex_;
     std::mutex prepare_mutex_;
 };

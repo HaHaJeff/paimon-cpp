@@ -266,7 +266,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestWriteWithInvalidBatch) {
     }
 }
 
-TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWritePreservesOffsetColumn) {
+TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteTracksInternalOffsetRange) {
     std::map<std::string, std::string> options = {
         {"file.format", "parquet"},
         {"write-only", "true"},
@@ -274,8 +274,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWritePreservesOffsetColumn) {
         {"bucket-key", "id"},
     };
     auto logical_schema =
-        arrow::schema({arrow::field("_OFFSET", arrow::int64(), /*nullable=*/false),
-                       arrow::field("id", arrow::int32()), arrow::field("name", arrow::utf8())});
+        arrow::schema({arrow::field("id", arrow::int32()), arrow::field("name", arrow::utf8())});
     auto dir = UniqueTestDirectory::Create();
     ASSERT_TRUE(dir);
     CreateTable(dir->Str(), logical_schema, options);
@@ -302,8 +301,8 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWritePreservesOffsetColumn) {
     ASSERT_OK_AND_ASSIGN(auto file_store_write, FileStoreWrite::Create(std::move(write_context)));
 
     ASSERT_OK(file_store_write->Write(MakeBatch(logical_schema, R"([
-        [0, 1, "a"],
-        [1, 2, "b"]
+        [1, "a"],
+        [2, "b"]
     ])")));
     ASSERT_NOK_WITH_MSG(
         file_store_write->PrepareCommit(/*wait_compaction=*/false, /*commit_identifier=*/0),
@@ -318,22 +317,21 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWritePreservesOffsetColumn) {
     ASSERT_FALSE(first_file->write_cols.has_value());
     std::shared_ptr<arrow::Schema> first_schema =
         ReadDataFileSchema(table_path, first_file, options);
-    ASSERT_EQ(3, first_schema->num_fields());
-    ASSERT_EQ("_OFFSET", first_schema->field(0)->name());
-    ASSERT_EQ(arrow::Type::INT64, first_schema->field(0)->type()->id());
+    ASSERT_EQ(2, first_schema->num_fields());
+    ASSERT_EQ("id", first_schema->field(0)->name());
     std::shared_ptr<arrow::StructArray> first_array =
         ReadDataFileArray(table_path, first_file, options);
     ASSERT_NE(nullptr, first_array);
     std::shared_ptr<arrow::Array> expected_first_array =
         arrow::ipc::internal::json::ArrayFromJSON(first_array->type(), R"([
-            [0, 1, "a"],
-            [1, 2, "b"]
+            [1, "a"],
+            [2, "b"]
         ])")
             .ValueOrDie();
     ASSERT_TRUE(first_array->Equals(*expected_first_array)) << first_array->ToString();
 
     ASSERT_OK(file_store_write->Write(MakeBatch(logical_schema, R"([
-        [2, 3, "c"]
+        [3, "c"]
     ])")));
     ASSERT_OK_AND_ASSIGN(auto second_prepared,
                          file_store_write->PrepareCommitWithProgress(/*commit_identifier=*/1));
@@ -347,7 +345,7 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWritePreservesOffsetColumn) {
     ASSERT_NE(nullptr, second_array);
     std::shared_ptr<arrow::Array> expected_second_array =
         arrow::ipc::internal::json::ArrayFromJSON(second_array->type(), R"([
-            [2, 3, "c"]
+            [3, "c"]
         ])")
             .ValueOrDie();
     ASSERT_TRUE(second_array->Equals(*expected_second_array)) << second_array->ToString();

@@ -28,7 +28,6 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
-#include "paimon/core/realtime/realtime_offset.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/realtime/mem_indexer.h"
 #include "paimon/testing/utils/testharness.h"
@@ -103,10 +102,9 @@ class TestingMemIndexerFactory : public MemIndexerFactory {
 
 std::unique_ptr<ArrowSchema> MakeWriteSchema() {
     auto c_schema = std::make_unique<ArrowSchema>();
-    EXPECT_TRUE(arrow::ExportSchema(*arrow::schema({arrow::field("_OFFSET", arrow::int64(), false),
-                                                    arrow::field("id", arrow::int64())}),
-                                    c_schema.get())
-                    .ok());
+    EXPECT_TRUE(
+        arrow::ExportSchema(*arrow::schema({arrow::field("id", arrow::int64())}), c_schema.get())
+            .ok());
     return c_schema;
 }
 
@@ -191,75 +189,6 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
 TEST(RealtimeContextTest, TestRejectsNullFactory) {
     ASSERT_NOK_WITH_MSG(RealtimeContext::Create(/*factory=*/nullptr),
                         "mem indexer factory is null");
-}
-
-TEST(RealtimeContextTest, TestBuildRealtimeSchema) {
-    auto logical_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(arrow::ExportSchema(*arrow::schema({arrow::field("id", arrow::int64())}),
-                                    logical_schema.get())
-                    .ok());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ArrowSchema> realtime_schema,
-                         RealtimeContext::BuildRealtimeSchema(std::move(logical_schema)));
-    std::shared_ptr<arrow::Schema> imported =
-        arrow::ImportSchema(realtime_schema.get()).ValueOrDie();
-    ASSERT_EQ(2, imported->num_fields());
-    ASSERT_EQ(RealtimeContext::kOffsetFieldName, imported->field(0)->name());
-    ASSERT_EQ(arrow::Type::INT64, imported->field(0)->type()->id());
-    ASSERT_FALSE(imported->field(0)->nullable());
-    ASSERT_EQ("id", imported->field(1)->name());
-
-    auto duplicate_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(
-        arrow::ExportSchema(*arrow::schema({arrow::field(RealtimeContext::kOffsetFieldName,
-                                                         arrow::int64(), /*nullable=*/false)}),
-                            duplicate_schema.get())
-            .ok());
-    ASSERT_NOK_WITH_MSG(RealtimeContext::BuildRealtimeSchema(std::move(duplicate_schema)),
-                        "already contains the reserved _OFFSET field");
-    ASSERT_NOK_WITH_MSG(RealtimeContext::BuildRealtimeSchema(nullptr), "input schema is null");
-}
-
-TEST(RealtimeOffsetTest, TestValidateTableSchema) {
-    auto make_schema =
-        [](const std::shared_ptr<arrow::Field>& offset_field,
-           const std::vector<std::string>& partition_keys) -> Result<std::unique_ptr<TableSchema>> {
-        arrow::FieldVector fields;
-        if (offset_field) {
-            fields.push_back(offset_field);
-        }
-        fields.push_back(arrow::field("id", arrow::int64()));
-        return TableSchema::Create(/*schema_id=*/0, arrow::schema(fields), partition_keys,
-                                   /*primary_keys=*/{}, /*options=*/{});
-    };
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableSchema> valid,
-                         make_schema(arrow::field(RealtimeContext::kOffsetFieldName, arrow::int64(),
-                                                  /*nullable=*/false),
-                                     {}));
-    ASSERT_OK(RealtimeOffset::ValidateTableSchema(*valid));
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableSchema> missing,
-                         make_schema(/*offset_field=*/nullptr, {}));
-    ASSERT_NOK_WITH_MSG(RealtimeOffset::ValidateTableSchema(*missing), "requires a _OFFSET field");
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableSchema> invalid_type,
-                         make_schema(arrow::field(RealtimeContext::kOffsetFieldName, arrow::int32(),
-                                                  /*nullable=*/false),
-                                     {}));
-    ASSERT_NOK_WITH_MSG(RealtimeOffset::ValidateTableSchema(*invalid_type),
-                        "must have BIGINT type");
-
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<TableSchema> nullable,
-        make_schema(arrow::field(RealtimeContext::kOffsetFieldName, arrow::int64()), {}));
-    ASSERT_NOK_WITH_MSG(RealtimeOffset::ValidateTableSchema(*nullable), "must be non-nullable");
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableSchema> partition_offset,
-                         make_schema(arrow::field(RealtimeContext::kOffsetFieldName, arrow::int64(),
-                                                  /*nullable=*/false),
-                                     {RealtimeContext::kOffsetFieldName}));
-    ASSERT_NOK_WITH_MSG(RealtimeOffset::ValidateTableSchema(*partition_offset),
-                        "cannot be a partition field");
 }
 
 }  // namespace

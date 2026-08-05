@@ -36,10 +36,10 @@ namespace paimon {
 class MemoryPool;
 class Predicate;
 
-/// A record batch and the contiguous offset range read from its rows.
+/// A table record batch and its framework-assigned contiguous offset range.
 ///
-/// The batch contains all table write fields, including the required `_OFFSET` field. Paimon
-/// validates that row `i` contains `offset_range.from + i` before calling `MemIndexer::Write`.
+/// The batch contains only table write fields. Row `i` is associated with
+/// `offset_range.from + i`; the offset is progress metadata and is not a table field.
 struct PAIMON_EXPORT RealtimeWriteBatch {
     /// Input batch whose ownership is transferred to `MemIndexer::Write`.
     std::unique_ptr<RecordBatch> batch;
@@ -100,7 +100,7 @@ class PAIMON_EXPORT MemIndexer {
 
     /// Adds a batch to the current building segment.
     ///
-    /// The number and `_OFFSET` values of the rows match the derived `offset_range`.
+    /// The row count matches the framework-assigned `offset_range`.
     virtual Status Write(RealtimeWriteBatch&& batch) = 0;
 
     /// Seals the current building data and opens a new building segment.
@@ -112,7 +112,7 @@ class PAIMON_EXPORT MemIndexer {
     ///
     /// Concatenating the returned readers must produce every sealed row exactly once and in write
     /// order. Each output batch contains `_VALUE_KIND` followed by all fields from the factory's
-    /// `write_schema`, including `_OFFSET`.
+    /// `write_schema`.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -126,8 +126,8 @@ class PAIMON_EXPORT MemIndexer {
     /// `offset_lower_exclusive`.
     ///
     /// Each output batch contains `_VALUE_KIND` first, followed by the fields requested by
-    /// `context.read_schema` except a duplicate `_VALUE_KIND`. `_OFFSET` is returned when requested
-    /// by the read schema. Concatenating all returned readers must produce every matching row once.
+    /// `context.read_schema` except a duplicate `_VALUE_KIND`. Concatenating all returned readers
+    /// must produce every matching row once.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
         const MemQueryContext& context) = 0;
@@ -153,9 +153,9 @@ class PAIMON_EXPORT MemIndexerFactory {
     /// Creates an indexer configured with the supplied schema, options, and memory pool.
     ///
     /// `write_schema` uses the Arrow C Data Interface and contains all table fields accepted by
-    /// `Write`, including `_OFFSET`. It is valid only during this call. An implementation may
-    /// consume its contents by using an Arrow C Data Interface importer; otherwise Paimon releases
-    /// them after this method returns.
+    /// `Write`. It is valid only during this call. An implementation may consume its contents by
+    /// using an Arrow C Data Interface importer; otherwise Paimon releases it after this method
+    /// returns.
     /// @param write_schema Complete table write schema.
     /// @param options Effective table options available to the indexer.
     /// @param memory_pool Memory pool provided by the write context.

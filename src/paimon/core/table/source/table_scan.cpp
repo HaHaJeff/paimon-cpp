@@ -40,7 +40,6 @@
 #include "paimon/core/operation/data_evolution_file_store_scan.h"
 #include "paimon/core/operation/file_store_scan.h"
 #include "paimon/core/operation/key_value_file_store_scan.h"
-#include "paimon/core/realtime/realtime_offset.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/schema_validation.h"
 #include "paimon/core/schema/table_schema.h"
@@ -220,7 +219,6 @@ Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& 
     if (!context.GetRealtimeContext()) {
         return Status::OK();
     }
-    PAIMON_RETURN_NOT_OK(RealtimeOffset::ValidateTableSchema(table_schema));
     if (!table_schema.PrimaryKeys().empty()) {
         return Status::Invalid("real-time union read currently supports append tables only");
     }

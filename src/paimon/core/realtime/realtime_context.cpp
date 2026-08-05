@@ -22,10 +22,7 @@
 #include <utility>
 #include <vector>
 
-#include "arrow/api.h"
-#include "arrow/c/bridge.h"
 #include "paimon/arrow/abi.h"
-#include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/core/realtime/partition_bucket.h"
 #include "paimon/macros.h"
 #include "paimon/realtime/arrow_mem_indexer_factory.h"
@@ -33,27 +30,6 @@
 #include "paimon/status.h"
 
 namespace paimon {
-
-Result<std::unique_ptr<ArrowSchema>> RealtimeContext::BuildRealtimeSchema(
-    std::unique_ptr<ArrowSchema> schema) {
-    if (!schema) {
-        return Status::Invalid("input schema is null");
-    }
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> arrow_schema,
-                                      arrow::ImportSchema(schema.get()));
-    if (arrow_schema->GetFieldIndex(kOffsetFieldName) >= 0) {
-        return Status::Invalid("input schema already contains the reserved _OFFSET field");
-    }
-
-    arrow::FieldVector fields = arrow_schema->fields();
-    fields.insert(fields.begin(),
-                  arrow::field(kOffsetFieldName, arrow::int64(), /*nullable=*/false));
-    std::shared_ptr<arrow::Schema> realtime_schema =
-        arrow::schema(std::move(fields), arrow_schema->metadata());
-    auto result = std::make_unique<ArrowSchema>();
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*realtime_schema, result.get()));
-    return result;
-}
 
 class RealtimeContext::Impl {
  public:

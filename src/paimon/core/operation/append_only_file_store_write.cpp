@@ -261,7 +261,7 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
                                                      partition_values.end());
     auto c_write_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*write_schema_, c_write_schema.get()));
-    int64_t expected_offset = 0;
+    int64_t next_offset = 0;
     PartitionBucket partition_bucket(partition_map, bucket);
     {
         std::lock_guard<std::mutex> lock(realtime_offsets_mutex_);
@@ -270,12 +270,12 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
             if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
                 return Status::Invalid("real-time offset has reached INT64_MAX");
             }
-            expected_offset = offset_iter->second + 1;
+            next_offset = offset_iter->second + 1;
         }
     }
     return RealtimeAppendOnlyWriter::Create(partition_map, bucket, std::move(c_write_schema),
                                             realtime_context_, writer, write_schema_,
-                                            options_.ToMap(), expected_offset, pool_);
+                                            options_.ToMap(), next_offset, pool_);
 }
 
 Result<AppendOnlyFileStoreWrite::WriterFactory> AppendOnlyFileStoreWrite::GetDataFileWriterFactory(

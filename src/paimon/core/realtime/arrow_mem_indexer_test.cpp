@@ -52,9 +52,8 @@ class ForeignReadView : public MemReadView {
 class ArrowMemIndexerTest : public testing::Test {
  public:
     void SetUp() override {
-        schema_ = arrow::schema({arrow::field("_OFFSET", arrow::int64(), false),
-                                 arrow::field("id", arrow::int64()),
-                                 arrow::field("value", arrow::utf8())});
+        schema_ = arrow::schema(
+            {arrow::field("id", arrow::int64()), arrow::field("value", arrow::utf8())});
         pool_ = GetDefaultPool();
         arrow_pool_ = GetArrowPool(pool_);
         indexer_ = std::make_shared<ArrowMemIndexer>(schema_, pool_, arrow_pool_);
@@ -90,17 +89,17 @@ TEST_F(ArrowMemIndexerTest, TestWriteValidationSealAndClose) {
 
     ASSERT_NOK_WITH_MSG(indexer_->Write(RealtimeWriteBatch{nullptr, Range(0, 0)}),
                         "write batch is null");
-    ASSERT_NOK_WITH_MSG(indexer_->Write(RealtimeWriteBatch{
-                            MakeBatch(R"([[0, 0, "a"], [1, 1, "b"]])"), Range(0, 0)}),
-                        "offset range does not match batch row count");
+    ASSERT_NOK_WITH_MSG(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[0, "a"], [1, "b"]])"), Range(0, 0)}),
+        "offset range does not match batch row count");
 
-    ASSERT_OK(indexer_->Write(
-        RealtimeWriteBatch{MakeBatch(R"([[0, 0, "a"], [1, 1, "b"]])"), Range(0, 1)}));
-    ASSERT_NOK_WITH_MSG(indexer_->Write(RealtimeWriteBatch{
-                            MakeBatch(R"([[3, 3, "d"], [4, 4, "e"]])"), Range(3, 4)}),
-                        "offset ranges must be contiguous");
-    ASSERT_OK(indexer_->Write(
-        RealtimeWriteBatch{MakeBatch(R"([[2, 2, "c"], [3, 3, "d"]])"), Range(2, 3)}));
+    ASSERT_OK(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[0, "a"], [1, "b"]])"), Range(0, 1)}));
+    ASSERT_NOK_WITH_MSG(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[3, "d"], [4, "e"]])"), Range(3, 4)}),
+        "offset ranges must be contiguous");
+    ASSERT_OK(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[2, "c"], [3, "d"]])"), Range(2, 3)}));
 
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
                          indexer_->SealForCommit());
@@ -113,7 +112,7 @@ TEST_F(ArrowMemIndexerTest, TestWriteValidationSealAndClose) {
     ASSERT_OK(indexer_->Close());
     ASSERT_EQ(0, indexer_->GetMemoryUsage());
     ASSERT_NOK_WITH_MSG(
-        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[4, 4, "e"]])"), Range(4, 4)}),
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[4, "e"]])"), Range(4, 4)}),
         "mem indexer is closed");
     ASSERT_NOK_WITH_MSG(indexer_->SealForCommit(), "mem indexer is closed");
     ASSERT_NOK_WITH_MSG(indexer_->AcquireReadView(), "mem indexer is closed");
@@ -122,19 +121,19 @@ TEST_F(ArrowMemIndexerTest, TestWriteValidationSealAndClose) {
 }
 
 TEST_F(ArrowMemIndexerTest, TestQueryReaderClipsCommittedOffsetWithBitmap) {
-    ASSERT_OK(indexer_->Write(RealtimeWriteBatch{
-        MakeBatch(R"([[10, 10, "a"], [11, 11, "b"], [12, 12, "c"]])"), Range(10, 12)}));
+    ASSERT_OK(indexer_->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[10, "a"], [11, "b"], [12, "c"]])"), Range(10, 12)}));
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
                          indexer_->SealForCommit());
     ASSERT_TRUE(segment.has_value());
-    ASSERT_OK(indexer_->Write(
-        RealtimeWriteBatch{MakeBatch(R"([[13, 13, "d"], [14, 14, "e"]])"), Range(13, 14)}));
+    ASSERT_OK(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[13, "d"], [14, "e"]])"), Range(13, 14)}));
 
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer_->AcquireReadView());
     ASSERT_EQ(std::optional<Range>(Range(10, 14)), view->GetOffsetRange());
 
-    std::shared_ptr<arrow::Schema> read_schema = arrow::schema(
-        {arrow::field("_OFFSET", arrow::int64(), false), arrow::field("value", arrow::utf8())});
+    std::shared_ptr<arrow::Schema> read_schema =
+        arrow::schema({arrow::field("value", arrow::utf8())});
     {
         std::unique_ptr<ArrowSchema> c_schema = MakeReadSchema(read_schema);
         MemQueryContext context{c_schema.get(), /*predicate=*/nullptr,
