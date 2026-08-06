@@ -459,6 +459,8 @@ TEST_F(RealtimeWriteInteTest, TestCommitOrdersPreparedOffsetRanges) {
     commits.push_back(std::move(second_commits[0]));
     std::reverse(commits.begin(), commits.end());
     ASSERT_OK(Commit(commits, /*commit_identifier=*/1));
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(4, committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
     ASSERT_OK(writer->Close());
 
     std::vector<Row> expected_rows = first_rows;

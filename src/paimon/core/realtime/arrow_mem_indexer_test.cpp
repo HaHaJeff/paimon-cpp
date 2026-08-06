@@ -68,6 +68,17 @@ class ArrowMemIndexerTest : public testing::Test {
         return RecordBatchBuilder(&c_array).Finish().value();
     }
 
+    std::unique_ptr<RecordBatch> MakeSlicedBatch(const std::string& json, int64_t offset,
+                                                 int64_t length) const {
+        std::shared_ptr<arrow::Array> array =
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema_->fields()), json)
+                .ValueOrDie()
+                ->Slice(offset, length);
+        ArrowArray c_array;
+        EXPECT_TRUE(arrow::ExportArray(*array, &c_array).ok());
+        return RecordBatchBuilder(&c_array).Finish().value();
+    }
+
     std::unique_ptr<ArrowSchema> MakeReadSchema(
         const std::shared_ptr<arrow::Schema>& schema) const {
         auto c_schema = std::make_unique<ArrowSchema>();
@@ -174,6 +185,35 @@ TEST_F(ArrowMemIndexerTest, TestQueryReaderClipsCommittedOffsetWithBitmap) {
         std::vector<std::unique_ptr<BatchReader>> readers,
         indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/14, context));
     ASSERT_TRUE(readers.empty());
+}
+
+TEST_F(ArrowMemIndexerTest, TestCommitReaderPreservesSlicedBatch) {
+    ASSERT_OK(indexer_->Write(RealtimeWriteBatch{
+        MakeSlicedBatch(R"([[0, "a"], [1, null], [2, "c"]])", /*offset=*/1, /*length=*/2),
+        Range(0, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
+                         indexer_->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         indexer_->CreateCommitReaders(segment.value()));
+    ASSERT_EQ(1, readers.size());
+
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+    arrow::Result<std::shared_ptr<arrow::Array>> import_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(import_result.ok()) << import_result.status().ToString();
+    std::shared_ptr<arrow::Array> actual_array = std::move(import_result).ValueOrDie();
+    std::shared_ptr<arrow::DataType> expected_type = arrow::struct_({
+        arrow::field("_VALUE_KIND", arrow::int8()),
+        arrow::field("id", arrow::int64()),
+        arrow::field("value", arrow::utf8()),
+    });
+    std::shared_ptr<arrow::Array> expected_array =
+        arrow::ipc::internal::json::ArrayFromJSON(expected_type, R"([[0, 1, null], [0, 2, "c"]])")
+            .ValueOrDie();
+    ASSERT_TRUE(actual_array->Equals(*expected_array))
+        << "expected: " << expected_array->ToString() << ", actual: " << actual_array->ToString();
 }
 
 TEST_F(ArrowMemIndexerTest, TestRejectsHandlesFromAnotherIndexerImplementation) {

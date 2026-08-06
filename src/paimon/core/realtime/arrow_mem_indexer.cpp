@@ -137,10 +137,8 @@ class ArrowMemIndexer::CommitBatchReader : public BatchReader {
         const arrow::FieldVector& data_fields = stored.data->struct_type()->fields();
         schema_fields.insert(schema_fields.end(), data_fields.begin(), data_fields.end());
 
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            std::shared_ptr<arrow::StructArray> result,
-            arrow::StructArray::Make(fields, schema_fields, stored.data->null_bitmap(),
-                                     stored.data->null_count(), stored.data->offset()));
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::StructArray> result,
+                                          arrow::StructArray::Make(fields, schema_fields));
         auto c_array = std::make_unique<ArrowArray>();
         auto c_schema = std::make_unique<ArrowSchema>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*result, c_array.get(), c_schema.get()));
