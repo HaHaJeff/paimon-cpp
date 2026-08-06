@@ -66,7 +66,7 @@
 #include "paimon/core/operation/commit/commit_changes_provider.h"
 #include "paimon/core/operation/commit/compacted_changelog_path_resolver.h"
 #include "paimon/core/operation/commit/conflict_detection.h"
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
+#include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/operation/commit/row_tracking_commit_utils.h"
 #include "paimon/core/operation/commit/sequence_snapshot_properties.h"
 #include "paimon/core/operation/expire_snapshots.h"
@@ -402,7 +402,8 @@ Result<int32_t> FileStoreCommitImpl::FilterAndCommit(
         PAIMON_RETURN_NOT_OK(CheckFilesExistence(retry_committables));
         for (const auto& committable : retry_committables) {
             PAIMON_RETURN_NOT_OK(Commit(committable, /*check_append_files=*/true,
-                                        /*retry_on_conflict=*/true));
+                                        /*retry_on_conflict=*/true,
+                                        /*realtime_ranges=*/{}));
         }
     }
     return retry_committables.size();
@@ -707,7 +708,8 @@ Status FileStoreCommitImpl::ExecuteOverwrite(
         PAIMON_ASSIGN_OR_RAISE(int32_t cnt,
                                TryCommit(changes->compact_table_files, /*changelog_files=*/{},
                                          changes->compact_index_files, identifier, watermark,
-                                         committable->Properties(), Snapshot::CommitKind::Compact(),
+                                         committable->Properties(), /*realtime_ranges=*/{},
+                                         Snapshot::CommitKind::Compact(),
                                          /*detect_conflicts=*/true,
                                          /*retry_on_conflict=*/true));
         *attempt += cnt;
@@ -810,12 +812,14 @@ Result<int32_t> FileStoreCommitImpl::TryOverwrite(
     std::shared_ptr<CommitChangesProvider> changes_provider =
         commit_scanner_->OverwriteChangesProvider(partitions, changes, index_entries);
     return TryCommit(changes_provider, commit_identifier, watermark, properties,
-                     Snapshot::CommitKind::Overwrite(), /*detect_conflicts=*/true,
+                     /*realtime_ranges=*/{}, Snapshot::CommitKind::Overwrite(),
+                     /*detect_conflicts=*/true,
                      /*retry_on_conflict=*/true);
 }
 
-Status FileStoreCommitImpl::Commit(const std::shared_ptr<ManifestCommittable>& committable,
-                                   bool check_append_files, bool retry_on_conflict) {
+Status FileStoreCommitImpl::Commit(
+    const std::shared_ptr<ManifestCommittable>& committable, bool check_append_files,
+    bool retry_on_conflict, const std::map<RealtimePartitionBucket, Range>& realtime_ranges) {
     PAIMON_LOG_INFO(logger_, "Ready to commit to table %s, number of commit messages: %zu",
                     table_name_.c_str(), committable->FileCommittables().size());
     PAIMON_ASSIGN_OR_RAISE(std::string committable_str, committable->ToString());
@@ -853,10 +857,11 @@ Status FileStoreCommitImpl::Commit(const std::shared_ptr<ManifestCommittable>& c
         }
 
         PAIMON_ASSIGN_OR_RAISE(
-            int32_t cnt, TryCommit(changes.append_table_files, changes.append_changelog,
-                                   changes.append_index_files, committable->Identifier(),
-                                   committable->Watermark(), committable->Properties(), commit_kind,
-                                   check_append_files, retry_on_conflict));
+            int32_t cnt,
+            TryCommit(changes.append_table_files, changes.append_changelog,
+                      changes.append_index_files, committable->Identifier(),
+                      committable->Watermark(), committable->Properties(), realtime_ranges,
+                      commit_kind, check_append_files, retry_on_conflict));
         attempt += cnt;
         generated_snapshot += 1;
     }
@@ -866,7 +871,7 @@ Status FileStoreCommitImpl::Commit(const std::shared_ptr<ManifestCommittable>& c
                                TryCommit(changes.compact_table_files, changes.compact_changelog,
                                          changes.compact_index_files, committable->Identifier(),
                                          committable->Watermark(), committable->Properties(),
-                                         Snapshot::CommitKind::Compact(),
+                                         /*realtime_ranges=*/{}, Snapshot::CommitKind::Compact(),
                                          /*detect_conflicts=*/true, retry_on_conflict));
         attempt += cnt;
         generated_snapshot += 1;
@@ -879,23 +884,20 @@ Status FileStoreCommitImpl::Commit(
     std::optional<int64_t> watermark) {
     std::shared_ptr<ManifestCommittable> committable =
         CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
-    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/true);
+    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/true,
+                  /*realtime_ranges=*/{});
 }
 
 Status FileStoreCommitImpl::CommitWithProgress(
     const std::vector<RealtimeCommitProgress>& realtime_commits, int64_t identifier,
     std::optional<int64_t> watermark) {
-    PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
-                           snapshot_manager_->LatestSnapshot());
-    PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap committed_offsets,
-                           RealtimeSnapshotProperties::ReadOffsets(latest_snapshot, fs_));
-    PAIMON_ASSIGN_OR_RAISE(
-        RealtimeSnapshotProperties::ValidatedCommitProgress validated_progress,
-        RealtimeSnapshotProperties::SortAndValidate(realtime_commits, committed_offsets));
+    std::vector<RealtimeCommitProgress> ordered_commits = realtime_commits;
+    RealtimeCommitProperties::Sort(&ordered_commits);
 
     std::vector<std::shared_ptr<CommitMessage>> commit_messages;
-    commit_messages.reserve(validated_progress.ordered_commits.size());
-    for (const RealtimeCommitProgress& realtime_commit : validated_progress.ordered_commits) {
+    commit_messages.reserve(ordered_commits.size());
+    std::map<RealtimePartitionBucket, Range> realtime_ranges;
+    for (const RealtimeCommitProgress& realtime_commit : ordered_commits) {
         if (!realtime_commit.commit_message) {
             return Status::Invalid("real-time commit message is null");
         }
@@ -906,41 +908,49 @@ Status FileStoreCommitImpl::CommitWithProgress(
         }
         std::map<std::string, std::string> message_partition;
         PAIMON_ASSIGN_OR_RAISE(message_partition, PartitionToMap(commit_message->Partition()));
-        if (message_partition != realtime_commit.partition ||
-            commit_message->Bucket() != realtime_commit.bucket) {
+        if (message_partition != realtime_commit.partition_bucket.partition ||
+            commit_message->Bucket() != realtime_commit.partition_bucket.bucket) {
             return Status::Invalid(
                 "real-time commit progress does not match commit message partition and bucket");
+        }
+        auto [range_iter, inserted] =
+            realtime_ranges.emplace(realtime_commit.partition_bucket, realtime_commit.offset_range);
+        if (!inserted) {
+            const Range& previous_range = range_iter->second;
+            if (previous_range.to == std::numeric_limits<int64_t>::max() ||
+                realtime_commit.offset_range.from != previous_range.to + 1) {
+                return Status::Invalid(
+                    fmt::format("real-time commit offsets for bucket {} are not contiguous",
+                                realtime_commit.partition_bucket.bucket));
+            }
+            range_iter->second = Range(previous_range.from, realtime_commit.offset_range.to);
         }
         commit_messages.push_back(realtime_commit.commit_message);
     }
 
-    std::map<std::string, std::string> properties;
-    if (!validated_progress.delta_offsets.empty()) {
-        PAIMON_ASSIGN_OR_RAISE(
-            properties[RealtimeSnapshotProperties::kOffsetsDeltaKey],
-            RealtimeSnapshotProperties::SerializeOffsets(validated_progress.delta_offsets));
-    }
     std::shared_ptr<ManifestCommittable> committable =
-        CreateManifestCommittable(identifier, commit_messages, watermark, properties);
-    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/false);
+        CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
+    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/false,
+                  realtime_ranges);
 }
 
-Result<int32_t> FileStoreCommitImpl::TryCommit(const std::vector<ManifestEntry>& delta_files,
-                                               const std::vector<ManifestEntry>& changelog_files,
-                                               const std::vector<IndexManifestEntry>& index_entries,
-                                               int64_t identifier, std::optional<int64_t> watermark,
-                                               const std::map<std::string, std::string>& properties,
-                                               Snapshot::CommitKind commit_kind,
-                                               bool detect_conflicts, bool retry_on_conflict) {
+Result<int32_t> FileStoreCommitImpl::TryCommit(
+    const std::vector<ManifestEntry>& delta_files,
+    const std::vector<ManifestEntry>& changelog_files,
+    const std::vector<IndexManifestEntry>& index_entries, int64_t identifier,
+    std::optional<int64_t> watermark, const std::map<std::string, std::string>& properties,
+    const std::map<RealtimePartitionBucket, Range>& realtime_ranges,
+    Snapshot::CommitKind commit_kind, bool detect_conflicts, bool retry_on_conflict) {
     std::shared_ptr<CommitChangesProvider> changes_provider =
         CommitChangesProvider::Provider(delta_files, changelog_files, index_entries);
-    return TryCommit(changes_provider, identifier, watermark, properties, commit_kind,
-                     detect_conflicts, retry_on_conflict);
+    return TryCommit(changes_provider, identifier, watermark, properties, realtime_ranges,
+                     commit_kind, detect_conflicts, retry_on_conflict);
 }
 
 Result<int32_t> FileStoreCommitImpl::TryCommit(
     const std::shared_ptr<CommitChangesProvider>& changes_provider, int64_t identifier,
     std::optional<int64_t> watermark, const std::map<std::string, std::string>& properties,
+    const std::map<RealtimePartitionBucket, Range>& realtime_ranges,
     Snapshot::CommitKind commit_kind, bool detect_conflicts, bool retry_on_conflict) {
     int32_t retry_count = 0;
     int64_t start_millis = DateTimeUtils::GetCurrentUTCTimeUs() / 1000;
@@ -949,10 +959,15 @@ Result<int32_t> FileStoreCommitImpl::TryCommit(
                                snapshot_manager_->LatestSnapshot());
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<CommitChanges> commit_changes,
                                changes_provider->Provide(latest_snapshot));
+        using SnapshotProperties = std::map<std::string, std::string>;
+        PAIMON_ASSIGN_OR_RAISE(
+            SnapshotProperties snapshot_properties,
+            RealtimeCommitProperties::Build(properties, latest_snapshot, realtime_ranges, fs_,
+                                            root_path_, snapshot_manager_->Branch()));
         PAIMON_ASSIGN_OR_RAISE(
             bool commit_success,
             TryCommitOnce(commit_changes->delta_files, commit_changes->changelog_files,
-                          commit_changes->index_entries, identifier, watermark, properties,
+                          commit_changes->index_entries, identifier, watermark, snapshot_properties,
                           commit_kind, latest_snapshot, detect_conflicts));
         if (commit_success) {
             break;
@@ -1246,12 +1261,7 @@ Result<bool> FileStoreCommitImpl::TryCommitOnce(
         statistics = std::nullopt;
     }
 
-    using SnapshotProperties = std::map<std::string, std::string>;
-    PAIMON_ASSIGN_OR_RAISE(
-        SnapshotProperties snapshot_properties,
-        RealtimeSnapshotProperties::MergeOffsets(
-            properties, latest_snapshot, fs_,
-            RealtimeSnapshotProperties::OffsetsDirectory(root_path_, snapshot_manager_->Branch())));
+    std::map<std::string, std::string> snapshot_properties = properties;
     if (options_.WriteSequenceNumberInitMode() == CoreOptions::SequenceNumberInitMode::SNAPSHOT) {
         PAIMON_ASSIGN_OR_RAISE(std::optional<int64_t> latest_max_sequence_number,
                                SequenceSnapshotProperties::MaxSequenceNumber(latest_snapshot));

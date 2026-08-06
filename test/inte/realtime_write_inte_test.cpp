@@ -42,7 +42,7 @@
 #include "paimon/commit_context.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/core/core_options.h"
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
+#include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
 #include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/defs.h"
@@ -365,7 +365,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
         PAIMON_ASSIGN_OR_RAISE(CoreOptions options, CoreOptions::FromMap(options_));
         SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
         PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> snapshot, snapshot_manager.LatestSnapshot());
-        return RealtimeSnapshotProperties::ReadOffsets(snapshot, options.GetFileSystem());
+        return RealtimeCommitProperties::ReadOffsets(snapshot, options.GetFileSystem());
     }
 
     void FinalizeCommitAndCheck(FileStoreWrite* writer,
@@ -1089,7 +1089,7 @@ TEST_F(RealtimeWriteInteTest, TestMultipleBucketsRestoreIndependentOffsets) {
     ASSERT_EQ(2, second_commits.size());
     std::map<int32_t, Range> prepared_ranges;
     for (const RealtimeCommitProgress& commit : second_commits) {
-        prepared_ranges.emplace(commit.bucket, commit.offset_range);
+        prepared_ranges.emplace(commit.partition_bucket.bucket, commit.offset_range);
     }
     ASSERT_EQ(Range(2, 2), prepared_ranges.at(0));
     ASSERT_EQ(Range(3, 3), prepared_ranges.at(1));

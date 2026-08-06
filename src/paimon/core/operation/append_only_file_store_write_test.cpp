@@ -310,8 +310,8 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteTracksInternalOffsetRange)
     ASSERT_OK_AND_ASSIGN(auto first_prepared,
                          file_store_write->PrepareCommitWithProgress(/*commit_identifier=*/0));
     ASSERT_EQ(1, first_prepared.size());
-    ASSERT_TRUE(first_prepared[0].partition.empty());
-    ASSERT_EQ(0, first_prepared[0].bucket);
+    ASSERT_TRUE(first_prepared[0].partition_bucket.partition.empty());
+    ASSERT_EQ(0, first_prepared[0].partition_bucket.bucket);
     ASSERT_EQ(Range(0, 1), first_prepared[0].offset_range);
     std::shared_ptr<DataFileMeta> first_file = OnlyNewFile({first_prepared[0].commit_message});
     ASSERT_FALSE(first_file->write_cols.has_value());
@@ -336,8 +336,8 @@ TEST_F(AppendOnlyFileStoreWriteTest, TestRealtimeWriteTracksInternalOffsetRange)
     ASSERT_OK_AND_ASSIGN(auto second_prepared,
                          file_store_write->PrepareCommitWithProgress(/*commit_identifier=*/1));
     ASSERT_EQ(1, second_prepared.size());
-    ASSERT_TRUE(second_prepared[0].partition.empty());
-    ASSERT_EQ(0, second_prepared[0].bucket);
+    ASSERT_TRUE(second_prepared[0].partition_bucket.partition.empty());
+    ASSERT_EQ(0, second_prepared[0].partition_bucket.bucket);
     ASSERT_EQ(Range(2, 2), second_prepared[0].offset_range);
     std::shared_ptr<DataFileMeta> second_file = OnlyNewFile({second_prepared[0].commit_message});
     std::shared_ptr<arrow::StructArray> second_array =

@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
+#include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/snapshot.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/plan_impl.h"
@@ -71,8 +71,8 @@ Result<RealtimeOffsetMap> RealtimeTableScan::LoadCommittedOffsets(
     }
     PAIMON_ASSIGN_OR_RAISE(Snapshot snapshot,
                            snapshot_manager_->LoadSnapshot(disk_plan->SnapshotId().value()));
-    return RealtimeSnapshotProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
-                                                   file_system_);
+    return RealtimeCommitProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
+                                                 file_system_);
 }
 
 Result<RealtimeTableScan::MemoryViewMap> RealtimeTableScan::CollectActiveMemoryViews(

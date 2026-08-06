@@ -35,24 +35,14 @@ namespace paimon {
 
 class FileSystem;
 
-class RealtimeSnapshotProperties {
+class RealtimeCommitProperties {
  public:
-    /// Ordered commit progress and the latest offset contributed by each partition-bucket.
-    struct ValidatedCommitProgress {
-        std::vector<RealtimeCommitProgress> ordered_commits;
-        RealtimeOffsetMap delta_offsets;
-    };
-
-    RealtimeSnapshotProperties() = delete;
+    RealtimeCommitProperties() = delete;
 
     static constexpr const char* kOffsetsKey = "realtime.offsets";
-    static constexpr const char* kOffsetsDeltaKey = "realtime.offsets.delta";
     static constexpr int32_t kOffsetsVersion = 1;
 
-    /// Orders progress entries and verifies they form a contiguous prefix after committed offsets.
-    static Result<ValidatedCommitProgress> SortAndValidate(
-        const std::vector<RealtimeCommitProgress>& commits,
-        const RealtimeOffsetMap& committed_offsets);
+    static void Sort(std::vector<RealtimeCommitProgress>* commits);
 
     static std::string OffsetsDirectory(const std::string& table_root, const std::string& branch);
 
@@ -61,10 +51,13 @@ class RealtimeSnapshotProperties {
 
     static Result<std::string> SerializeOffsets(const RealtimeOffsetMap& offsets);
 
-    static Result<std::map<std::string, std::string>> MergeOffsets(
+    /// Builds snapshot properties against `latest_snapshot` and applies real-time progress.
+    static Result<std::map<std::string, std::string>> Build(
         const std::map<std::string, std::string>& properties,
         const std::optional<Snapshot>& latest_snapshot,
-        const std::shared_ptr<FileSystem>& file_system, const std::string& offsets_directory);
+        const std::map<RealtimePartitionBucket, Range>& realtime_ranges,
+        const std::shared_ptr<FileSystem>& file_system, const std::string& table_root,
+        const std::string& branch);
 
  private:
     static Result<std::string> WriteOffsets(const RealtimeOffsetMap& offsets,

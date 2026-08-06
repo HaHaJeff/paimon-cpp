@@ -32,7 +32,7 @@
 #include "paimon/core/mergetree/compact/merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/core/operation/append_only_file_store_write.h"
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
+#include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/operation/key_value_file_store_write.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/postpone/postpone_bucket_file_store_write.h"
@@ -143,7 +143,7 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                                    snapshot_manager->LatestSnapshot());
             if (latest_snapshot) {
                 PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap realtime_committed_offsets,
-                                       RealtimeSnapshotProperties::ReadOffsets(
+                                       RealtimeCommitProperties::ReadOffsets(
                                            latest_snapshot, options.GetFileSystem()));
                 PAIMON_RETURN_NOT_OK(ctx->GetRealtimeContext()->AdvanceCommittedProgress(
                     latest_snapshot->Id(), realtime_committed_offsets));

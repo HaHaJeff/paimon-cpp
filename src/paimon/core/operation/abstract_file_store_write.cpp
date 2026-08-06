@@ -319,8 +319,9 @@ Result<std::vector<RealtimeCommitProgress>> AbstractFileStoreWrite::PrepareRealt
                                                      snapshot.partition));
         std::map<std::string, std::string> partition(partition_values.begin(),
                                                      partition_values.end());
-        result.push_back(RealtimeCommitProgress{committable, std::move(partition), snapshot.bucket,
-                                                increment.GetRealtimeOffsetRange().value()});
+        result.push_back(RealtimeCommitProgress{
+            committable, RealtimePartitionBucket(std::move(partition), snapshot.bucket),
+            increment.GetRealtimeOffsetRange().value()});
     }
     {
         std::lock_guard<std::mutex> lock(realtime_metrics_mutex_);

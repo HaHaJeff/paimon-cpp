@@ -17,7 +17,7 @@
  * under the License.
  */
 
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
+#include "paimon/core/operation/commit/realtime_commit_properties.h"
 
 #include <cstdint>
 #include <limits>
@@ -64,7 +64,7 @@ const char kTargetJson[] = R"({
     ]
 })";
 
-class RealtimeSnapshotPropertiesTest : public testing::Test {
+class RealtimeCommitPropertiesTest : public testing::Test {
  protected:
     void SetUp() override {
         directory_ = UniqueTestDirectory::Create();
@@ -106,9 +106,16 @@ class RealtimeSnapshotPropertiesTest : public testing::Test {
     Result<RealtimeOffsetMap> ReadJson(const std::string& json) {
         PAIMON_ASSIGN_OR_RAISE(std::string path, WriteJson(json));
         std::map<std::string, std::string> properties = {
-            {RealtimeSnapshotProperties::kOffsetsKey, path}};
-        return RealtimeSnapshotProperties::ReadOffsets(
+            {RealtimeCommitProperties::kOffsetsKey, path}};
+        return RealtimeCommitProperties::ReadOffsets(
             std::optional<Snapshot>(MakeSnapshot(properties)), file_system_);
+    }
+
+    Result<Snapshot> MakeSnapshotWithOffsets(const RealtimeOffsetMap& offsets) {
+        PAIMON_ASSIGN_OR_RAISE(std::string json,
+                               RealtimeCommitProperties::SerializeOffsets(offsets));
+        PAIMON_ASSIGN_OR_RAISE(std::string path, WriteJson(json));
+        return MakeSnapshot(Properties{{RealtimeCommitProperties::kOffsetsKey, path}});
     }
 
     std::unique_ptr<UniqueTestDirectory> directory_;
@@ -124,22 +131,22 @@ RealtimeOffsetMap TargetOffsets() {
 
 }  // namespace
 
-TEST_F(RealtimeSnapshotPropertiesTest, SerializeAndDeserializeTargetJson) {
+TEST_F(RealtimeCommitPropertiesTest, SerializeAndDeserializeTargetJson) {
     RealtimeOffsetMap expected = TargetOffsets();
     ASSERT_OK_AND_ASSIGN(std::string actual_json,
-                         RealtimeSnapshotProperties::SerializeOffsets(expected));
+                         RealtimeCommitProperties::SerializeOffsets(expected));
     ASSERT_EQ(kTargetJson, actual_json);
 
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap actual, ReadJson(kTargetJson));
     ASSERT_EQ(expected, actual);
     ASSERT_OK_AND_ASSIGN(std::string round_trip_json,
-                         RealtimeSnapshotProperties::SerializeOffsets(actual));
+                         RealtimeCommitProperties::SerializeOffsets(actual));
     ASSERT_EQ(kTargetJson, round_trip_json);
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, SerializeEmptyOffsets) {
+TEST_F(RealtimeCommitPropertiesTest, SerializeEmptyOffsets) {
     ASSERT_OK_AND_ASSIGN(std::string actual_json,
-                         RealtimeSnapshotProperties::SerializeOffsets(/*offsets=*/{}));
+                         RealtimeCommitProperties::SerializeOffsets(/*offsets=*/{}));
     ASSERT_EQ(R"({
     "version": 1,
     "offsets": []
@@ -147,62 +154,62 @@ TEST_F(RealtimeSnapshotPropertiesTest, SerializeEmptyOffsets) {
               actual_json);
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, SerializeRejectsInvalidOffsets) {
+TEST_F(RealtimeCommitPropertiesTest, SerializeRejectsInvalidOffsets) {
     RealtimeOffsetMap negative_bucket = {{RealtimePartitionBucket({{"dt", "2"}}, -1), 0}};
-    ASSERT_NOK_WITH_MSG(RealtimeSnapshotProperties::SerializeOffsets(negative_bucket),
+    ASSERT_NOK_WITH_MSG(RealtimeCommitProperties::SerializeOffsets(negative_bucket),
                         "invalid bucket -1");
 
     RealtimeOffsetMap negative_offset = {
         {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0), -1}};
-    ASSERT_NOK_WITH_MSG(RealtimeSnapshotProperties::SerializeOffsets(negative_offset),
+    ASSERT_NOK_WITH_MSG(RealtimeCommitProperties::SerializeOffsets(negative_offset),
                         "invalid offset -1");
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, PartitionBucketAndOffsetsDirectory) {
+TEST_F(RealtimeCommitPropertiesTest, PartitionBucketAndOffsetsDirectory) {
     RealtimePartitionBucket expected_partition_bucket({{"dt", "a/b"}, {"region", "cn"}}, 3);
     ASSERT_EQ(expected_partition_bucket,
               RealtimePartitionBucket({{"dt", "a/b"}, {"region", "cn"}}, /*bucket=*/3));
-    ASSERT_EQ("/table/metadata", RealtimeSnapshotProperties::OffsetsDirectory("/table", "main"));
+    ASSERT_EQ("/table/metadata", RealtimeCommitProperties::OffsetsDirectory("/table", "main"));
     ASSERT_EQ("/table/branch/branch-dev/metadata",
-              RealtimeSnapshotProperties::OffsetsDirectory("/table", "dev"));
+              RealtimeCommitProperties::OffsetsDirectory("/table", "dev"));
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, ReadOffsetsWithoutProgress) {
+TEST_F(RealtimeCommitPropertiesTest, ReadOffsetsWithoutProgress) {
     ASSERT_OK_AND_ASSIGN(
         RealtimeOffsetMap no_snapshot,
-        RealtimeSnapshotProperties::ReadOffsets(/*snapshot=*/std::nullopt, file_system_));
+        RealtimeCommitProperties::ReadOffsets(/*snapshot=*/std::nullopt, file_system_));
     ASSERT_TRUE(no_snapshot.empty());
 
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap no_properties,
-                         RealtimeSnapshotProperties::ReadOffsets(
+                         RealtimeCommitProperties::ReadOffsets(
                              std::optional<Snapshot>(MakeSnapshot(std::nullopt)), file_system_));
     ASSERT_TRUE(no_properties.empty());
 
     std::map<std::string, std::string> unrelated_properties = {{"other", "value"}};
     ASSERT_OK_AND_ASSIGN(
         RealtimeOffsetMap no_offsets_property,
-        RealtimeSnapshotProperties::ReadOffsets(
+        RealtimeCommitProperties::ReadOffsets(
             std::optional<Snapshot>(MakeSnapshot(unrelated_properties)), file_system_));
     ASSERT_TRUE(no_offsets_property.empty());
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, ReadOffsetsRequiresFileSystem) {
+TEST_F(RealtimeCommitPropertiesTest, ReadOffsetsRequiresFileSystem) {
     std::map<std::string, std::string> properties = {
-        {RealtimeSnapshotProperties::kOffsetsKey, "metadata/test.offsets"}};
+        {RealtimeCommitProperties::kOffsetsKey, "metadata/test.offsets"}};
     ASSERT_NOK_WITH_MSG(
-        RealtimeSnapshotProperties::ReadOffsets(std::optional<Snapshot>(MakeSnapshot(properties)),
-                                                /*file_system=*/nullptr),
+        RealtimeCommitProperties::ReadOffsets(std::optional<Snapshot>(MakeSnapshot(properties)),
+                                              /*file_system=*/nullptr),
         "file system is null");
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, ReadOffsetsPropagatesFileError) {
+TEST_F(RealtimeCommitPropertiesTest, ReadOffsetsPropagatesFileError) {
     std::map<std::string, std::string> properties = {
-        {RealtimeSnapshotProperties::kOffsetsKey, directory_->Str() + "/missing.offsets"}};
-    ASSERT_NOK(RealtimeSnapshotProperties::ReadOffsets(
+        {RealtimeCommitProperties::kOffsetsKey, directory_->Str() + "/missing.offsets"}};
+    ASSERT_NOK(RealtimeCommitProperties::ReadOffsets(
         std::optional<Snapshot>(MakeSnapshot(properties)), file_system_));
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, DeserializeRejectsInvalidJson) {
+TEST_F(RealtimeCommitPropertiesTest, DeserializeRejectsInvalidJson) {
     const std::vector<std::pair<std::string, std::string>> invalid_json_cases = {
         {"{", "deserialize failed"},
         {R"([])", "value must be an object"},
@@ -210,7 +217,6 @@ TEST_F(RealtimeSnapshotPropertiesTest, DeserializeRejectsInvalidJson) {
         {R"({"version":2,"offsets":[]})", "unsupported offsets version 2"},
         {R"({"version":1,"offsets":{}})", "value must be an array"},
         {R"({"version":1,"offsets":[{"bucket":0,"offset":1}]})", "key must exist"},
-        {R"({"version":1,"offsets":[{"partition":{},"offset":1}]})", "key must exist"},
         {R"({"version":1,"offsets":[{"partition":{},"bucket":0}]})", "key must exist"},
         {R"({"version":1,"offsets":[{"partition":"dt=2","bucket":0,"offset":1}]})",
          "value must be an object"},
@@ -233,142 +239,111 @@ TEST_F(RealtimeSnapshotPropertiesTest, DeserializeRejectsInvalidJson) {
     }
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, ValidateAndOrderProgress) {
-    RealtimePartitionBucket bucket0({{"dt", "2"}}, /*bucket=*/0);
-    RealtimePartitionBucket bucket1({{"dt", "2"}}, /*bucket=*/1);
-    RealtimeOffsetMap committed_offsets = {{bucket1, 4}};
+TEST_F(RealtimeCommitPropertiesTest, SortProgress) {
     std::vector<RealtimeCommitProgress> commits = {
-        {/*commit_message=*/nullptr, {{"dt", "2"}}, 0, Range(2, 3)},
-        {/*commit_message=*/nullptr, {{"dt", "2"}}, 1, Range(5, 6)},
-        {/*commit_message=*/nullptr, {{"dt", "2"}}, 0, Range(0, 1)}};
+        {/*commit_message=*/nullptr, RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0),
+         Range(2, 3)},
+        {/*commit_message=*/nullptr, RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/1),
+         Range(5, 6)},
+        {/*commit_message=*/nullptr, RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0),
+         Range(0, 1)}};
 
-    ASSERT_OK_AND_ASSIGN(RealtimeSnapshotProperties::ValidatedCommitProgress validated_progress,
-                         RealtimeSnapshotProperties::SortAndValidate(commits, committed_offsets));
-    ASSERT_EQ(3, validated_progress.ordered_commits.size());
-    ASSERT_EQ(Range(0, 1), validated_progress.ordered_commits[0].offset_range);
-    ASSERT_EQ(Range(2, 3), validated_progress.ordered_commits[1].offset_range);
-    ASSERT_EQ(Range(5, 6), validated_progress.ordered_commits[2].offset_range);
-    ASSERT_EQ(3, validated_progress.delta_offsets.at(bucket0));
-    ASSERT_EQ(6, validated_progress.delta_offsets.at(bucket1));
+    RealtimeCommitProperties::Sort(&commits);
+    ASSERT_EQ(Range(0, 1), commits[0].offset_range);
+    ASSERT_EQ(Range(2, 3), commits[1].offset_range);
+    ASSERT_EQ(Range(5, 6), commits[2].offset_range);
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, SortAndValidateRejectsInvalidProgress) {
+TEST_F(RealtimeCommitPropertiesTest, BuildRejectsInvalidProgress) {
     RealtimePartitionBucket bucket0({{"dt", "2"}}, /*bucket=*/0);
     RealtimeOffsetMap committed_offsets = {{bucket0, 1}};
+    ASSERT_OK_AND_ASSIGN(Snapshot latest_snapshot, MakeSnapshotWithOffsets(committed_offsets));
 
-    std::vector<RealtimeCommitProgress> invalid_bucket = {
-        {/*commit_message=*/nullptr, {{"dt", "2"}}, -1, Range(0, 0)}};
+    std::map<RealtimePartitionBucket, Range> invalid_bucket = {
+        {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/-1), Range(0, 0)}};
     ASSERT_NOK_WITH_MSG(
-        RealtimeSnapshotProperties::SortAndValidate(invalid_bucket, /*committed_offsets=*/{}),
+        RealtimeCommitProperties::Build(/*properties=*/{}, /*latest_snapshot=*/std::nullopt,
+                                        invalid_bucket, file_system_, directory_->Str(), "main"),
         "bucket -1 is invalid");
 
-    std::vector<RealtimeCommitProgress> gap = {
-        {/*commit_message=*/nullptr, {{"dt", "2"}}, 0, Range(3, 4)}};
-    ASSERT_NOK_WITH_MSG(RealtimeSnapshotProperties::SortAndValidate(gap, committed_offsets),
+    std::map<RealtimePartitionBucket, Range> gap = {
+        {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0), Range(3, 4)}};
+    ASSERT_NOK_WITH_MSG(RealtimeCommitProperties::Build(/*properties=*/{}, latest_snapshot, gap,
+                                                        file_system_, directory_->Str(), "main"),
                         "are not contiguous");
 
-    std::vector<RealtimeCommitProgress> overlap = {
-        {/*commit_message=*/nullptr, {{"dt", "2"}}, 0, Range(1, 2)}};
-    ASSERT_NOK_WITH_MSG(RealtimeSnapshotProperties::SortAndValidate(overlap, committed_offsets),
+    std::map<RealtimePartitionBucket, Range> overlap = {
+        {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0), Range(1, 2)}};
+    ASSERT_NOK_WITH_MSG(RealtimeCommitProperties::Build(/*properties=*/{}, latest_snapshot, overlap,
+                                                        file_system_, directory_->Str(), "main"),
                         "are not contiguous");
 
     RealtimeOffsetMap exhausted_offsets = {{bucket0, std::numeric_limits<int64_t>::max()}};
-    std::vector<RealtimeCommitProgress> after_max = {
-        {/*commit_message=*/nullptr,
-         {{"dt", "2"}},
-         0,
+    ASSERT_OK_AND_ASSIGN(Snapshot exhausted_snapshot, MakeSnapshotWithOffsets(exhausted_offsets));
+    std::map<RealtimePartitionBucket, Range> after_max = {
+        {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0),
          Range(std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max())}};
-    ASSERT_NOK_WITH_MSG(RealtimeSnapshotProperties::SortAndValidate(after_max, exhausted_offsets),
-                        "are not contiguous");
+    ASSERT_NOK_WITH_MSG(
+        RealtimeCommitProperties::Build(/*properties=*/{}, exhausted_snapshot, after_max,
+                                        file_system_, directory_->Str(), "main"),
+        "are not contiguous");
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, ValidateEmptyProgress) {
-    ASSERT_OK_AND_ASSIGN(
-        RealtimeSnapshotProperties::ValidatedCommitProgress validated_progress,
-        RealtimeSnapshotProperties::SortAndValidate(/*commits=*/{}, /*committed_offsets=*/{}));
-    ASSERT_TRUE(validated_progress.ordered_commits.empty());
-    ASSERT_TRUE(validated_progress.delta_offsets.empty());
-}
-
-TEST_F(RealtimeSnapshotPropertiesTest, MergeOffsetsWithoutDelta) {
+TEST_F(RealtimeCommitPropertiesTest, BuildWithoutProgress) {
     std::string latest_offsets_path = directory_->Str() + "/latest.offsets";
     std::map<std::string, std::string> latest_properties = {
-        {RealtimeSnapshotProperties::kOffsetsKey, latest_offsets_path}};
+        {RealtimeCommitProperties::kOffsetsKey, latest_offsets_path}};
+    std::map<std::string, std::string> properties = {{"custom", "value"}};
+
+    ASSERT_OK_AND_ASSIGN(Properties inherited,
+                         RealtimeCommitProperties::Build(
+                             properties, std::optional<Snapshot>(MakeSnapshot(latest_properties)),
+                             /*realtime_ranges=*/{}, /*file_system=*/nullptr,
+                             /*table_root=*/"", /*branch=*/"main"));
+    ASSERT_EQ("value", inherited.at("custom"));
+    ASSERT_EQ(latest_offsets_path, inherited.at(RealtimeCommitProperties::kOffsetsKey));
+
+    ASSERT_OK_AND_ASSIGN(Properties unchanged, RealtimeCommitProperties::Build(
+                                                   properties, /*latest_snapshot=*/std::nullopt,
+                                                   /*realtime_ranges=*/{}, /*file_system=*/nullptr,
+                                                   /*table_root=*/"", /*branch=*/"main"));
+    ASSERT_EQ(properties, unchanged);
+}
+
+TEST_F(RealtimeCommitPropertiesTest, BuildWritesMergedProgress) {
+    ASSERT_OK_AND_ASSIGN(std::string latest_offsets_path, WriteJson(kTargetJson));
+    std::map<std::string, std::string> latest_properties = {
+        {RealtimeCommitProperties::kOffsetsKey, latest_offsets_path}};
+    std::map<RealtimePartitionBucket, Range> ranges = {
+        {RealtimePartitionBucket({{"dt", "3"}}, /*bucket=*/0), Range(0, 4)},
+        {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/2), Range(10, 11)},
+        {RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0), Range(8, 8)}};
     std::map<std::string, std::string> properties = {{"custom", "value"}};
 
     ASSERT_OK_AND_ASSIGN(Properties merged,
-                         RealtimeSnapshotProperties::MergeOffsets(
+                         RealtimeCommitProperties::Build(
                              properties, std::optional<Snapshot>(MakeSnapshot(latest_properties)),
-                             file_system_, directory_->Str() + "/metadata"));
+                             ranges, file_system_, directory_->Str(), "main"));
     ASSERT_EQ("value", merged.at("custom"));
-    ASSERT_EQ(latest_offsets_path, merged.at(RealtimeSnapshotProperties::kOffsetsKey));
-
-    ASSERT_OK_AND_ASSIGN(
-        Properties merged_without_snapshot,
-        RealtimeSnapshotProperties::MergeOffsets(properties, /*latest_snapshot=*/std::nullopt,
-                                                 file_system_, directory_->Str() + "/metadata"));
-    ASSERT_EQ(properties, merged_without_snapshot);
-}
-
-TEST_F(RealtimeSnapshotPropertiesTest, MergeOffsetsWritesMergedProgress) {
-    ASSERT_OK_AND_ASSIGN(std::string latest_offsets_path, WriteJson(kTargetJson));
-    std::map<std::string, std::string> latest_properties = {
-        {RealtimeSnapshotProperties::kOffsetsKey, latest_offsets_path}};
-
-    RealtimeOffsetMap delta_offsets = {{RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0), 5},
-                                       {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/2), 11},
-                                       {RealtimePartitionBucket({{"dt", "3"}}, /*bucket=*/0), 4}};
-    ASSERT_OK_AND_ASSIGN(std::string delta_json,
-                         RealtimeSnapshotProperties::SerializeOffsets(delta_offsets));
-    std::map<std::string, std::string> properties = {
-        {"custom", "value"}, {RealtimeSnapshotProperties::kOffsetsDeltaKey, delta_json}};
-
-    ASSERT_OK_AND_ASSIGN(Properties merged,
-                         RealtimeSnapshotProperties::MergeOffsets(
-                             properties, std::optional<Snapshot>(MakeSnapshot(latest_properties)),
-                             file_system_, directory_->Str() + "/metadata"));
-    ASSERT_EQ("value", merged.at("custom"));
-    ASSERT_EQ(0, merged.count(RealtimeSnapshotProperties::kOffsetsDeltaKey));
-    ASSERT_NE(latest_offsets_path, merged.at(RealtimeSnapshotProperties::kOffsetsKey));
+    ASSERT_NE(latest_offsets_path, merged.at(RealtimeCommitProperties::kOffsetsKey));
 
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap actual,
-                         RealtimeSnapshotProperties::ReadOffsets(
+                         RealtimeCommitProperties::ReadOffsets(
                              std::optional<Snapshot>(MakeSnapshot(merged)), file_system_));
     RealtimeOffsetMap expected = TargetOffsets();
+    expected[RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)] = 8;
     expected[RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/2)] = 11;
     expected[RealtimePartitionBucket({{"dt", "3"}}, /*bucket=*/0)] = 4;
     ASSERT_EQ(expected, actual);
 }
 
-TEST_F(RealtimeSnapshotPropertiesTest, MergeEmptyDelta) {
-    ASSERT_OK_AND_ASSIGN(std::string empty_delta,
-                         RealtimeSnapshotProperties::SerializeOffsets(/*offsets=*/{}));
-    std::map<std::string, std::string> properties = {
-        {"custom", "value"}, {RealtimeSnapshotProperties::kOffsetsDeltaKey, empty_delta}};
-
-    ASSERT_OK_AND_ASSIGN(Properties merged,
-                         RealtimeSnapshotProperties::MergeOffsets(
-                             properties, /*latest_snapshot=*/std::nullopt, /*file_system=*/nullptr,
-                             /*offsets_directory=*/""));
-    std::map<std::string, std::string> expected = {{"custom", "value"}};
-    ASSERT_EQ(expected, merged);
-}
-
-TEST_F(RealtimeSnapshotPropertiesTest, MergeOffsetsRequiresFileSystem) {
-    RealtimeOffsetMap delta_offsets = {{RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0), 1}};
-    ASSERT_OK_AND_ASSIGN(std::string delta_json,
-                         RealtimeSnapshotProperties::SerializeOffsets(delta_offsets));
-    std::map<std::string, std::string> properties = {
-        {RealtimeSnapshotProperties::kOffsetsDeltaKey, delta_json}};
-    ASSERT_NOK_WITH_MSG(RealtimeSnapshotProperties::MergeOffsets(
-                            properties, /*latest_snapshot=*/std::nullopt, /*file_system=*/nullptr,
-                            directory_->Str() + "/metadata"),
+TEST_F(RealtimeCommitPropertiesTest, BuildRequiresFileSystem) {
+    std::map<RealtimePartitionBucket, Range> ranges = {
+        {RealtimePartitionBucket({{"dt", "2"}}, /*bucket=*/0), Range(0, 1)}};
+    ASSERT_NOK_WITH_MSG(RealtimeCommitProperties::Build(
+                            /*properties=*/{}, /*latest_snapshot=*/std::nullopt, ranges,
+                            /*file_system=*/nullptr, directory_->Str(), "main"),
                         "file system is null");
-
-    ASSERT_NOK_WITH_MSG(
-        RealtimeSnapshotProperties::MergeOffsets(properties, /*latest_snapshot=*/std::nullopt,
-                                                 file_system_, /*offsets_directory=*/""),
-        "offsets directory is empty");
 }
 
 }  // namespace paimon::test

@@ -41,7 +41,7 @@
 #include "paimon/core/manifest/manifest_file.h"
 #include "paimon/core/manifest/manifest_list.h"
 #include "paimon/core/operation/append_only_file_store_scan.h"
-#include "paimon/core/operation/commit/realtime_snapshot_properties.h"
+#include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/operation/file_store_scan.h"
 #include "paimon/core/operation/internal_read_context.h"
 #include "paimon/core/operation/raw_file_split_read.h"
@@ -106,8 +106,8 @@ Status AppendOnlyFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {
     PAIMON_ASSIGN_OR_RAISE(Snapshot snapshot, snapshot_manager_->LoadSnapshot(snapshot_id));
     PAIMON_ASSIGN_OR_RAISE(
         RealtimeOffsetMap committed_offsets,
-        RealtimeSnapshotProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
-                                                options_.GetFileSystem()));
+        RealtimeCommitProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
+                                              options_.GetFileSystem()));
     PAIMON_RETURN_NOT_OK(
         realtime_context_->AdvanceCommittedProgress(snapshot_id, committed_offsets));
     return Status::OK();
