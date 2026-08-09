@@ -117,10 +117,11 @@ class PAIMON_EXPORT RealtimeContext {
 
     /// Advances the committed progress visible to the registered memory indexers.
     ///
-    /// Calls are idempotent for the same snapshot and must advance snapshot ids monotonically.
-    /// Each indexer is notified outside the context's registry lock and may choose how and when to
-    /// release sealed data covered by its committed offset. Existing read views continue to pin
-    /// referenced resources until their readers are closed.
+    /// Snapshot ids must advance monotonically. After validation, the committed snapshot progress
+    /// is adopted atomically before indexers are notified outside the context's registry lock. If
+    /// an indexer notification fails, retrying the same snapshot only notifies indexers whose
+    /// reclamation progress is behind. Existing read views continue to pin referenced resources
+    /// until their readers are closed.
     Status AdvanceCommittedProgress(int64_t snapshot_id,
                                     const RealtimeOffsetMap& committed_offsets);
 

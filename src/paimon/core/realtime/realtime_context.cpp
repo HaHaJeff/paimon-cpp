@@ -23,6 +23,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -72,6 +73,9 @@ class RealtimeContext::Impl {
         }
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer, std::move(indexer_result));
         indexers_.emplace(key, indexer);
+        if (offset_iter != committed_offsets_.end()) {
+            reclaimed_offsets_.emplace(key, offset_iter->second);
+        }
         return RealtimeMemIndexerState{std::move(indexer), initial_offset};
     }
 
@@ -97,13 +101,7 @@ class RealtimeContext::Impl {
         if (last_refreshed_snapshot_id_ && snapshot_id < last_refreshed_snapshot_id_.value()) {
             return Status::Invalid("real-time committed snapshot cannot move backwards");
         }
-        if (last_refreshed_snapshot_id_ && snapshot_id == last_refreshed_snapshot_id_.value()) {
-            return Status::OK();
-        }
-
-        std::vector<std::pair<std::shared_ptr<MemIndexer>, int64_t>> notifications;
-        {
-            std::lock_guard<std::mutex> registry_lock(mutex_);
+        if (!last_refreshed_snapshot_id_ || snapshot_id > last_refreshed_snapshot_id_.value()) {
             for (const auto& [partition_bucket, committed_offset] : committed_offsets) {
                 if (partition_bucket.bucket < 0 || committed_offset < 0) {
                     return Status::Invalid("invalid partition-bucket committed offset");
@@ -114,22 +112,40 @@ class RealtimeContext::Impl {
                         return Status::Invalid(
                             "real-time partition-bucket committed offset cannot move backwards");
                     }
-                    if (committed_offset == previous_iter->second) {
-                        continue;
-                    }
                 }
-                auto iter = indexers_.find(partition_bucket);
-                if (iter != indexers_.end()) {
-                    notifications.emplace_back(iter->second, committed_offset);
+            }
+            committed_offsets_ = committed_offsets;
+            last_refreshed_snapshot_id_ = snapshot_id;
+        }
+
+        std::vector<std::tuple<RealtimePartitionBucket, std::shared_ptr<MemIndexer>, int64_t>>
+            notifications;
+        {
+            std::lock_guard<std::mutex> registry_lock(mutex_);
+            for (const auto& [partition_bucket, committed_offset] : committed_offsets_) {
+                auto reclaimed_iter = reclaimed_offsets_.find(partition_bucket);
+                if (reclaimed_iter != reclaimed_offsets_.end() &&
+                    reclaimed_iter->second >= committed_offset) {
+                    continue;
+                }
+                auto indexer_iter = indexers_.find(partition_bucket);
+                if (indexer_iter != indexers_.end()) {
+                    notifications.emplace_back(partition_bucket, indexer_iter->second,
+                                               committed_offset);
                 }
             }
         }
-        for (const auto& [indexer, committed_offset] : notifications) {
-            PAIMON_RETURN_NOT_OK(indexer->AdvanceCommittedOffset(committed_offset));
+        // Reclaim independent indexers on a best-effort basis, then report the first error.
+        Status first_error = Status::OK();
+        for (const auto& [partition_bucket, indexer, committed_offset] : notifications) {
+            Status status = indexer->AdvanceCommittedOffset(committed_offset);
+            if (status.ok()) {
+                reclaimed_offsets_[partition_bucket] = committed_offset;
+            } else if (first_error.ok()) {
+                first_error = std::move(status);
+            }
         }
-        committed_offsets_ = committed_offsets;
-        last_refreshed_snapshot_id_ = snapshot_id;
-        return Status::OK();
+        return first_error;
     }
 
  private:
@@ -138,6 +154,7 @@ class RealtimeContext::Impl {
     std::mutex progress_mutex_;
     std::map<RealtimePartitionBucket, std::shared_ptr<MemIndexer>> indexers_;
     RealtimeOffsetMap committed_offsets_;
+    RealtimeOffsetMap reclaimed_offsets_;
     std::optional<int64_t> last_refreshed_snapshot_id_;
 };
 

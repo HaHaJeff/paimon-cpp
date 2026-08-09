@@ -68,6 +68,11 @@ class TestingMemIndexer : public MemIndexer {
     }
 
     Status AdvanceCommittedOffset(int64_t committed_offset) override {
+        ++advance_count;
+        if (fail_next_advance) {
+            fail_next_advance = false;
+            return Status::Invalid("injected committed offset failure");
+        }
         committed_offsets.push_back(committed_offset);
         return Status::OK();
     }
@@ -81,6 +86,8 @@ class TestingMemIndexer : public MemIndexer {
     }
 
     int32_t acquire_count = 0;
+    int32_t advance_count = 0;
+    bool fail_next_advance = false;
     std::vector<int64_t> committed_offsets;
 };
 
@@ -188,6 +195,40 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
             {RealtimePartitionBucket(partition, /*bucket=*/1), /*offset=*/8},
             {RealtimePartitionBucket({{"dt", "unknown"}}, /*bucket=*/0), /*offset=*/9}}));
     ASSERT_EQ(std::vector<int64_t>({7}), factory->indexers[0]->committed_offsets);
+    ASSERT_EQ(std::vector<int64_t>({8}), factory->indexers[1]->committed_offsets);
+}
+
+TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
+    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
+                         RealtimeContext::Create(factory));
+    std::shared_ptr<MemoryPool> pool = GetDefaultPool();
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+
+    ASSERT_OK(context->GetOrCreateMemIndexer(partition, 0, MakeWriteSchema(), {}, pool));
+    ASSERT_OK(context->GetOrCreateMemIndexer(partition, 1, MakeWriteSchema(), {}, pool));
+    ASSERT_OK(context->GetOrCreateMemIndexer(partition, 2, MakeWriteSchema(), {}, pool));
+    ASSERT_EQ(3, factory->indexers.size());
+    factory->indexers[1]->fail_next_advance = true;
+
+    const RealtimeOffsetMap committed_offsets = {
+        {RealtimePartitionBucket(partition, /*bucket=*/0), /*offset=*/7},
+        {RealtimePartitionBucket(partition, /*bucket=*/1), /*offset=*/8},
+        {RealtimePartitionBucket(partition, /*bucket=*/2), /*offset=*/9}};
+    ASSERT_NOK_WITH_MSG(context->AdvanceCommittedProgress(5, committed_offsets),
+                        "injected committed offset failure");
+    ASSERT_EQ(std::vector<int64_t>({7}), factory->indexers[0]->committed_offsets);
+    ASSERT_TRUE(factory->indexers[1]->committed_offsets.empty());
+    ASSERT_EQ(std::vector<int64_t>({9}), factory->indexers[2]->committed_offsets);
+
+    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState failed_indexer_state,
+                         context->GetOrCreateMemIndexer(partition, 1, MakeWriteSchema(), {}, pool));
+    ASSERT_EQ(9, failed_indexer_state.initial_offset);
+
+    ASSERT_OK(context->AdvanceCommittedProgress(5, committed_offsets));
+    ASSERT_EQ(1, factory->indexers[0]->advance_count);
+    ASSERT_EQ(2, factory->indexers[1]->advance_count);
+    ASSERT_EQ(1, factory->indexers[2]->advance_count);
     ASSERT_EQ(std::vector<int64_t>({8}), factory->indexers[1]->committed_offsets);
 }
 

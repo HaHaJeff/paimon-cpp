@@ -134,6 +134,9 @@ class PAIMON_EXPORT MemIndexer {
 
     /// Notifies the indexer that its partition-bucket committed offset has advanced.
     ///
+    /// Calls are monotonic and may repeat the same offset after a previous call reports an error,
+    /// so implementations must apply this notification idempotently.
+    ///
     /// An implementation may reclaim covered segments immediately, defer destruction, spill them,
     /// or retain them. Existing read views continue to keep referenced resources alive.
     virtual Status AdvanceCommittedOffset(int64_t committed_offset) = 0;
