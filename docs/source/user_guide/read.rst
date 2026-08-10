@@ -80,6 +80,9 @@ Overflow behavior is undefined for C++ and Java Paimon. Results in overflow scen
 Paimon C++ does not guarantee identical results to Java Paimon in overflow scenarios. Users should not rely on identical
 return values between implementations.
 
+One exception: casting ``float`` or ``double`` to an integer type is well defined and matches Java on every supported
+architecture; see note 2️⃣ below the matrix.
+
 Type Change Support Matrix
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 The table below indicates support for changing a column type from ``source`` to ``target``. Refer to the numbered notes below the table
@@ -265,10 +268,15 @@ for caveats.
   1️⃣ Integer downcast overflow behavior matches Java in specific cases.
     Example: smallint -> tinyint, 32767 becomes -1; int -> smallint, -2147483648 becomes 0.
 
-  2️⃣ Floating-point overflow behavior is partially consistent with Java and partially different.
-    Example: float -> tinyint
-      - Java: MAX_FLOAT -> -1, INFINITY -> -1
-      - C++:  MAX_FLOAT -> 0, INFINITY -> 0
+  2️⃣ Casting float/double to an integer type follows Java semantics on every supported architecture:
+    ``NaN`` becomes 0, an out-of-range value saturates at the int32 bounds (int64 for ``bigint``),
+    and the result is narrowed to the target width by keeping the low bits, the way Java
+    narrowing does.
+
+    Example: float -> tinyint, C++ and Java both: ``MAX_FLOAT -> -1``, ``INFINITY -> -1``,
+    ``NaN -> 0``, ``300.9 -> 44``.
+
+    double -> float overflow produces ``Infinity`` / ``-Infinity``, consistent with Java.
 
   3️⃣ Keyword differences for special float/double values:
     - Java: Infinity, -Infinity, NaN

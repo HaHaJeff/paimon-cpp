@@ -8,6 +8,7 @@
 #
 #===------------------------------------------------------------------------===#
 import bisect
+import io
 import os
 import re
 import subprocess
@@ -333,8 +334,17 @@ class SymbolizationLoop(object):
     if sys.version_info[0] == 2:
       sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
     else:
-      # Unbuffered output is not supported in Python 3
-      sys.stdout = os.fdopen(sys.stdout.fileno(), 'w')
+      # Test output is not guaranteed to be valid UTF-8, so pin both streams to the same
+      # encoding and round such bytes through surrogateescape, which passes them out
+      # unchanged instead of raising and truncating the rest of the test log. Both the
+      # encoding and the error handler have to be set on both streams: taking either from
+      # the locale or from PYTHONIOENCODING would let them disagree and re-encode the bytes.
+      # The buffers are rewrapped rather than reconfigured, which needs Python 3.7, and
+      # line buffering stands in for the unbuffered output Python 3 does not support.
+      sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8',
+                                   errors='surrogateescape')
+      sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
+                                    errors='surrogateescape', line_buffering=True)
 
     while True:
       line = sys.stdin.readline()

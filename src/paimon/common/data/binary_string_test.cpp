@@ -83,10 +83,11 @@ TEST_F(BinaryStringTest, TestBasic) {
     CheckBasic("Paimon中文社区", 10);
     CheckBasic("中 文 社 区", 7);
 
-    CheckBasic("¡", 1);       // 2 bytes char
-    CheckBasic("ку", 2);      // 2 * 2 bytes chars
-    CheckBasic("︽﹋％", 3);  // 3 * 3 bytes chars
-    // CheckBasic("\uD83E\uDD19", 1);  // 4 bytes char
+    CheckBasic("¡", 1);             // 2 bytes char
+    CheckBasic("ку", 2);            // 2 * 2 bytes chars
+    CheckBasic("︽﹋％", 3);        // 3 * 3 bytes chars
+    CheckBasic(u8"\U0001F919", 1);  // 4 bytes char, written as a code point rather than
+                                    // as a surrogate pair, which is ill-formed in C++
 }
 
 TEST_F(BinaryStringTest, EmptyStringTest) {
@@ -196,6 +197,9 @@ TEST_F(BinaryStringTest, TestSubstring) {
     InnerCheckEqual(FromString("数据砖头").Substring(1, 3, pool.get()), FromString("据砖"));
     InnerCheckEqual(FromString("数据砖头").Substring(3, 5, pool.get()), FromString("头"));
     InnerCheckEqual(FromString("ߵ梷").Substring(0, 2, pool.get()), FromString("ߵ梷"));
+    InnerCheckEqual(FromString(u8"\U0001F919ab").Substring(0, 1, pool.get()),
+                    FromString(u8"\U0001F919"));
+    InnerCheckEqual(FromString(u8"\U0001F919ab").Substring(1, 3, pool.get()), FromString("ab"));
 }
 
 TEST_F(BinaryStringTest, TestSubStringAndCopyBinaryString) {
@@ -229,6 +233,8 @@ TEST_F(BinaryStringTest, TestIndexOf) {
         InnerCheckEqual(FromString("数据砖头").IndexOf(FromString("数"), 3), -1);
         InnerCheckEqual(FromString("数据砖头").IndexOf(FromString("数"), 0), 0);
         InnerCheckEqual(FromString("数据砖头").IndexOf(FromString("头"), 0), 3);
+        InnerCheckEqual(FromString(u8"a\U0001F919b").IndexOf(FromString(u8"\U0001F919"), 0), 1);
+        InnerCheckEqual(FromString(u8"a\U0001F919b").IndexOf(FromString("b"), 0), 2);
     }
     {
         auto pool = GetDefaultPool();
@@ -257,6 +263,12 @@ TEST_F(BinaryStringTest, TestToUpperLowerCase) {
     InnerCheckEqual(FromString("!@#$%^*").ToLowerCase(pool.get()), FromString("!@#$%^*"));
     InnerCheckEqual(FromString("!@#$%^*").ToLowerCase(pool.get()), FromString("!@#$%^*"));
     InnerCheckEqual(BinaryString::EmptyUtf8().ToLowerCase(pool.get()), BinaryString::EmptyUtf8());
+
+    // Invalid UTF-8 bytes pass through case conversion unchanged on both char-signedness ABIs.
+    InnerCheckEqual(FromString("a\x80z").ToUpperCase(pool.get()), FromString("A\x80Z"));
+    InnerCheckEqual(FromString("A\x80Z").ToLowerCase(pool.get()), FromString("a\x80z"));
+    InnerCheckEqual(FromString("ab\xff").ToUpperCase(pool.get()), FromString("AB\xff"));
+    InnerCheckEqual(FromString("AB\xff").ToLowerCase(pool.get()), FromString("ab\xff"));
 }
 
 TEST_F(BinaryStringTest, TestEmptyString) {

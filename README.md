@@ -49,7 +49,8 @@ Paimon C++ currently provides:
 > Paimon C++ therefore currently treats the `bitmap` global index type as unsupported. The legacy
 > implementation remains in the codebase pending migration to the Java-compatible format.
 
-Note: Only Linux x86_64 builds are currently supported and verified.
+Note: Linux `x86_64` and `aarch64` builds are supported and verified in CI. See the supported
+platform matrix in [docs/source/building.rst](docs/source/building.rst) for other platforms.
 
 ## Building
 

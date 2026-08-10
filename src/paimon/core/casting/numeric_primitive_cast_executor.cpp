@@ -20,11 +20,14 @@
 #include "paimon/core/casting/numeric_primitive_cast_executor.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
+#include "arrow/api.h"
 #include "arrow/compute/cast.h"
 #include "arrow/type.h"
 #include "fmt/format.h"
+#include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/field_type_utils.h"
 #include "paimon/core/casting/casting_utils.h"
 #include "paimon/defs.h"
@@ -204,9 +207,76 @@ Result<Literal> NumericPrimitiveCastExecutor::Cast(
     return iter->second(literal);
 }
 
+namespace {
+template <typename SrcArrayType, typename TargetBuilderType, typename TargetType>
+Result<std::shared_ptr<arrow::Array>> JavaCastFloatingArray(const arrow::Array& src_array,
+                                                            arrow::MemoryPool* pool) {
+    const auto& typed_src_array = static_cast<const SrcArrayType&>(src_array);
+    TargetBuilderType builder(pool);
+    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Reserve(typed_src_array.length()));
+    for (int64_t i = 0; i < typed_src_array.length(); i++) {
+        if (typed_src_array.IsNull(i)) {
+            builder.UnsafeAppendNull();
+        } else {
+            builder.UnsafeAppend(
+                NumericPrimitiveCastExecutor::JavaFloatingToIntegerCast<TargetType>(
+                    typed_src_array.Value(i)));
+        }
+    }
+    std::shared_ptr<arrow::Array> target_array;
+    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Finish(&target_array));
+    return target_array;
+}
+
+template <typename SrcArrayType>
+Result<std::shared_ptr<arrow::Array>> JavaCastFloatingArrayToInteger(
+    const arrow::Array& src_array, const std::shared_ptr<arrow::DataType>& target_type,
+    arrow::MemoryPool* pool) {
+    switch (target_type->id()) {
+        case arrow::Type::INT8:
+            return JavaCastFloatingArray<SrcArrayType, arrow::Int8Builder, int8_t>(src_array, pool);
+        case arrow::Type::INT16:
+            return JavaCastFloatingArray<SrcArrayType, arrow::Int16Builder, int16_t>(src_array,
+                                                                                     pool);
+        case arrow::Type::INT32:
+            return JavaCastFloatingArray<SrcArrayType, arrow::Int32Builder, int32_t>(src_array,
+                                                                                     pool);
+        case arrow::Type::INT64:
+            return JavaCastFloatingArray<SrcArrayType, arrow::Int64Builder, int64_t>(src_array,
+                                                                                     pool);
+        default:
+            return Status::Invalid(
+                fmt::format("cast array in NumericPrimitiveCastExecutor failed: {} is not an "
+                            "integer target type",
+                            target_type->ToString()));
+    }
+}
+
+// Deliberately not arrow::is_integer(): that also matches the unsigned types, which
+// JavaCastFloatingArrayToInteger() does not handle and which still belong to Arrow's kernel.
+bool IsSignedIntegerType(arrow::Type::type type) {
+    return type == arrow::Type::INT8 || type == arrow::Type::INT16 || type == arrow::Type::INT32 ||
+           type == arrow::Type::INT64;
+}
+}  // namespace
+
 Result<std::shared_ptr<arrow::Array>> NumericPrimitiveCastExecutor::Cast(
     const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& target_type,
     arrow::MemoryPool* pool) const {
+    // Arrow's floating point to integer kernel is a plain static_cast, annotated
+    // ARROW_DISABLE_UBSAN("float-cast-overflow"), so it is undefined for a value that does not
+    // fit and answers it differently per architecture. Convert those here instead, with the same
+    // Java semantics the literal overload uses, so that stats converted through one path and
+    // column data converted through the other agree. This trades Arrow's vectorized kernel for a
+    // scalar loop, which these conversions, reached from schema evolution, can afford.
+    if (IsSignedIntegerType(target_type->id())) {
+        if (array->type_id() == arrow::Type::FLOAT) {
+            return JavaCastFloatingArrayToInteger<arrow::FloatArray>(*array, target_type, pool);
+        }
+        if (array->type_id() == arrow::Type::DOUBLE) {
+            return JavaCastFloatingArrayToInteger<arrow::DoubleArray>(*array, target_type, pool);
+        }
+    }
     arrow::compute::CastOptions options = arrow::compute::CastOptions::Safe();
     options.allow_int_overflow = true;
     options.allow_float_truncate = true;

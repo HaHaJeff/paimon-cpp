@@ -108,6 +108,10 @@ class DataDefine {
                     return "map";
                 } else if constexpr (std::is_same_v<T, std::string_view>) {
                     return std::string(arg);
+                } else if constexpr (std::is_same_v<T, char>) {
+                    // TINYINT is held as a plain char, whose signedness follows the ABI, and
+                    // std::to_string would print 236 rather than -20 where it is unsigned.
+                    return std::to_string(static_cast<int32_t>(static_cast<int8_t>(arg)));
                 } else {
                     return std::to_string(arg);
                 }

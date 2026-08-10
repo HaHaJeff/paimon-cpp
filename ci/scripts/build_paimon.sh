@@ -136,6 +136,12 @@ fi
 if [[ "${enable_tsan}" == "true" ]]; then
     ENABLE_TANTIVY="OFF" # Tantivy's Rust library is not TSAN-instrumented.
 fi
+# CI always builds natively, so the host architecture is the target architecture.
+host_arch=$(uname -m)
+if [[ "${host_arch}" != "x86_64" ]]; then
+    ENABLE_LUMINA="OFF"
+    echo "=== Lumina disabled: no prebuilt artifacts for ${host_arch} ==="
+fi
 
 CMAKE_ARGS=(
     "-G Ninja"

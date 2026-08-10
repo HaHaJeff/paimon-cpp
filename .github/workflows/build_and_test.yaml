@@ -33,31 +33,69 @@ permissions:
   contents: read
 
 jobs:
+  script-tests:
+    name: script-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout paimon-cpp
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Run CMake module tests
+        shell: bash
+        run: ci/scripts/test_cmake_modules.sh
+      - name: Run packaging argument tests
+        shell: bash
+        run: ci/scripts/test_packaging_args.sh
+      - name: Run asan_symbolize tests
+        shell: bash
+        run: ci/scripts/test_asan_symbolize.sh
+
   build-and-test:
     name: ${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: gcc-release
+          - name: gcc-release-x86_64
             cc: gcc-14
             cxx: g++-14
             build_args: --build_type Release
-          - name: clang-release
+          - name: clang-release-x86_64
             build_args: --build_type Release
-          - name: gcc-debug
+          - name: gcc-debug-x86_64
             cc: gcc-14
             cxx: g++-14
-          - name: clang-debug
+          - name: clang-debug-x86_64
             fetch_depth: '0' # fetch the PR target branch history for clang-tidy
             build_args: >-
               --check_clang_tidy
               --lint_git_target_commit "origin/${{ github.base_ref || github.event.repository.default_branch }}"
-          - name: asan-ubsan
+          - name: asan-ubsan-x86_64
             build_args: --enable_asan --enable_ubsan
-          - name: tsan
+          - name: tsan-x86_64
+            skip_rust: true
+            build_args: --enable_tsan
+          - name: gcc-debug-aarch64
+            runner: ubuntu-24.04-arm
+            cc: gcc-14
+            cxx: g++-14
+          - name: gcc-release-aarch64
+            runner: ubuntu-24.04-arm
+            cc: gcc-14
+            cxx: g++-14
+            build_args: --build_type Release
+          - name: clang-debug-aarch64
+            runner: ubuntu-24.04-arm
+          - name: asan-ubsan-aarch64
+            runner: ubuntu-24.04-arm
+            build_args: --enable_asan --enable_ubsan
+          - name: clang-release-aarch64
+            runner: ubuntu-24.04-arm
+            build_args: --build_type Release
+          - name: tsan-aarch64
+            runner: ubuntu-24.04-arm
             skip_rust: true
             build_args: --enable_tsan
     steps:

@@ -33,7 +33,7 @@ out-of-source. For example, you could create ``paimon-cpp/build`` and invoke
 Building requires:
 
 * A C++17-enabled compiler. On Linux, gcc 8 and higher should be sufficient.
-  macOS and Windows are not supported for now.
+  Windows is not supported for now.
 * At least 2GB of RAM for a minimal build, 8GB for a minimal
   debug build with tests and 16GB for a full build.
 
@@ -47,6 +47,61 @@ On Ubuntu/Debian you can install the requirements with:
 
 We also provide a docker template to help you get started quickly. See in
 ``.devcontainer`` folder for more details.
+
+.. _cpp-building-platforms:
+
+Supported platforms
+-------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 25 55
+
+   * - Operating system
+     - Architecture
+     - Support level
+   * - Linux
+     - ``x86_64``
+     - Built and tested in CI.
+   * - Linux
+     - ``aarch64`` / ``arm64``
+     - Built and tested in CI.
+   * - macOS
+     - ``x86_64``, ``arm64``
+     - Architecture detection is wired up, but macOS as a whole is not an
+       officially supported platform and is not covered by CI.
+   * - Windows
+     - any
+     - Not supported.
+
+The build system derives the target CPU family from
+``CMAKE_SYSTEM_PROCESSOR`` (or from ``CMAKE_OSX_ARCHITECTURES`` on macOS) and
+only applies tuning flags belonging to that family. On an architecture it does
+not recognise it simply adds no tuning flags of its own, which is not by itself
+a statement that the dependencies or the runtime work there. On aarch64 the
+``-march=`` value defaults to ``armv8-a`` and can be overridden with
+``-DPAIMON_AARCH64_MARCH=armv8.2-a+crc`` or similar; an explicitly empty value
+(``-DPAIMON_AARCH64_MARCH=""``) passes no ``-march`` flag at all, for toolchains
+that reject the flag, such as AppleClang targeting arm64.
+
+There is no x86 SIMD level to select, and no instruction-set flag is added on
+x86: the baseline stays whatever the toolchain defaults to. No persisted value
+depends on it, in particular the checksum written to SST files and to the B-tree
+global index is the same however Paimon was compiled.
+
+One optional component is architecture-restricted:
+``-DPAIMON_ENABLE_LUMINA=ON`` consumes a prebuilt binary that is only
+published for Linux ``x86_64``, so configuring it on any other platform fails
+with an explicit error.
+
+Cross compilation is not wired up end to end: the bundled third-party builds are
+handed only the C and C++ compilers, without a toolchain file, sysroot or find
+root, so they can still pick up host libraries. Build natively on each target.
+
+``build_and_package.sh`` therefore names its output after the host platform, for
+example ``output/paimon-cpp-linux-aarch64.tar.gz``, so artifacts built on several
+machines can be collected side by side. ``--platform <label>`` overrides that
+label alone; it does not configure a cross build.
 
 .. _cpp-building-building:
 
@@ -123,7 +178,8 @@ boolean flags to ``cmake``.
 * ``-DPAIMON_ENABLE_ORC=ON``: Paimon integration with Apache ORC
 * ``-DPAIMON_ENABLE_AVRO=ON``: Apache Avro libraries and Paimon integration
 * ``-DPAIMON_ENABLE_JINDO=ON``: Support for Alibaba Jindo filesystems
-* ``-DPAIMON_ENABLE_LUMINA=ON``: Support for the Lumina vector index.
+* ``-DPAIMON_ENABLE_LUMINA=ON``: Support for the Lumina vector index. Requires
+  Linux ``x86_64``; see :ref:`cpp-building-platforms`.
 * ``-DPAIMON_ENABLE_LUCENE=ON``: Support for Lucene full-text search indexes
 * ``-DPAIMON_ENABLE_TANTIVY=ON``: Enable the experimental Tantivy full-text index Rust FFI.
 * ``-DPAIMON_ENABLE_REST=ON``: Support for the REST catalog (``metastore=rest``), requires the libcurl development package.

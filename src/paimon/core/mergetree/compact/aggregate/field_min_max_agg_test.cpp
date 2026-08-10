@@ -147,6 +147,9 @@ TEST(FieldMinMaxAggTest, TestVariantType) {
     };
 
     CheckResult(arrow::int8(), static_cast<char>(100), static_cast<char>(15));
+    // A negative TINYINT: the variant holds it as a plain char, so where the ABI makes char
+    // unsigned, comparing the variants directly would order -20 above 10.
+    CheckResult(arrow::int8(), static_cast<char>(10), static_cast<char>(-20));
     CheckResult(arrow::int16(), static_cast<int16_t>(100), static_cast<int16_t>(15));
     CheckResult(arrow::int32(), static_cast<int32_t>(100), static_cast<int32_t>(15));
     CheckResult(arrow::date32(), static_cast<int32_t>(100), static_cast<int32_t>(15));

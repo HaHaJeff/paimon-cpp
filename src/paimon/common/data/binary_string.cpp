@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 
 #include "paimon/common/memory/memory_segment_utils.h"
 #include "paimon/memory/bytes.h"
@@ -75,16 +76,19 @@ std::string BinaryString::ToString() const {
 }
 
 int32_t BinaryString::NumBytesForFirstByte(char b) {
-    if (b >= 0) {
+    // Classify the leading byte as unsigned: where the ABI makes plain char unsigned, as the
+    // AArch64 Linux ABI does, a signed test would classify every byte as single byte ASCII.
+    const auto first_byte = static_cast<uint8_t>(b);
+    if (first_byte < 0x80) {
         // 1 byte, 7 bits: 0xxxxxxx
         return 1;
-    } else if ((b >> 5) == -2 && (b & 0x1e) != 0) {
+    } else if ((first_byte & 0xe0) == 0xc0 && (first_byte & 0x1e) != 0) {
         // 2 bytes, 11 bits: 110xxxxx 10xxxxxx
         return 2;
-    } else if ((b >> 4) == -2) {
+    } else if ((first_byte & 0xf0) == 0xe0) {
         // 3 bytes, 16 bits: 1110xxxx 10xxxxxx 10xxxxxx
         return 3;
-    } else if ((b >> 3) == -2) {
+    } else if ((first_byte & 0xf8) == 0xf0) {
         // 4 bytes, 21 bits: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
         return 4;
     } else {
@@ -202,14 +206,15 @@ BinaryString BinaryString::ToUpperCase(MemoryPool* pool) const {
     int32_t size = segment_.Size();
     SegmentAndOffset segment_and_offset = StartSegmentAndOffset(size);
     std::shared_ptr<Bytes> bytes = Bytes::AllocateBytes(size_in_bytes_, pool);
-    (*bytes)[0] = tolower(segment_and_offset.Value());
     for (int32_t i = 0; i < size_in_bytes_; i++) {
         char b = segment_and_offset.Value();
         if (NumBytesForFirstByte(b) != 1) {
             // fallback
             return CppToUpperCase(pool);
         }
-        int32_t upper = toupper(static_cast<int32_t>(b));
+        // A byte >= 0x80 still reaches here via the invalid-first-byte path, and toupper()
+        // requires a non-negative argument, which plain char does not guarantee.
+        int32_t upper = toupper(static_cast<unsigned char>(b));
         if (upper > 127) {
             // fallback
             return CppToUpperCase(pool);
@@ -222,7 +227,8 @@ BinaryString BinaryString::ToUpperCase(MemoryPool* pool) const {
 
 BinaryString BinaryString::CppToUpperCase(MemoryPool* pool) const {
     std::string str = ToString();
-    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+    std::transform(str.begin(), str.end(), str.begin(),
+                   [](unsigned char c) { return static_cast<char>(::toupper(c)); });
     return FromString(str, pool);
 }
 
@@ -233,14 +239,14 @@ BinaryString BinaryString::ToLowerCase(MemoryPool* pool) const {
     int32_t size = segment_.Size();
     SegmentAndOffset segment_and_offset = StartSegmentAndOffset(size);
     std::shared_ptr<Bytes> bytes = Bytes::AllocateBytes(size_in_bytes_, pool);
-    (*bytes)[0] = tolower(segment_and_offset.Value());
     for (int32_t i = 0; i < size_in_bytes_; i++) {
         char b = segment_and_offset.Value();
         if (NumBytesForFirstByte(b) != 1) {
             // fallback
             return CppToLowerCase(pool);
         }
-        int32_t lower = tolower(static_cast<int32_t>(b));
+        // As in ToUpperCase: a byte >= 0x80 must stay non-negative for tolower().
+        int32_t lower = tolower(static_cast<unsigned char>(b));
         if (lower > 127) {
             // fallback
             return CppToLowerCase(pool);
@@ -253,7 +259,8 @@ BinaryString BinaryString::ToLowerCase(MemoryPool* pool) const {
 
 BinaryString BinaryString::CppToLowerCase(MemoryPool* pool) const {
     std::string str = ToString();
-    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+    std::transform(str.begin(), str.end(), str.begin(),
+                   [](unsigned char c) { return static_cast<char>(::tolower(c)); });
     return FromString(str, pool);
 }
 

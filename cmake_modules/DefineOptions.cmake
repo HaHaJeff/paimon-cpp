@@ -18,6 +18,10 @@
 # Borrowed the file from Apache Arrow:
 # https://github.com/apache/arrow/blob/apache-arrow-17.0.0/cpp/cmake_modules/DefineOptions.cmake
 
+# Single source of the Arm64 default, applied both to the option below and to the
+# fallback after it.
+set(PAIMON_AARCH64_MARCH_DEFAULT "armv8-a")
+
 macro(set_option_category name)
     set(PAIMON_OPTION_CATEGORY ${name})
     list(APPEND "PAIMON_OPTION_CATEGORIES" ${name})
@@ -101,6 +105,10 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
     define_option(PAIMON_USE_APPLE_LIBCXX_WITH_CLANG
                   "Use Apple SDK libc++ headers when building with upstream Clang on macOS"
                   ON)
+
+    define_option_string(PAIMON_AARCH64_MARCH
+                         "AArch64 value passed to -march=; empty passes no -march flag"
+                         "${PAIMON_AARCH64_MARCH_DEFAULT}")
 
     #----------------------------------------------------------------------
     set_option_category("Test")
@@ -260,6 +268,16 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
                          AUTO
                          BUNDLED
                          SYSTEM)
+endif()
+
+# The option above exists only for a top-level build, but SetupCxxFlags.cmake
+# uses PAIMON_AARCH64_MARCH on AArch64 targets, so an add_subdirectory() consumer
+# needs the same default. Only an undefined value falls back: an explicitly empty
+# value is the opt-out that SetupCxxFlags.cmake answers with no -march flag at
+# all, and any other value, OFF included, is taken literally so a typo fails the
+# compiler probe instead of being coerced silently.
+if(NOT DEFINED PAIMON_AARCH64_MARCH)
+    set(PAIMON_AARCH64_MARCH "${PAIMON_AARCH64_MARCH_DEFAULT}")
 endif()
 
 macro(validate_config)

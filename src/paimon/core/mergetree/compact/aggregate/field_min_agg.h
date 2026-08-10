@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -60,6 +61,17 @@ class FieldMinAgg : public FieldAggregator {
         arrow::Type::type type = field_type->id();
         switch (type) {
             case arrow::Type::type::INT8:
+                // The variant holds TINYINT as a plain char, so comparing the variants directly
+                // would follow the ABI's signedness for char and order negative values above
+                // positive ones where it is unsigned. Compare the signed value it stands for.
+                return FieldMinFunc([](const VariantType& accumulator,
+                                       const VariantType& input_field) -> VariantType {
+                    auto accumulator_value =
+                        static_cast<int8_t>(DataDefine::GetVariantValue<char>(accumulator));
+                    auto input_value =
+                        static_cast<int8_t>(DataDefine::GetVariantValue<char>(input_field));
+                    return accumulator_value < input_value ? accumulator : input_field;
+                });
             case arrow::Type::type::INT16:
             case arrow::Type::type::INT32:
             case arrow::Type::type::DATE32:

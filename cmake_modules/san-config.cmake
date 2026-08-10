@@ -51,6 +51,28 @@ if(PAIMON_USE_UBSAN)
                                INTERFACE -fsanitize=undefined -fno-sanitize=vptr
                                          -fno-omit-frame-pointer)
         target_link_options(paimon_sanitizer_flags INTERFACE -fsanitize=undefined)
+        # The signed-integer-overflow check on a 128-bit multiplication becomes a call to
+        # __muloti4, which Clang takes from compiler-rt. libgcc does not provide it, and on
+        # aarch64 Clang does not inline the check the way it can on x86-64, so the link needs
+        # compiler-rt's builtins. Only that archive is added, rather than switching the whole
+        # runtime library with --rtlib=compiler-rt. GCC lowers the check through libgcc and
+        # never emits __muloti4, and it rejects the --rtlib= driver flag, so the probe is
+        # Clang only.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            execute_process(COMMAND ${CMAKE_CXX_COMPILER} --rtlib=compiler-rt
+                                    --print-libgcc-file-name
+                            OUTPUT_VARIABLE PAIMON_COMPILER_RT_BUILTINS
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            if(EXISTS "${PAIMON_COMPILER_RT_BUILTINS}")
+                target_link_libraries(paimon_sanitizer_flags
+                                      INTERFACE "${PAIMON_COMPILER_RT_BUILTINS}")
+                message(STATUS "Undefined Behavior Sanitizer builtins: ${PAIMON_COMPILER_RT_BUILTINS}"
+                )
+            else()
+                message(WARNING "compiler-rt builtins not found; a 128-bit multiplication under "
+                                "-fsanitize=undefined may fail to link")
+            endif()
+        endif()
         message(STATUS "Undefined Behavior Sanitizer enabled")
     else()
         message(WARNING "Undefined Behavior Sanitizer is only supported for GCC and Clang compilers"

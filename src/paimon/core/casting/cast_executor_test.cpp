@@ -134,6 +134,14 @@ class CastExecutorTest : public ::testing::Test {
         return target_array.status().ToString();
     }
 
+    /// Casts through the fixture's memory pool, which the test bodies cannot reach themselves.
+    Result<std::shared_ptr<arrow::Array>> CastArray(
+        const std::shared_ptr<CastExecutor>& cast_executor,
+        const std::shared_ptr<arrow::Array>& src_array,
+        const std::shared_ptr<arrow::DataType>& target_type) const {
+        return cast_executor->Cast(src_array, target_type, arrow_pool_.get());
+    }
+
     template <typename Type>
     Literal CreateLiteral(const FieldType& type, const Type& data) const {
         if constexpr (std::is_same_v<Type, std::string>) {
@@ -154,6 +162,9 @@ class CastExecutorTest : public ::testing::Test {
                             const FieldType& src_type, const std::vector<SrcType>& src_data,
                             const std::shared_ptr<arrow::DataType>& target_type,
                             const std::vector<TargetType>& target_data) const {
+        // Without this, a target vector longer than the source is silently ignored and a shorter
+        // one reads out of bounds.
+        ASSERT_EQ(src_data.size(), target_data.size());
         FieldType target_field_type = FieldTypeUtils::ConvertToFieldType(target_type->id()).value();
         std::vector<Literal> src_literals;
         std::vector<Literal> target_literals;
@@ -215,6 +226,8 @@ class CastExecutorTest : public ::testing::Test {
     static constexpr int64_t NANOS_PER_SECOND = 1000000000l;
     static constexpr int64_t MILLIS_PER_SECOND = 1000l;
     static constexpr int64_t NANOS_PER_MILLIS = 1000000l;
+    static constexpr int32_t MAX_INT32 = std::numeric_limits<int32_t>::max();
+    static constexpr int32_t MIN_INT32 = std::numeric_limits<int32_t>::min();
     static constexpr int64_t MAX_INT64 = std::numeric_limits<int64_t>::max();
     static constexpr int64_t MIN_INT64 = std::numeric_limits<int64_t>::min();
     static constexpr float MAX_FLOAT = std::numeric_limits<float>::max();
@@ -380,42 +393,58 @@ TEST_F(CastExecutorTest, TestNumericPrimitiveCastExecutorCastLiteral) {
     }
     // test src type FLOAT
     {
-        // Java Paimon cast MAX_FLOAT to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
-        std::vector<int8_t> target_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<float> src_data = {1.1,       2.2,      3.3,       -10.01, 0,
+                                       127.9,     -128.9,   300.9,     -300.9, MAX_FLOAT,
+                                       MIN_FLOAT, INFINITY, -INFINITY, NAN};
+        std::vector<int8_t> target_data = {1, 2, 3, -10, 0, 127, -128, 44, -44, -1, 0, -1, 0, 0};
         CheckLiteralResult<float, int8_t>(cast_executor, FieldType::FLOAT, src_data, arrow::int8(),
                                           target_data);
     }
     {
-        // Java Paimon cast MAX_FLOAT to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
-        std::vector<int16_t> target_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<float> src_data = {1.1,      2.2,       3.3,     -10.01,    0,
+                                       32767.9,  -32768.9,  40000.9, MAX_FLOAT, MIN_FLOAT,
+                                       INFINITY, -INFINITY, NAN};
+        std::vector<int16_t> target_data = {1,      2,  3, -10, 0, 32767, -32768,
+                                            -25536, -1, 0, -1,  0, 0};
         CheckLiteralResult<float, int16_t>(cast_executor, FieldType::FLOAT, src_data,
                                            arrow::int16(), target_data);
     }
     {
-        // Java Paimon cast MAX_FLOAT to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast INFINITY to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to -2147483648
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
+        const float max_float_convertible_to_int32 = std::nextafter(2147483648.0f, 0.0f);
+        std::vector<float> src_data = {1.1,
+                                       2.2,
+                                       3.3,
+                                       -10.01,
+                                       0,
+                                       -2147483648.0f,
+                                       max_float_convertible_to_int32,
+                                       MAX_FLOAT,
+                                       MIN_FLOAT,
+                                       INFINITY,
+                                       -INFINITY,
+                                       NAN};
         std::vector<int32_t> target_data = {
-            1, 2, 3, -10, 0, -2147483648, -2147483648, -2147483648, -2147483648, -2147483648};
+            1, 2, 3, -10, 0, MIN_INT32, 2147483520, MAX_INT32, MIN_INT32, MAX_INT32, MIN_INT32, 0};
         CheckLiteralResult<float, int32_t>(cast_executor, FieldType::FLOAT, src_data,
                                            arrow::int32(), target_data);
     }
     {
-        // Java Paimon cast MAX_FLOAT to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast INFINITY to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to MIN_INT64
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
-        std::vector<int64_t> target_data = {1,         2,         3,         -10,       0,
-                                            MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64};
+        const float max_float_convertible_to_int64 = std::nextafter(9223372036854775808.0f, 0.0f);
+        std::vector<float> src_data = {1.1,
+                                       2.2,
+                                       3.3,
+                                       -10.01,
+                                       0,
+                                       static_cast<float>(MIN_INT64),
+                                       max_float_convertible_to_int64,
+                                       MAX_FLOAT,
+                                       MIN_FLOAT,
+                                       INFINITY,
+                                       -INFINITY,
+                                       NAN};
+        std::vector<int64_t> target_data = {
+            1,         2,         3,         -10,       0, MIN_INT64, 9223371487098961920,
+            MAX_INT64, MIN_INT64, MAX_INT64, MIN_INT64, 0};
         CheckLiteralResult<float, int64_t>(cast_executor, FieldType::FLOAT, src_data,
                                            arrow::int64(), target_data);
     }
@@ -445,42 +474,48 @@ TEST_F(CastExecutorTest, TestNumericPrimitiveCastExecutorCastLiteral) {
     }
     // test src type DOUBLE
     {
-        // Java Paimon cast MAX_DOUBLE to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
-        std::vector<int8_t> target_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<double> src_data = {1.1,        2.2,      3.3,       -10.01, 0,
+                                        127.9,      -128.9,   300.9,     -300.9, MAX_DOUBLE,
+                                        MIN_DOUBLE, INFINITY, -INFINITY, NAN};
+        std::vector<int8_t> target_data = {1, 2, 3, -10, 0, 127, -128, 44, -44, -1, 0, -1, 0, 0};
         CheckLiteralResult<double, int8_t>(cast_executor, FieldType::DOUBLE, src_data,
                                            arrow::int8(), target_data);
     }
     {
-        // Java Paimon cast MAX_DOUBLE to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
-        std::vector<int16_t> target_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<double> src_data = {1.1,      2.2,       3.3,     -10.01,     0,
+                                        32767.9,  -32768.9,  40000.9, MAX_DOUBLE, MIN_DOUBLE,
+                                        INFINITY, -INFINITY, NAN};
+        std::vector<int16_t> target_data = {1,      2,  3, -10, 0, 32767, -32768,
+                                            -25536, -1, 0, -1,  0, 0};
         CheckLiteralResult<double, int16_t>(cast_executor, FieldType::DOUBLE, src_data,
                                             arrow::int16(), target_data);
     }
     {
-        // Java Paimon cast MAX_DOUBLE to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast INFINITY to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to -2147483648
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
+        std::vector<double> src_data = {1.1,        2.2,          3.3,           -10.01,
+                                        0,          2147483647.9, -2147483648.9, MAX_DOUBLE,
+                                        MIN_DOUBLE, INFINITY,     -INFINITY,     NAN};
         std::vector<int32_t> target_data = {
-            1, 2, 3, -10, 0, -2147483648, -2147483648, -2147483648, -2147483648, -2147483648};
+            1, 2, 3, -10, 0, MAX_INT32, MIN_INT32, MAX_INT32, MIN_INT32, MAX_INT32, MIN_INT32, 0};
         CheckLiteralResult<double, int32_t>(cast_executor, FieldType::DOUBLE, src_data,
                                             arrow::int32(), target_data);
     }
     {
-        // Java Paimon cast MAX_DOUBLE to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast INFINITY to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to MIN_INT64
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
-        std::vector<int64_t> target_data = {1,         2,         3,         -10,       0,
-                                            MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64};
+        const double max_double_convertible_to_int64 = std::nextafter(9223372036854775808.0, 0.0);
+        std::vector<double> src_data = {1.1,
+                                        2.2,
+                                        3.3,
+                                        -10.01,
+                                        0,
+                                        static_cast<double>(MIN_INT64),
+                                        max_double_convertible_to_int64,
+                                        MAX_DOUBLE,
+                                        MIN_DOUBLE,
+                                        INFINITY,
+                                        -INFINITY,
+                                        NAN};
+        std::vector<int64_t> target_data = {
+            1,         2,         3,         -10,       0, MIN_INT64, 9223372036854774784,
+            MAX_INT64, MIN_INT64, MAX_INT64, MIN_INT64, 0};
         CheckLiteralResult<double, int64_t>(cast_executor, FieldType::DOUBLE, src_data,
                                             arrow::int64(), target_data);
     }
@@ -590,51 +625,65 @@ TEST_F(CastExecutorTest, TestNumericPrimitiveCastExecutorCastArray) {
     }
     // test src type float
     {
-        // Java Paimon cast MAX_FLOAT to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
+        std::vector<float> src_data = {1.1,       2.2,      3.3,       -10.01, 0,
+                                       127.9,     -128.9,   300.9,     -300.9, MAX_FLOAT,
+                                       MIN_FLOAT, INFINITY, -INFINITY, NAN};
         auto src_array = MakeArrowArray<float, arrow::FloatBuilder>(arrow::float32(), src_data);
-        std::vector<int8_t> expected_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<int8_t> expected_data = {1, 2, 3, -10, 0, 127, -128, 44, -44, -1, 0, -1, 0, 0};
         auto expected_array =
             MakeArrowArray<int8_t, arrow::Int8Builder>(arrow::int8(), expected_data);
         CheckArrayResult(cast_executor, arrow::int8(), src_array, expected_array);
     }
     {
-#ifndef NDEBUG
-        // Java Paimon cast MAX_FLOAT to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
+        std::vector<float> src_data = {1.1,      2.2,       3.3,     -10.01,    0,
+                                       32767.9,  -32768.9,  40000.9, MAX_FLOAT, MIN_FLOAT,
+                                       INFINITY, -INFINITY, NAN};
         auto src_array = MakeArrowArray<float, arrow::FloatBuilder>(arrow::float32(), src_data);
-        std::vector<int16_t> expected_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<int16_t> expected_data = {1,      2,  3, -10, 0, 32767, -32768,
+                                              -25536, -1, 0, -1,  0, 0};
         auto expected_array =
             MakeArrowArray<int16_t, arrow::Int16Builder>(arrow::int16(), expected_data);
         CheckArrayResult(cast_executor, arrow::int16(), src_array, expected_array);
-#endif
     }
     {
-        // Java Paimon cast MAX_FLOAT to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast INFINITY to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to -2147483648
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
+        const float max_float_convertible_to_int32 = std::nextafter(2147483648.0f, 0.0f);
+        std::vector<float> src_data = {1.1,
+                                       2.2,
+                                       3.3,
+                                       -10.01,
+                                       0,
+                                       -2147483648.0f,
+                                       max_float_convertible_to_int32,
+                                       MAX_FLOAT,
+                                       MIN_FLOAT,
+                                       INFINITY,
+                                       -INFINITY,
+                                       NAN};
         auto src_array = MakeArrowArray<float, arrow::FloatBuilder>(arrow::float32(), src_data);
         std::vector<int32_t> expected_data = {
-            1, 2, 3, -10, 0, -2147483648, -2147483648, -2147483648, -2147483648, -2147483648};
+            1, 2, 3, -10, 0, MIN_INT32, 2147483520, MAX_INT32, MIN_INT32, MAX_INT32, MIN_INT32, 0};
         auto expected_array =
             MakeArrowArray<int32_t, arrow::Int32Builder>(arrow::int32(), expected_data);
         CheckArrayResult(cast_executor, arrow::int32(), src_array, expected_array);
     }
     {
-        // Java Paimon cast MAX_FLOAT to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast INFINITY to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to MIN_INT64
-        std::vector<float> src_data = {1.1,       2.2,       3.3,      -10.01,    0,
-                                       MAX_FLOAT, MIN_FLOAT, INFINITY, -INFINITY, NAN};
+        const float max_float_convertible_to_int64 = std::nextafter(9223372036854775808.0f, 0.0f);
+        std::vector<float> src_data = {1.1,
+                                       2.2,
+                                       3.3,
+                                       -10.01,
+                                       0,
+                                       static_cast<float>(MIN_INT64),
+                                       max_float_convertible_to_int64,
+                                       MAX_FLOAT,
+                                       MIN_FLOAT,
+                                       INFINITY,
+                                       -INFINITY,
+                                       NAN};
         auto src_array = MakeArrowArray<float, arrow::FloatBuilder>(arrow::float32(), src_data);
         std::vector<int64_t> expected_data = {
-            1, 2, 3, -10, 0, MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64};
+            1,         2,         3,         -10,       0, MIN_INT64, 9223371487098961920,
+            MAX_INT64, MIN_INT64, MAX_INT64, MIN_INT64, 0};
         auto expected_array =
             MakeArrowArray<int64_t, arrow::Int64Builder>(arrow::int64(), expected_data);
         CheckArrayResult(cast_executor, arrow::int64(), src_array, expected_array);
@@ -662,49 +711,55 @@ TEST_F(CastExecutorTest, TestNumericPrimitiveCastExecutorCastArray) {
 
     // test src type double
     {
-        // Java Paimon cast MAX_DOUBLE to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
+        std::vector<double> src_data = {1.1,        2.2,      3.3,       -10.01, 0,
+                                        127.9,      -128.9,   300.9,     -300.9, MAX_DOUBLE,
+                                        MIN_DOUBLE, INFINITY, -INFINITY, NAN};
         auto src_array = MakeArrowArray<double, arrow::DoubleBuilder>(arrow::float64(), src_data);
-        std::vector<int8_t> expected_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<int8_t> expected_data = {1, 2, 3, -10, 0, 127, -128, 44, -44, -1, 0, -1, 0, 0};
         auto expected_array =
             MakeArrowArray<int8_t, arrow::Int8Builder>(arrow::int8(), expected_data);
         CheckArrayResult(cast_executor, arrow::int8(), src_array, expected_array);
     }
     {
-        // Java Paimon cast MAX_DOUBLE to -1 while C++ Paimon cast to 0
-        // Java Paimon cast INFINITY to -1 while C++ Paimon cast to 0
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
+        std::vector<double> src_data = {1.1,      2.2,       3.3,     -10.01,     0,
+                                        32767.9,  -32768.9,  40000.9, MAX_DOUBLE, MIN_DOUBLE,
+                                        INFINITY, -INFINITY, NAN};
         auto src_array = MakeArrowArray<double, arrow::DoubleBuilder>(arrow::float64(), src_data);
-        std::vector<int16_t> expected_data = {1, 2, 3, -10, 0, 0, 0, 0, 0, 0};
+        std::vector<int16_t> expected_data = {1,      2,  3, -10, 0, 32767, -32768,
+                                              -25536, -1, 0, -1,  0, 0};
         auto expected_array =
             MakeArrowArray<int16_t, arrow::Int16Builder>(arrow::int16(), expected_data);
         CheckArrayResult(cast_executor, arrow::int16(), src_array, expected_array);
     }
     {
-        // Java Paimon cast MAX_DOUBLE to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast INFINITY to 2147483647 while C++ Paimon cast to -2147483648
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to -2147483648
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
+        std::vector<double> src_data = {1.1,        2.2,          3.3,           -10.01,
+                                        0,          2147483647.9, -2147483648.9, MAX_DOUBLE,
+                                        MIN_DOUBLE, INFINITY,     -INFINITY,     NAN};
         auto src_array = MakeArrowArray<double, arrow::DoubleBuilder>(arrow::float64(), src_data);
         std::vector<int32_t> expected_data = {
-            1, 2, 3, -10, 0, -2147483648, -2147483648, -2147483648, -2147483648, -2147483648};
+            1, 2, 3, -10, 0, MAX_INT32, MIN_INT32, MAX_INT32, MIN_INT32, MAX_INT32, MIN_INT32, 0};
         auto expected_array =
             MakeArrowArray<int32_t, arrow::Int32Builder>(arrow::int32(), expected_data);
         CheckArrayResult(cast_executor, arrow::int32(), src_array, expected_array);
     }
     {
-        // Java Paimon cast MAX_DOUBLE to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast INFINITY to MAX_INT64 while C++ Paimon cast to MIN_INT64
-        // Java Paimon cast NAN to 0 while C++ Paimon cast to MIN_INT64
-        std::vector<double> src_data = {1.1,        2.2,        3.3,      -10.01,    0,
-                                        MAX_DOUBLE, MIN_DOUBLE, INFINITY, -INFINITY, NAN};
+        const double max_double_convertible_to_int64 = std::nextafter(9223372036854775808.0, 0.0);
+        std::vector<double> src_data = {1.1,
+                                        2.2,
+                                        3.3,
+                                        -10.01,
+                                        0,
+                                        static_cast<double>(MIN_INT64),
+                                        max_double_convertible_to_int64,
+                                        MAX_DOUBLE,
+                                        MIN_DOUBLE,
+                                        INFINITY,
+                                        -INFINITY,
+                                        NAN};
         auto src_array = MakeArrowArray<double, arrow::DoubleBuilder>(arrow::float64(), src_data);
         std::vector<int64_t> expected_data = {
-            1, 2, 3, -10, 0, MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64, MIN_INT64};
+            1,         2,         3,         -10,       0, MIN_INT64, 9223372036854774784,
+            MAX_INT64, MIN_INT64, MAX_INT64, MIN_INT64, 0};
         auto expected_array =
             MakeArrowArray<int64_t, arrow::Int64Builder>(arrow::int64(), expected_data);
         CheckArrayResult(cast_executor, arrow::int64(), src_array, expected_array);
@@ -728,6 +783,50 @@ TEST_F(CastExecutorTest, TestNumericPrimitiveCastExecutorCastArray) {
         auto expected_array =
             MakeArrowArray<double, arrow::DoubleBuilder>(arrow::float64(), expected_data);
         CheckArrayApproxResult(cast_executor, arrow::float64(), src_array, expected_array);
+    }
+}
+
+TEST_F(CastExecutorTest, TestNumericPrimitiveCastExecutorFloatingToIntegerArrayEdgeCases) {
+    auto cast_executor = std::make_shared<NumericPrimitiveCastExecutor>();
+    // float and double to integer no longer go through Arrow's kernel, so the edge cases of the
+    // conversion this executor does itself are covered here.
+    std::vector<float> src_data = {1.1, MAX_FLOAT, -10.01, NAN, 127.9};
+    auto src_array = MakeArrowArray<float, arrow::FloatBuilder>(arrow::float32(), src_data);
+    std::vector<int8_t> expected_data = {1, -1, -10, 0, 127};
+    auto expected_array = MakeArrowArray<int8_t, arrow::Int8Builder>(arrow::int8(), expected_data);
+    {
+        // MakeArrowArray() appends a trailing null, so this also covers null passthrough.
+        CheckArrayResult(cast_executor, arrow::int8(), src_array, expected_array);
+    }
+    {
+        // An empty array must not reserve or append anything.
+        auto empty_src_array = src_array->Slice(0, 0);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> target_array,
+                             CastArray(cast_executor, empty_src_array, arrow::int8()));
+        ASSERT_EQ(0, target_array->length());
+        ASSERT_TRUE(target_array->type()->Equals(arrow::int8()));
+    }
+    {
+        // A slice has a non-zero offset, which the conversion has to honour for both the values
+        // and the validity bitmap.
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> target_array,
+                             CastArray(cast_executor, src_array->Slice(2), arrow::int8()));
+        ASSERT_TRUE(target_array->Equals(expected_array->Slice(2),
+                                         arrow::EqualOptions::Defaults().nans_equal(true)))
+            << "target:" << target_array->ToString()
+            << "expected:" << expected_array->Slice(2)->ToString();
+    }
+    {
+        // The double instantiation shares the template, but pin its slice handling too.
+        std::vector<double> double_src_data = {1.1, MAX_DOUBLE, -10.01, NAN, 127.9};
+        auto double_src_array =
+            MakeArrowArray<double, arrow::DoubleBuilder>(arrow::float64(), double_src_data);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> target_array,
+                             CastArray(cast_executor, double_src_array->Slice(2), arrow::int8()));
+        ASSERT_TRUE(target_array->Equals(expected_array->Slice(2),
+                                         arrow::EqualOptions::Defaults().nans_equal(true)))
+            << "target:" << target_array->ToString()
+            << "expected:" << expected_array->Slice(2)->ToString();
     }
 }
 

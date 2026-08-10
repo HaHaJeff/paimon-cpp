@@ -22,6 +22,28 @@ include(CheckCXXCompilerFlag)
 
 message(STATUS "System processor: ${CMAKE_SYSTEM_PROCESSOR}")
 
+include("${CMAKE_CURRENT_LIST_DIR}/TargetArchitecture.cmake")
+message(STATUS "Target processor: ${PAIMON_TARGET_PROCESSOR} "
+               "(CPU family: ${PAIMON_TARGET_CPU_FAMILY})")
+
+# Probe the architecture specific tuning flags. x86 deliberately gets none of its
+# own, so there is nothing to probe there: the baseline stays whatever the
+# toolchain defaults to, and no persisted value depends on it; see
+# src/paimon/common/utils/crc32c.h.
+if(PAIMON_TARGET_CPU_FAMILY STREQUAL "aarch64" AND NOT "${PAIMON_AARCH64_MARCH}" STREQUAL
+                                                   "")
+    set(PAIMON_AARCH64_MARCH_FLAG "-march=${PAIMON_AARCH64_MARCH}")
+    # check_cxx_compiler_flag() caches under a fixed name, so a reconfigure in the
+    # same build directory would otherwise reuse the old PAIMON_AARCH64_MARCH verdict.
+    if(NOT "${PAIMON_AARCH64_MARCH_FLAG}" STREQUAL "${PAIMON_PROBED_AARCH64_MARCH_FLAG}")
+        unset(CXX_SUPPORTS_AARCH64_MARCH CACHE)
+        set(PAIMON_PROBED_AARCH64_MARCH_FLAG
+            "${PAIMON_AARCH64_MARCH_FLAG}"
+            CACHE INTERNAL "Arm64 arch flag that CXX_SUPPORTS_AARCH64_MARCH refers to")
+    endif()
+    check_cxx_compiler_flag("${PAIMON_AARCH64_MARCH_FLAG}" CXX_SUPPORTS_AARCH64_MARCH)
+endif()
+
 # Support C11
 if(NOT DEFINED CMAKE_C_STANDARD)
     set(CMAKE_C_STANDARD 11)
@@ -225,58 +247,22 @@ if(BUILD_WARNING_FLAGS)
 endif(BUILD_WARNING_FLAGS)
 
 # Only enable additional instruction sets if they are supported
-if(PAIMON_CPU_FLAG STREQUAL "x86")
-    if(PAIMON_SIMD_LEVEL STREQUAL "AVX512")
-        if(NOT CXX_SUPPORTS_AVX512)
-            message(FATAL_ERROR "AVX512 required but compiler doesn't support it.")
-        endif()
-        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} ${PAIMON_AVX512_FLAG}")
-        add_definitions(-DPAIMON_HAVE_AVX512 -DPAIMON_HAVE_AVX2 -DPAIMON_HAVE_BMI2
-                        -DPAIMON_HAVE_SSE4_2)
-    elseif(PAIMON_SIMD_LEVEL STREQUAL "AVX2")
-        if(NOT CXX_SUPPORTS_AVX2)
-            message(FATAL_ERROR "AVX2 required but compiler doesn't support it.")
-        endif()
-        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} ${PAIMON_AVX2_FLAG}")
-        add_definitions(-DPAIMON_HAVE_AVX2 -DPAIMON_HAVE_BMI2 -DPAIMON_HAVE_SSE4_2)
-    elseif(PAIMON_SIMD_LEVEL STREQUAL "SSE4_2")
-        if(NOT CXX_SUPPORTS_SSE4_2)
-            message(FATAL_ERROR "SSE4.2 required but compiler doesn't support it.")
-        endif()
-        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} ${PAIMON_SSE4_2_FLAG}")
-        add_definitions(-DPAIMON_HAVE_SSE4_2)
-    endif()
-endif()
-
-if(PAIMON_CPU_FLAG STREQUAL "ppc")
-    if(CXX_SUPPORTS_ALTIVEC AND PAIMON_ALTIVEC)
-        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} ${PAIMON_ALTIVEC_FLAG}")
-    endif()
-endif()
-
-if(PAIMON_CPU_FLAG STREQUAL "armv8")
-    if(NOT CXX_SUPPORTS_ARMV8_ARCH)
-        message(FATAL_ERROR "Unsupported arch flag: ${PAIMON_ARMV8_ARCH_FLAG}.")
-    endif()
-    if(PAIMON_ARMV8_ARCH_FLAG MATCHES "native")
-        message(FATAL_ERROR "native arch not allowed, please specify arch explicitly.")
-    endif()
-    set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} ${PAIMON_ARMV8_ARCH_FLAG}")
-
-    add_definitions(-DPAIMON_HAVE_NEON)
-
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS
-                                                "5.4")
-        message(WARNING "Disable Armv8 CRC and Crypto as compiler doesn't support them well."
-        )
+if(PAIMON_TARGET_CPU_FAMILY STREQUAL "aarch64")
+    if("${PAIMON_AARCH64_MARCH}" STREQUAL "")
+        # An explicitly empty PAIMON_AARCH64_MARCH opts out of -march entirely, for
+        # toolchains that reject the flag, such as AppleClang targeting arm64.
+        message(STATUS "PAIMON_AARCH64_MARCH is empty: passing no -march flag")
     else()
-        if(PAIMON_ARMV8_ARCH_FLAG MATCHES "\\+crypto")
-            add_definitions(-DPAIMON_HAVE_ARMV8_CRYPTO)
+        if(NOT CXX_SUPPORTS_AARCH64_MARCH)
+            message(FATAL_ERROR "The compiler does not accept ${PAIMON_AARCH64_MARCH_FLAG}. "
+                                "Set -DPAIMON_AARCH64_MARCH to a value it accepts, or to an "
+                                "empty string to pass no -march flag.")
         endif()
-        # armv8.1+ implies crc support
-        if(PAIMON_ARMV8_ARCH_FLAG MATCHES "armv8\\.[1-9]|\\+crc")
-            add_definitions(-DPAIMON_HAVE_ARMV8_CRC)
+        if(PAIMON_AARCH64_MARCH_FLAG MATCHES "native")
+            message(FATAL_ERROR "native arch not allowed, please specify arch explicitly."
+            )
         endif()
+        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} ${PAIMON_AARCH64_MARCH_FLAG}")
     endif()
 endif()
 

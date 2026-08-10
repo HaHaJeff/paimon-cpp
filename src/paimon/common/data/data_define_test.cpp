@@ -97,6 +97,17 @@ TEST(DataDefineTest, VariantValueToStringReturnsStringForInt) {
     ASSERT_EQ(DataDefine::VariantValueToString(int_variant), "42");
 }
 
+// Test case: VariantValueToString should print a negative TINYINT as a negative number, which
+// it holds as a plain char whose signedness follows the ABI
+TEST(DataDefineTest, VariantValueToStringReturnsSignedStringForTinyInt) {
+    VariantType tiny_int_variant = static_cast<char>(-20);
+    ASSERT_EQ(DataDefine::VariantValueToString(tiny_int_variant), "-20");
+    tiny_int_variant = static_cast<char>(127);
+    ASSERT_EQ(DataDefine::VariantValueToString(tiny_int_variant), "127");
+    tiny_int_variant = static_cast<char>(-128);
+    ASSERT_EQ(DataDefine::VariantValueToString(tiny_int_variant), "-128");
+}
+
 // Test case: VariantValueToString should handle string data (BinaryString)
 TEST(DataDefineTest, VariantValueToStringReturnsStringForBinaryString) {
     auto pool = GetDefaultPool();

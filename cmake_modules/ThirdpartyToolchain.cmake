@@ -1261,7 +1261,27 @@ macro(build_jindosdk_c)
 endmacro()
 
 macro(build_lumina)
-    message(STATUS "Installing Lumina from precompiled package")
+    # The release tarball ships one prebuilt artifact tree per platform; keep this
+    # list in sync with the platforms the pinned release actually contains.
+    set(LUMINA_SUPPORTED_PLATFORMS "linux-x86_64")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND PAIMON_TARGET_CPU_FAMILY STREQUAL "x86")
+        set(LUMINA_ARTIFACT_PLATFORM "linux-x86_64")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND PAIMON_TARGET_CPU_FAMILY STREQUAL
+                                                  "aarch64")
+        set(LUMINA_ARTIFACT_PLATFORM "linux-aarch64")
+    else()
+        set(LUMINA_ARTIFACT_PLATFORM "${CMAKE_SYSTEM_NAME}-${PAIMON_TARGET_PROCESSOR}")
+    endif()
+    if(NOT "${LUMINA_ARTIFACT_PLATFORM}" IN_LIST LUMINA_SUPPORTED_PLATFORMS)
+        message(FATAL_ERROR "Lumina ${PAIMON_LUMINA_BUILD_VERSION} has no prebuilt artifacts for "
+                            "${LUMINA_ARTIFACT_PLATFORM} (available: ${LUMINA_SUPPORTED_PLATFORMS}). "
+                            "Reconfigure with -DPAIMON_ENABLE_LUMINA=OFF.")
+    endif()
+    set(LUMINA_ARTIFACT_DIR
+        "artifacts/cpp/${LUMINA_ARTIFACT_PLATFORM}/install-root/usr/local")
+
+    message(STATUS "Installing Lumina for ${LUMINA_ARTIFACT_PLATFORM} from precompiled package"
+    )
 
     set(LUMINA_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/lumina_ep-install")
     set(LUMINA_INCLUDE_DIR "${LUMINA_PREFIX}/include")
@@ -1275,10 +1295,10 @@ macro(build_lumina)
                         CONFIGURE_COMMAND ""
                         BUILD_COMMAND ""
                         INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_directory
-                                        <SOURCE_DIR>/artifacts/cpp/linux-x86_64/install-root/usr/local/include
+                                        <SOURCE_DIR>/${LUMINA_ARTIFACT_DIR}/include
                                         ${LUMINA_INCLUDE_DIR}
                         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                                <SOURCE_DIR>/artifacts/cpp/linux-x86_64/install-root/usr/local/lib/liblumina.so
+                                <SOURCE_DIR>/${LUMINA_ARTIFACT_DIR}/lib/liblumina.so
                                 ${LUMINA_DYNAMIC_LIB}
                         BUILD_BYPRODUCTS "${LUMINA_DYNAMIC_LIB}")
 

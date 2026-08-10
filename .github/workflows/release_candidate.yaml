@@ -99,7 +99,7 @@ jobs:
     name: Verify source archive (${{ matrix.compiler }})
     if: github.ref_type == 'tag'
     needs: archive
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -107,6 +107,7 @@ jobs:
         compiler:
           - gcc-14
           - clang
+          - gcc-14-aarch64
         include:
           - compiler: gcc-14
             cc: gcc-14
@@ -114,6 +115,10 @@ jobs:
           - compiler: clang
             cc: clang
             cxx: clang++
+          - compiler: gcc-14-aarch64
+            cc: gcc-14
+            cxx: g++-14
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout source
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1

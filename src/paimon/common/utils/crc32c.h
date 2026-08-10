@@ -20,27 +20,26 @@
 
 #include <cstddef>
 #include <cstdint>
-#if defined(PAIMON_HAVE_SSE4_2)
-#include <nmmintrin.h>
-#endif
+
 #include "paimon/visibility.h"
 
 namespace paimon {
 
-/// CRC32C
+/// Despite the name, this computes CRC-32 with the zlib polynomial 0x04C11DB7,
+/// not Castagnoli CRC-32C. The value is persisted in the SST block trailer and in
+/// the B-tree global index, so it must stay identical across compilers,
+/// architectures and build flags.
+///
+/// An SSE4.2 `_mm_crc32` kernel used to live here behind PAIMON_HAVE_SSE4_2. It
+/// computed Castagnoli, i.e. a different checksum for the same bytes, so it was
+/// removed rather than left switchable. Any future hardware kernel has to
+/// implement the zlib polynomial and be checked against crc32c_test.cpp.
 class PAIMON_EXPORT CRC32C {
  public:
+    /// @param data bytes to checksum
+    /// @param length number of bytes
+    /// @param crc running value to continue from, 0 to start a new checksum
+    /// @return the checksum of `data` appended to the stream `crc` stands for
     static uint32_t calculate(const char* data, size_t length, uint32_t crc = 0);
-
- private:
-#if defined(PAIMON_HAVE_SSE4_2)
-    /// Simd implementation for crc32c.
-    ///
-    /// @param data data to be calculated
-    /// @param length length of data
-    /// @param crc initial crc value
-    /// @return crc32c value
-    static uint32_t crc32c_hw(const char* data, size_t length, uint32_t crc);
-#endif
 };
 }  // namespace paimon

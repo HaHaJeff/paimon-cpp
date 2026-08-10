@@ -27,7 +27,25 @@ This document defines the coding conventions for the Paimon C++ project. All pul
 
 - **C++17** is the target standard.
 - Do **not** use C++20 or later features.
-- Only the **x86_64** architecture is currently supported.
+- The **x86_64** and **aarch64** architectures are supported. Do not assume a specific
+  architecture.
+- Never rely on the signedness of plain `char`. It is
+  [implementation defined](https://gcc.gnu.org/onlinedocs/gcc/Characters-implementation.html),
+  is fixed by the target ABI rather than by the architecture as such (the AArch64 and
+  x86-64 psABIs disagree), and can be flipped with
+  `-fsigned-char` / `-funsigned-char`. Use `int8_t` or `uint8_t` when the signedness of a
+  byte matters, and keep `char` for text.
+- Converting a floating point value to an integer type is
+  [undefined behavior](https://en.cppreference.com/w/cpp/language/implicit_conversion) unless the
+  truncated value is representable in the target type; `NaN` and the infinities never are. Check
+  the value for finiteness and range first, then apply an explicit policy — reject it or saturate
+  it. Do not rely on what a given architecture happens to produce, and do not let a test reach the
+  conversion with an unrepresentable value: Clang's `-fsanitize=float-cast-overflow` reports it.
+  `NumericPrimitiveCastExecutor::JavaFloatingToIntegerCast` implements the policy Paimon uses,
+  which is the one Java applies: `NaN` becomes 0, and an out of range value saturates at the int32
+  bounds, or the int64 bounds for a BIGINT destination, and is then narrowed to the target width by
+  keeping the low bits. The narrowing is why `300.9` converts to 44 as a TINYINT — the low byte of
+  300 — and saturating first is why `MAX_FLOAT` converts to -1 rather than to 127.
 
 ---
 
