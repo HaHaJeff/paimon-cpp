@@ -200,10 +200,7 @@ Status RealtimeAppendOnlyWriter::Sync() {
 }
 
 Status RealtimeAppendOnlyWriter::Close() {
-    {
-        std::lock_guard<std::mutex> lock(mem_indexer_mutex_);
-        PAIMON_RETURN_NOT_OK(mem_indexer_->Close());
-    }
+    // The shared real-time context owns the mem indexer for scans and later writers.
     return file_writer_->Close();
 }
 

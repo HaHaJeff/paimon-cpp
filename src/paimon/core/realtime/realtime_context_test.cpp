@@ -28,6 +28,7 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/realtime/mem_indexer.h"
 #include "paimon/testing/utils/testharness.h"
@@ -81,10 +82,6 @@ class TestingMemIndexer : public MemIndexer {
         return 0;
     }
 
-    Status Close() override {
-        return Status::OK();
-    }
-
     int32_t acquire_count = 0;
     int32_t advance_count = 0;
     bool fail_next_advance = false;
@@ -93,12 +90,13 @@ class TestingMemIndexer : public MemIndexer {
 
 class TestingMemIndexerFactory : public MemIndexerFactory {
  public:
-    Result<std::shared_ptr<MemIndexer>> Create(ArrowSchema* write_schema,
+    Result<std::shared_ptr<MemIndexer>> Create(std::unique_ptr<ArrowSchema> write_schema,
                                                const std::map<std::string, std::string>&,
                                                const std::shared_ptr<MemoryPool>&) override {
         if (!write_schema || !write_schema->release) {
             return Status::Invalid("testing write schema is null");
         }
+        ArrowSchemaRelease(write_schema.get());
         auto indexer = std::make_shared<TestingMemIndexer>();
         indexers.push_back(indexer);
         return indexer;
@@ -131,6 +129,7 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(first_state.indexer, first_again_state.indexer);
     ASSERT_EQ(0, first_again_state.initial_offset);
     ASSERT_EQ(1, factory->indexers.size());
+    ASSERT_EQ(1, factory->indexers[0]->acquire_count);
 
     ASSERT_OK_AND_ASSIGN(
         RealtimeMemIndexerState second_state,
@@ -149,7 +148,7 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(expected_partition_bucket, views[0].partition_bucket);
     ASSERT_EQ(first_state.indexer, views[0].indexer);
     ASSERT_TRUE(views[0].read_view);
-    ASSERT_EQ(1, factory->indexers[0]->acquire_count);
+    ASSERT_EQ(2, factory->indexers[0]->acquire_count);
     ASSERT_EQ(1, factory->indexers[1]->acquire_count);
     ASSERT_EQ(1, factory->indexers[2]->acquire_count);
 }

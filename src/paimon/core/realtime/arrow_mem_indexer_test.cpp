@@ -93,7 +93,7 @@ class ArrowMemIndexerTest : public testing::Test {
     std::shared_ptr<ArrowMemIndexer> indexer_;
 };
 
-TEST_F(ArrowMemIndexerTest, TestWriteValidationSealAndClose) {
+TEST_F(ArrowMemIndexerTest, TestWriteValidationAndSeal) {
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> empty_segment,
                          indexer_->SealForCommit());
     ASSERT_FALSE(empty_segment.has_value());
@@ -120,15 +120,6 @@ TEST_F(ArrowMemIndexerTest, TestWriteValidationSealAndClose) {
     ASSERT_FALSE(empty_segment.has_value());
 
     ASSERT_GT(indexer_->GetMemoryUsage(), 0);
-    ASSERT_OK(indexer_->Close());
-    ASSERT_EQ(0, indexer_->GetMemoryUsage());
-    ASSERT_NOK_WITH_MSG(
-        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[4, "e"]])"), Range(4, 4)}),
-        "mem indexer is closed");
-    ASSERT_NOK_WITH_MSG(indexer_->SealForCommit(), "mem indexer is closed");
-    ASSERT_NOK_WITH_MSG(indexer_->AcquireReadView(), "mem indexer is closed");
-    ASSERT_NOK_WITH_MSG(indexer_->AdvanceCommittedOffset(/*committed_offset=*/3),
-                        "mem indexer is closed");
 }
 
 TEST_F(ArrowMemIndexerTest, TestQueryReaderClipsCommittedOffsetWithBitmap) {

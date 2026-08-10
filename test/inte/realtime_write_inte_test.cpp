@@ -229,8 +229,8 @@ class RealtimeWriteInteTest : public ::testing::Test {
         return rows;
     }
 
-    Status Commit(const std::vector<RealtimeCommitProgress>& realtime_commits,
-                  int64_t commit_identifier) const {
+    Result<int64_t> Commit(const std::vector<RealtimeCommitProgress>& realtime_commits,
+                           int64_t commit_identifier) const {
         CommitContextBuilder builder(table_path_, commit_user_);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<CommitContext> context,
                                builder.SetOptions(options_).Finish());
@@ -485,6 +485,76 @@ TEST_F(RealtimeWriteInteTest, TestReadMemoryBeforePrepareCommit) {
     ASSERT_OK(writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestCloseWriterKeepsContextReadable) {
+    CreateTable(/*partition_keys=*/{});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(rows, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK(writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
+    ASSERT_EQ(rows, actual_rows);
+}
+
+TEST_F(RealtimeWriteInteTest, TestPinnedPlanRemainsReadableAfterWriterClose) {
+    CreateTable(/*partition_keys=*/{});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(rows, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+    ASSERT_OK(writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(plan));
+    ASSERT_EQ(rows, actual_rows);
+}
+
+TEST_F(RealtimeWriteInteTest, TestCloseWriterAllowsContextReuseByLaterWriter) {
+    CreateTable(/*partition_keys=*/{});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> first_rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
+                         MakeBatch(first_rows, /*partitioned=*/false));
+    ASSERT_OK(first_writer->Write(std::move(first_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> commits,
+                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, commits.size());
+    ASSERT_EQ(Range(0, 2), commits[0].offset_range);
+    ASSERT_OK(first_writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> second_rows = MakeRows(/*first_id=*/3, /*count=*/2, /*partition=*/"p0");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
+                         MakeBatch(second_rows, /*partitioned=*/false));
+    ASSERT_OK(second_writer->Write(std::move(second_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_commits,
+                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_EQ(1, second_commits.size());
+    ASSERT_EQ(Range(3, 4), second_commits[0].offset_range);
+
+    commits.push_back(std::move(second_commits[0]));
+    ASSERT_OK(Commit(commits, /*commit_identifier=*/1));
+    std::vector<Row> expected_rows = first_rows;
+    expected_rows.insert(expected_rows.end(), second_rows.begin(), second_rows.end());
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
+    ASSERT_EQ(expected_rows, actual_rows);
+    ASSERT_OK(second_writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestReadCommittedDiskAndBuildingMemory) {
     CreateTable(/*partition_keys=*/{});
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
@@ -640,7 +710,8 @@ TEST_F(RealtimeWriteInteTest, TestRefreshCommittedSnapshotReclaimsMemory) {
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_commits,
                          writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
     ASSERT_EQ(1, disk_commits.size());
-    ASSERT_OK(Commit(disk_commits, /*commit_identifier=*/0));
+    ASSERT_OK_AND_ASSIGN(int64_t committed_snapshot_id,
+                         Commit(disk_commits, /*commit_identifier=*/0));
 
     std::vector<Row> memory_rows = MakeRows(/*first_id=*/10, /*count=*/2, /*partition=*/"p0");
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> memory_batch,
@@ -654,12 +725,7 @@ TEST_F(RealtimeWriteInteTest, TestRefreshCommittedSnapshotReclaimsMemory) {
     ASSERT_OK_AND_ASSIGN(uint64_t memory_usage_before_refresh,
                          GetRealtimeMemoryUsage(realtime_context));
 
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(options_));
-    SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
-    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> latest_snapshot,
-                         snapshot_manager.LatestSnapshot());
-    ASSERT_TRUE(latest_snapshot.has_value());
-    ASSERT_OK(writer->RefreshCommittedSnapshot(latest_snapshot->Id()));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(committed_snapshot_id));
 
     ASSERT_OK_AND_ASSIGN(std::vector<Row> read2, ReadRows(realtime_context));
     ASSERT_EQ(read1, read2);
@@ -682,7 +748,8 @@ TEST_F(RealtimeWriteInteTest, TestPlanPinsMemoryAcrossRefresh) {
     ASSERT_OK(writer->Write(std::move(disk_batch)));
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_commits,
                          writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
-    ASSERT_OK(Commit(disk_commits, /*commit_identifier=*/0));
+    ASSERT_OK_AND_ASSIGN(int64_t committed_snapshot_id,
+                         Commit(disk_commits, /*commit_identifier=*/0));
 
     std::vector<Row> memory_rows = MakeRows(/*first_id=*/3, /*count=*/2, /*partition=*/"p0");
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> memory_batch,
@@ -691,12 +758,7 @@ TEST_F(RealtimeWriteInteTest, TestPlanPinsMemoryAcrossRefresh) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> pinned_plan,
                          CreatePlan(realtime_context, /*predicate=*/nullptr));
 
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(options_));
-    SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
-    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> latest_snapshot,
-                         snapshot_manager.LatestSnapshot());
-    ASSERT_TRUE(latest_snapshot.has_value());
-    ASSERT_OK(writer->RefreshCommittedSnapshot(latest_snapshot->Id()));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(committed_snapshot_id));
 
     std::vector<Row> expected_rows = disk_rows;
     expected_rows.insert(expected_rows.end(), memory_rows.begin(), memory_rows.end());
@@ -716,9 +778,6 @@ TEST_F(RealtimeWriteInteTest, TestRepeatedCommitReadAndRefresh) {
                          RealtimeContext::Create());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(options_));
-    SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
-
     constexpr int64_t kRoundCount = 3;
     constexpr int64_t kRowsPerRound = 4;
     std::vector<Row> expected_rows;
@@ -732,7 +791,8 @@ TEST_F(RealtimeWriteInteTest, TestRepeatedCommitReadAndRefresh) {
         ASSERT_EQ(1, commits.size());
         ASSERT_EQ(Range(round * kRowsPerRound, (round + 1) * kRowsPerRound - 1),
                   commits[0].offset_range);
-        ASSERT_OK(Commit(commits, /*commit_identifier=*/round));
+        ASSERT_OK_AND_ASSIGN(int64_t committed_snapshot_id,
+                             Commit(commits, /*commit_identifier=*/round));
         expected_rows.insert(expected_rows.end(), rows.begin(), rows.end());
 
         ASSERT_OK_AND_ASSIGN(std::vector<Row> read_before_refresh, ReadRows(realtime_context));
@@ -741,10 +801,7 @@ TEST_F(RealtimeWriteInteTest, TestRepeatedCommitReadAndRefresh) {
                              GetRealtimeMemoryUsage(realtime_context));
         ASSERT_GT(memory_usage_before_refresh, 0);
 
-        ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> latest_snapshot,
-                             snapshot_manager.LatestSnapshot());
-        ASSERT_TRUE(latest_snapshot.has_value());
-        ASSERT_OK(writer->RefreshCommittedSnapshot(latest_snapshot->Id()));
+        ASSERT_OK(writer->RefreshCommittedSnapshot(committed_snapshot_id));
 
         ASSERT_OK_AND_ASSIGN(std::vector<Row> read_after_refresh, ReadRows(realtime_context));
         ASSERT_EQ(read_before_refresh, read_after_refresh);
@@ -761,9 +818,6 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
                          RealtimeContext::Create());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(options_));
-    SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
-
     constexpr int32_t kPrepareThreadCount = 4;
     constexpr int32_t kReadThreadCount = 4;
     constexpr int64_t kBatchCount = 12;
@@ -885,23 +939,14 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
             std::vector<RealtimeCommitProgress> commits;
             commits.push_back(std::move(next_commit).value());
             int64_t committed_offset = commits[0].offset_range.to;
-            Status status = Commit(commits, commit_identifier++);
-            if (state.RecordErrorIfNotOk(status)) {
+            Result<int64_t> commit_result = Commit(commits, commit_identifier++);
+            if (state.RecordErrorIfNotOk(commit_result)) {
                 break;
             }
             next_offset = committed_offset + 1;
-            Result<std::optional<Snapshot>> snapshot_result = snapshot_manager.LatestSnapshot();
-            if (state.RecordErrorIfNotOk(snapshot_result)) {
-                break;
-            }
-            std::optional<Snapshot> snapshot = std::move(snapshot_result).value();
-            if (!snapshot) {
-                state.RecordError("real-time commit did not create a snapshot");
-                break;
-            }
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
-                pending_snapshot_ids.push_back(snapshot->Id());
+                pending_snapshot_ids.push_back(std::move(commit_result).value());
             }
             ++commit_count;
             state.snapshot_cv.notify_all();

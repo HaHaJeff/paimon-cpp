@@ -106,8 +106,9 @@ class FileStoreCommitImpl : public FileStoreCommit {
                   int64_t commit_identifier,
                   std::optional<int64_t> watermark = std::nullopt) override;
 
-    Status CommitWithProgress(const std::vector<RealtimeCommitProgress>& realtime_commits,
-                              int64_t commit_identifier, std::optional<int64_t> watermark) override;
+    Result<int64_t> CommitWithProgress(const std::vector<RealtimeCommitProgress>& realtime_commits,
+                                       int64_t commit_identifier,
+                                       std::optional<int64_t> watermark) override;
 
     Result<int32_t> FilterAndCommit(
         const std::map<int64_t, std::vector<std::shared_ptr<CommitMessage>>>&

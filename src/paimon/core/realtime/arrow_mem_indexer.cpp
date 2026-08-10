@@ -263,9 +263,6 @@ Status ArrowMemIndexer::Write(RealtimeWriteBatch&& write_batch) {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) {
-        return Status::Invalid("mem indexer is closed");
-    }
     if (building_range_ && write_batch.offset_range.from != building_range_->to + 1) {
         return Status::Invalid("real-time offset ranges must be contiguous");
     }
@@ -284,9 +281,6 @@ Status ArrowMemIndexer::Write(RealtimeWriteBatch&& write_batch) {
 
 Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> ArrowMemIndexer::SealForCommit() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) {
-        return Status::Invalid("mem indexer is closed");
-    }
     if (building_batches_.empty()) {
         return std::optional<std::shared_ptr<RealtimeSegmentHandle>>();
     }
@@ -311,9 +305,6 @@ Result<std::vector<std::unique_ptr<BatchReader>>> ArrowMemIndexer::CreateCommitR
 
 Result<std::shared_ptr<MemReadView>> ArrowMemIndexer::AcquireReadView() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) {
-        return Status::Invalid("mem indexer is closed");
-    }
     std::vector<StoredBatch> batches;
     for (const std::shared_ptr<Segment>& segment : sealed_segments_) {
         const std::vector<StoredBatch>& segment_batches = segment->GetBatches();
@@ -350,9 +341,6 @@ Result<std::vector<std::unique_ptr<BatchReader>>> ArrowMemIndexer::CreateQueryRe
 
 Status ArrowMemIndexer::AdvanceCommittedOffset(int64_t committed_offset) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) {
-        return Status::Invalid("mem indexer is closed");
-    }
     // TODO(xinyu.lxy): Consider deferring segment destruction to a reclamation queue. Existing
     // read views may pin reclaimed batches, so the last query releasing a view can otherwise pay
     // the full buffer destruction cost and observe higher tail latency.
@@ -372,16 +360,6 @@ uint64_t ArrowMemIndexer::GetMemoryUsage() const {
         result += segment->GetMemoryUsage();
     }
     return result;
-}
-
-Status ArrowMemIndexer::Close() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    building_batches_.clear();
-    sealed_segments_.clear();
-    building_memory_usage_ = 0;
-    building_range_.reset();
-    closed_ = true;
-    return Status::OK();
 }
 
 }  // namespace paimon

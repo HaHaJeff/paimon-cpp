@@ -93,7 +93,8 @@ struct PAIMON_EXPORT MemQueryContext {
 /// Paimon serializes calls to `Write` and `SealForCommit` for the same indexer. After sealing,
 /// `CreateCommitReaders` may read the immutable sealed segment while later `Write` calls append to
 /// a new building segment. Paimon retains control of file format, rolling, indexes, and
-/// commit-message generation.
+/// commit-message generation. An indexer may outlive an individual writer because the shared
+/// real-time context and active read views retain it.
 class PAIMON_EXPORT MemIndexer {
  public:
     virtual ~MemIndexer() = default;
@@ -143,9 +144,6 @@ class PAIMON_EXPORT MemIndexer {
 
     /// Returns the number of bytes currently retained by building and sealed segments.
     virtual uint64_t GetMemoryUsage() const = 0;
-
-    /// Releases resources owned by this indexer and rejects subsequent writes or seals.
-    virtual Status Close() = 0;
 };
 
 /// Factory for application-provided `MemIndexer` implementations.
@@ -154,11 +152,13 @@ class PAIMON_EXPORT MemIndexerFactory {
     virtual ~MemIndexerFactory() = default;
 
     /// Creates an indexer configured with the supplied schema, options, and memory pool.
-    /// @param write_schema Complete table write schema.
+    /// @param write_schema Complete table write schema whose ownership is transferred to the
+    /// factory. The factory may consume it or retain it in the created indexer.
     /// @param options Effective table options available to the indexer.
     /// @param memory_pool Memory pool provided by the write context.
     virtual Result<std::shared_ptr<MemIndexer>> Create(
-        ::ArrowSchema* write_schema, const std::map<std::string, std::string>& options,
+        std::unique_ptr<::ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool) = 0;
 };
 

@@ -888,9 +888,12 @@ Status FileStoreCommitImpl::Commit(
                   /*realtime_ranges=*/{});
 }
 
-Status FileStoreCommitImpl::CommitWithProgress(
+Result<int64_t> FileStoreCommitImpl::CommitWithProgress(
     const std::vector<RealtimeCommitProgress>& realtime_commits, int64_t identifier,
     std::optional<int64_t> watermark) {
+    if (realtime_commits.empty()) {
+        return Status::Invalid("real-time commits must not be empty");
+    }
     std::vector<RealtimeCommitProgress> ordered_commits = realtime_commits;
     RealtimeCommitProperties::Sort(&ordered_commits);
 
@@ -930,8 +933,13 @@ Status FileStoreCommitImpl::CommitWithProgress(
 
     std::shared_ptr<ManifestCommittable> committable =
         CreateManifestCommittable(identifier, commit_messages, watermark, /*properties=*/{});
-    return Commit(committable, /*check_append_files=*/false, /*retry_on_conflict=*/false,
-                  realtime_ranges);
+    const int64_t previous_snapshot_id = last_committed_snapshot_id_;
+    PAIMON_RETURN_NOT_OK(Commit(committable, /*check_append_files=*/false,
+                                /*retry_on_conflict=*/false, realtime_ranges));
+    if (last_committed_snapshot_id_ <= previous_snapshot_id) {
+        return Status::Invalid("real-time commit did not produce a snapshot");
+    }
+    return last_committed_snapshot_id_;
 }
 
 Result<int32_t> FileStoreCommitImpl::TryCommit(

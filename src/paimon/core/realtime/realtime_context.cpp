@@ -64,13 +64,26 @@ class RealtimeContext::Impl {
             if (write_schema) {
                 ArrowSchemaRelease(write_schema.get());
             }
+            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemReadView> read_view,
+                                   iter->second->AcquireReadView());
+            if (!read_view) {
+                return Status::Invalid("mem indexer returned a null read view");
+            }
+            const std::optional<Range> memory_range = read_view->GetOffsetRange();
+            if (memory_range) {
+                if (memory_range->to == std::numeric_limits<int64_t>::max()) {
+                    return Status::Invalid("real-time offset has reached INT64_MAX");
+                }
+                // A reused indexer may retain sealed-but-uncommitted rows beyond the committed
+                // offset. Continue after all retained rows instead of restarting across a seal.
+                if (memory_range->to >= initial_offset) {
+                    initial_offset = memory_range->to + 1;
+                }
+            }
             return RealtimeMemIndexerState{iter->second, initial_offset};
         }
         Result<std::shared_ptr<MemIndexer>> indexer_result =
-            factory_->Create(write_schema.get(), options, memory_pool);
-        if (write_schema) {
-            ArrowSchemaRelease(write_schema.get());
-        }
+            factory_->Create(std::move(write_schema), options, memory_pool);
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer, std::move(indexer_result));
         indexers_.emplace(key, indexer);
         if (offset_iter != committed_offsets_.end()) {

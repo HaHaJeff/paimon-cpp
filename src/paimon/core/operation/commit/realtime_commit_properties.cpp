@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "fmt/format.h"
+#include "paimon/common/utils/jsonizable.h"
 #include "paimon/common/utils/rapidjson_util.h"
 #include "paimon/common/utils/uuid.h"
 #include "paimon/core/utils/branch_manager.h"
@@ -37,14 +38,15 @@
 namespace paimon {
 namespace {
 
-class OffsetEntryJson {
+class OffsetEntryJson : public Jsonizable<OffsetEntryJson> {
  public:
     OffsetEntryJson() = default;
 
     OffsetEntryJson(std::map<std::string, std::string> partition, int32_t bucket, int64_t offset)
         : partition_(std::move(partition)), bucket_(bucket), offset_(offset) {}
 
-    rapidjson::Value ToJson(rapidjson::Document::AllocatorType* allocator) const {
+    rapidjson::Value ToJson(rapidjson::Document::AllocatorType* allocator) const
+        noexcept(false) override {
         rapidjson::Value value(rapidjson::kObjectType);
         value.AddMember("partition", RapidJsonUtil::SerializeValue(partition_, allocator),
                         *allocator);
@@ -53,7 +55,7 @@ class OffsetEntryJson {
         return value;
     }
 
-    void FromJson(const rapidjson::Value& value) {
+    void FromJson(const rapidjson::Value& value) noexcept(false) override {
         partition_ = RapidJsonUtil::DeserializeKeyValue<std::map<std::string, std::string>>(
             value, "partition");
         bucket_ = RapidJsonUtil::DeserializeKeyValue<int32_t>(value, "bucket");
@@ -78,13 +80,14 @@ class OffsetEntryJson {
     int64_t offset_ = -1;
 };
 
-class OffsetsJson {
+class OffsetsJson : public Jsonizable<OffsetsJson> {
  public:
     OffsetsJson() = default;
 
     explicit OffsetsJson(const RealtimeOffsetMap& offsets) : offsets_(offsets) {}
 
-    rapidjson::Value ToJson(rapidjson::Document::AllocatorType* allocator) const {
+    rapidjson::Value ToJson(rapidjson::Document::AllocatorType* allocator) const
+        noexcept(false) override {
         rapidjson::Value value(rapidjson::kObjectType);
         value.AddMember(
             "version",
@@ -107,7 +110,7 @@ class OffsetsJson {
         return value;
     }
 
-    void FromJson(const rapidjson::Value& value) {
+    void FromJson(const rapidjson::Value& value) noexcept(false) override {
         auto version = RapidJsonUtil::DeserializeKeyValue<int32_t>(value, "version");
         if (version != RealtimeCommitProperties::kOffsetsVersion) {
             throw std::invalid_argument(fmt::format("unsupported offsets version {}", version));

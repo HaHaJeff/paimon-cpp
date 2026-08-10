@@ -82,10 +82,10 @@ class PAIMON_EXPORT FileStoreCommit {
     /// @param realtime_commits Commit messages and inclusive offset ranges to commit.
     /// @param commit_identifier Identifier of the streaming commit operation.
     /// @param watermark Optional event-time watermark.
-    /// @return Status indicating the success or failure of the commit operation.
-    virtual Status CommitWithProgress(const std::vector<RealtimeCommitProgress>& realtime_commits,
-                                      int64_t commit_identifier,
-                                      std::optional<int64_t> watermark) = 0;
+    /// @return The id of the final snapshot produced by this commit.
+    virtual Result<int64_t> CommitWithProgress(
+        const std::vector<RealtimeCommitProgress>& realtime_commits, int64_t commit_identifier,
+        std::optional<int64_t> watermark) = 0;
 
     /// Filter out all `std::vector<CommitMessage>` which have been committed and commit the
     /// remaining ones.

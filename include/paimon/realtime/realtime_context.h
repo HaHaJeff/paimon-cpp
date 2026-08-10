@@ -66,11 +66,11 @@ struct PAIMON_EXPORT RealtimePartitionBucket {
 /// Largest committed offset for each partition-bucket.
 using RealtimeOffsetMap = std::map<RealtimePartitionBucket, int64_t>;
 
-/// Memory indexer and its initial offset resolved from the same committed progress.
+/// Memory indexer and its initial offset resolved from committed and retained memory progress.
 struct PAIMON_EXPORT RealtimeMemIndexerState {
     /// Plugin instance associated with the requested partition-bucket.
     std::shared_ptr<MemIndexer> indexer;
-    /// First offset available to a newly created writer.
+    /// First offset after both committed rows and rows currently retained by the indexer.
     int64_t initial_offset;
 };
 
@@ -100,9 +100,10 @@ class PAIMON_EXPORT RealtimeContext {
     static Result<std::shared_ptr<RealtimeContext>> Create(
         const std::shared_ptr<MemIndexerFactory>& factory);
 
-    /// Returns the stable indexer and initial offset associated with a partition-bucket.
+    /// Returns the stable indexer and next writable offset associated with a partition-bucket.
     ///
-    /// The indexer lookup and initial offset resolution use the same committed progress view.
+    /// The offset follows both committed progress and any building or sealed rows retained by a
+    /// reused indexer.
     Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
         const std::map<std::string, std::string>& partition, int32_t bucket,
         std::unique_ptr<::ArrowSchema> write_schema,

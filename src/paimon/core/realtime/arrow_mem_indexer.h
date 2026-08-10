@@ -60,8 +60,6 @@ class ArrowMemIndexer : public MemIndexer {
 
     uint64_t GetMemoryUsage() const override;
 
-    Status Close() override;
-
  private:
     struct StoredBatch {
         std::shared_ptr<arrow::StructArray> data;
@@ -83,7 +81,6 @@ class ArrowMemIndexer : public MemIndexer {
     std::vector<std::shared_ptr<Segment>> sealed_segments_;
     std::optional<Range> building_range_;
     uint64_t building_memory_usage_ = 0;
-    bool closed_ = false;
 };
 
 }  // namespace paimon

@@ -28,7 +28,8 @@ class PAIMON_EXPORT ArrowMemIndexerFactory : public MemIndexerFactory {
  public:
     /// Creates an Arrow-backed indexer for one partition and bucket.
     Result<std::shared_ptr<MemIndexer>> Create(
-        ::ArrowSchema* write_schema, const std::map<std::string, std::string>& options,
+        std::unique_ptr<::ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool) override;
 };
 

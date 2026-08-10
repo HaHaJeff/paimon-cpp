@@ -40,9 +40,6 @@ class MemoryPool;
 /// @see WriteContextBuilder
 class PAIMON_EXPORT WriteContext {
  public:
-    /// Constructs a write context with an optional real-time write context.
-    ///
-    /// Prefer `WriteContextBuilder`.
     WriteContext(const std::string& root_path, const std::string& commit_user,
                  bool is_streaming_mode, bool ignore_num_bucket_check, bool ignore_previous_files,
                  bool enable_multi_thread_spill, const std::optional<int32_t>& write_id,
