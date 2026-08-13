@@ -219,11 +219,32 @@ Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& 
     if (!context.GetRealtimeContext()) {
         return Status::OK();
     }
-    if (!table_schema.PrimaryKeys().empty()) {
-        return Status::Invalid("real-time union read currently supports append tables only");
-    }
     if (core_options.GetBucket() <= 0) {
         return Status::Invalid("real-time union read requires fixed bucket mode");
+    }
+    if (!table_schema.PrimaryKeys().empty()) {
+        if (core_options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
+            return Status::NotImplemented(
+                "PK real-time read only supports the DEDUPLICATE merge engine");
+        }
+        if (!core_options.GetFieldsSequenceGroups().empty()) {
+            return Status::NotImplemented("PK real-time read does not support sequence groups");
+        }
+        if (core_options.IgnoreDelete() || core_options.PartialUpdateRemoveRecordOnDelete() ||
+            core_options.AggregationRemoveRecordOnDelete() ||
+            !core_options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
+            return Status::NotImplemented("PK real-time read requires default delete behavior");
+        }
+        if (!core_options.GetSequenceField().empty()) {
+            return Status::NotImplemented("PK real-time read does not support sequence.field");
+        }
+        if (core_options.NeedLookup() || core_options.DeletionVectorsEnabled() ||
+            core_options.GetChangelogProducer() != ChangelogProducer::NONE) {
+            return Status::NotImplemented("PK real-time read does not support lookup or early MOR");
+        }
+        if (!core_options.GetWriteBufferSpillable()) {
+            return Status::Invalid("PK real-time read requires write-buffer spill");
+        }
     }
     if (core_options.DataEvolutionEnabled()) {
         return Status::Invalid("real-time union read does not support data evolution");

@@ -21,10 +21,14 @@
 
 #include <utility>
 
+#include "paimon/core/io/key_value_record_reader.h"
 #include "paimon/core/operation/merge_file_split_read.h"
 #include "paimon/core/operation/raw_file_split_read.h"
+#include "paimon/core/options/merge_engine.h"
+#include "paimon/core/realtime/primary_key_merge_input.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
+#include "paimon/core/table/source/realtime_split.h"
 #include "paimon/status.h"
 
 namespace paimon {
@@ -74,6 +78,26 @@ void KeyValueTableRead::ForceKeepDelete(bool force_keep_delete) {
 
 Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
     const std::shared_ptr<Split>& split) {
+    std::shared_ptr<RealtimeSplit> realtime_split = std::dynamic_pointer_cast<RealtimeSplit>(split);
+    if (realtime_split) {
+        if (context_->GetCoreOptions().GetMergeEngine() != MergeEngine::DEDUPLICATE) {
+            return Status::NotImplemented(
+                "PK real-time read only supports the DEDUPLICATE merge engine");
+        }
+        for (const auto& read : split_reads_) {
+            auto* merge_read = dynamic_cast<MergeFileSplitRead*>(read.get());
+            if (merge_read != nullptr) {
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
+                    PrimaryKeyMergeInput::Create(realtime_split, merge_read->GetKeySchema(),
+                                                 merge_read->GetValueSchema(), context_,
+                                                 GetMemoryPool()));
+                return merge_read->CreateReader(realtime_split->DiskSplits(),
+                                                std::move(memory_readers));
+            }
+        }
+        return Status::Invalid("create reader failed, merge file split read not found.");
+    }
     auto data_split = std::dynamic_pointer_cast<DataSplit>(split);
     if (!data_split) {
         return Status::Invalid("split cannot be casted to DataSplit");
@@ -89,6 +113,12 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
 
 Result<std::unique_ptr<CountReader>> KeyValueTableRead::CreateCountReader(
     const std::vector<std::shared_ptr<Split>>& splits) {
+    for (const std::shared_ptr<Split>& split : splits) {
+        if (std::dynamic_pointer_cast<RealtimeSplit>(split)) {
+            return Status::NotImplemented(
+                "CreateCountReader does not support process-local real-time splits");
+        }
+    }
     if (context_->GetPredicate() != nullptr) {
         return Status::NotImplemented(
             "CreateCountReader with predicate pushdown is not supported yet");
