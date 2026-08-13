@@ -370,6 +370,7 @@ set(PAIMON_CORE_SRCS
     core/realtime/arrow_mem_indexer.cpp
     core/realtime/arrow_mem_indexer_factory.cpp
     core/realtime/primary_key_mem_indexer.cpp
+    core/realtime/primary_key_merge_input.cpp
     core/realtime/realtime_append_only_writer.cpp
     core/realtime/realtime_primary_key_writer.cpp
     core/realtime/realtime_context.cpp
