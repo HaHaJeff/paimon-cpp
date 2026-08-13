@@ -117,10 +117,25 @@ class MergeFileSplitRead : public AbstractSplitRead {
         return value_schema_;
     }
 
+    std::shared_ptr<arrow::Schema> GetKeySchema() const {
+        return key_schema_;
+    }
+
+    /// Merges ordinary disk splits with generic additional sorted KeyValue readers.
+    Result<std::unique_ptr<BatchReader>> CreateReader(
+        const std::vector<std::shared_ptr<Split>>& disk_splits,
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers);
+
     void SetMergeFunctionWrapper(
         const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper);
 
  private:
+    Result<std::unique_ptr<BatchReader>> CreateReader(
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& record_readers);
+
+    Result<std::unique_ptr<BatchReader>> CreateProjectionReader(
+        std::unique_ptr<SortMergeReader>&& sort_merge_reader) const;
+
     Result<std::unique_ptr<BatchReader>> CreateMergeReader(
         const std::shared_ptr<DataSplitImpl>& data_split,
         const std::shared_ptr<DataFilePathFactory>& data_file_path_factory);

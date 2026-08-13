@@ -1145,6 +1145,28 @@ TEST_P(MergeFileSplitReadTest, TestEmptyPlan) {
     ASSERT_FALSE(read_result);
 }
 
+TEST_P(MergeFileSplitReadTest, TestEmptyGeneric) {
+    std::string path =
+        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
+    ReadContextBuilder context_builder(path);
+    context_builder.SetReadFieldNames({"k1", "p1", "s1", "v0", "v1"});
+    context_builder.SetOptions({{Options::SEQUENCE_FIELD, "s0,s1"},
+                                {Options::MERGE_ENGINE, "deduplicate"},
+                                {Options::IGNORE_DELETE, "true"}});
+    AddOptions(&context_builder);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
+    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<MergeFileSplitRead> split_read,
+        MergeFileSplitRead::Create(/*path_factory=*/nullptr, internal_context, pool_, executor_));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
+                         split_read->CreateReader(/*disk_splits=*/{},
+                                                  /*additional_readers=*/{}));
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, batch_reader->NextBatch());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+}
+
 TEST_P(MergeFileSplitReadTest, TestIOException) {
     std::string path =
         paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
