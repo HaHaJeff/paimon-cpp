@@ -369,7 +369,9 @@ set(PAIMON_CORE_SRCS
     core/operation/write_restore.cpp
     core/realtime/arrow_mem_indexer.cpp
     core/realtime/arrow_mem_indexer_factory.cpp
+    core/realtime/primary_key_mem_indexer.cpp
     core/realtime/realtime_append_only_writer.cpp
+    core/realtime/realtime_primary_key_writer.cpp
     core/realtime/realtime_context.cpp
     core/postpone/postpone_bucket_writer.cpp
     core/schema/arrow_schema_validator.cpp

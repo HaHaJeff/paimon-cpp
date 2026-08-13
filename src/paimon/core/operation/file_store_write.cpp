@@ -56,6 +56,47 @@ struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
 
+namespace {
+
+Status ValidatePkRealtimeV1Options(const std::shared_ptr<TableSchema>& table_schema,
+                                   const CoreOptions& options,
+                                   const std::vector<std::string>& write_fields) {
+    if (table_schema->PrimaryKeys().empty()) {
+        return Status::Invalid("PK realtime v1 requires a primary-key table");
+    }
+    if (options.GetBucket() <= 0) {
+        return Status::NotImplemented("PK realtime v1 requires fixed buckets");
+    }
+    if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
+        return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
+    }
+    if (write_fields != table_schema->FieldNames()) {
+        return Status::NotImplemented(
+            "PK realtime v1 requires full-row writes in table field order");
+    }
+    if (!options.GetFieldsSequenceGroups().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support sequence groups");
+    }
+    if (options.IgnoreDelete() || options.PartialUpdateRemoveRecordOnDelete() ||
+        options.AggregationRemoveRecordOnDelete() ||
+        !options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
+        return Status::NotImplemented("PK realtime v1 requires default delete behavior");
+    }
+    if (!options.GetSequenceField().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support sequence.field");
+    }
+    if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
+        options.GetChangelogProducer() != ChangelogProducer::NONE) {
+        return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
+    }
+    if (!options.GetWriteBufferSpillable()) {
+        return Status::Invalid("PK realtime v1 requires write-buffer spill");
+    }
+    return Status::OK();
+}
+
+}  // namespace
+
 Result<std::vector<RealtimeCommitProgress>> FileStoreWrite::PrepareCommitWithProgress(int64_t) {
     return Status::Invalid("prepare commit with progress requires a real-time writer");
 }
@@ -191,7 +232,25 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            return Status::Invalid("real-time write currently supports append tables only");
+            if (ignore_previous_files) {
+                return Status::NotImplemented(
+                    "PK realtime v1 requires restore from the latest snapshot");
+            }
+            const std::vector<std::string> write_fields =
+                ctx->GetWriteSchema().empty() ? schema->FieldNames() : ctx->GetWriteSchema();
+            PAIMON_RETURN_NOT_OK(ValidatePkRealtimeV1Options(schema, options, write_fields));
+            if (ctx->GetTempDirectory().empty()) {
+                return Status::Invalid("PK realtime v1 requires a spill temp directory");
+            }
+            PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
+                                   snapshot_manager->LatestSnapshot());
+            if (latest_snapshot) {
+                PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap realtime_committed_offsets,
+                                       RealtimeCommitProperties::ReadOffsets(
+                                           latest_snapshot, options.GetFileSystem()));
+                PAIMON_RETURN_NOT_OK(ctx->GetRealtimeContext()->AdvanceCommittedProgress(
+                    latest_snapshot->Id(), realtime_committed_offsets));
+            }
         }
         if (options.GetBucket() == BucketModeDefine::POSTPONE_BUCKET) {
             return PostponeBucketFileStoreWrite::Create(
@@ -247,7 +306,8 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
             ctx->GetRootPath(), schema, arrow_schema, partition_schema, dv_maintainer_factory,
             io_manager, key_comparator, sequence_fields_comparator, merge_function_wrapper, options,
             ignore_previous_files, ctx->IsStreamingMode(), ctx->IgnoreNumBucketCheck(),
-            ctx->EnableMultiThreadSpill(), ctx->GetExecutor(), ctx->GetMemoryPool());
+            ctx->EnableMultiThreadSpill(), ctx->GetRealtimeContext(), ctx->GetExecutor(),
+            ctx->GetMemoryPool());
     }
 }
 
