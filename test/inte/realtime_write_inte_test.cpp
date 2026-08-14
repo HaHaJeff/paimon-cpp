@@ -289,6 +289,14 @@ class RealtimeWriteInteTest : public ::testing::Test {
     Result<std::shared_ptr<Plan>> CreatePlan(
         const std::shared_ptr<RealtimeContext>& realtime_context,
         const std::shared_ptr<Predicate>& predicate) const {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableScan> scan,
+                               CreateScan(realtime_context, predicate));
+        return scan->CreatePlan();
+    }
+
+    Result<std::unique_ptr<TableScan>> CreateScan(
+        const std::shared_ptr<RealtimeContext>& realtime_context,
+        const std::shared_ptr<Predicate>& predicate) const {
         ScanContextBuilder scan_builder(table_path_);
         if (realtime_context) {
             scan_builder.WithRealtimeContext(realtime_context);
@@ -296,9 +304,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
         scan_builder.SetPredicate(predicate).WithMemoryPool(pool_);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ScanContext> scan_context,
                                scan_builder.SetOptions(options_).Finish());
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableScan> scan,
-                               TableScan::Create(std::move(scan_context)));
-        return scan->CreatePlan();
+        return TableScan::Create(std::move(scan_context));
     }
 
     Result<CollectedReadResult> ReadPlan(const std::shared_ptr<Plan>& plan,
@@ -1578,6 +1584,20 @@ TEST_F(RealtimeWriteInteTest, TestPkCreationAppliesV1Gates) {
                          RealtimeContext::Create());
     ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context),
                         "supports only the DEDUPLICATE merge engine");
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRealtimeScanCreationValidatesMergeEngine) {
+    options_[Options::MERGE_ENGINE] = "partial-update";
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+
+    ASSERT_NOK_WITH_MSG(CreateScan(realtime_context, /*predicate=*/nullptr),
+                        "supports the DEDUPLICATE merge engine");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableScan> disk_scan,
+                         CreateScan(/*realtime_context=*/nullptr, /*predicate=*/nullptr));
+    ASSERT_OK(disk_scan->CreatePlan());
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkWriteFailure) {

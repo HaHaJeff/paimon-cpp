@@ -24,7 +24,9 @@
 #include <utility>
 #include <vector>
 
+#include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
+#include "paimon/core/schema/table_schema.h"
 #include "paimon/core/snapshot.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/plan_impl.h"
@@ -36,6 +38,59 @@
 #include "paimon/status.h"
 
 namespace paimon {
+
+Result<std::unique_ptr<TableScan>> RealtimeTableScan::Create(
+    std::unique_ptr<TableScan>&& disk_scan, const TableSchema& table_schema,
+    const CoreOptions& core_options, const ScanContext& context,
+    const std::shared_ptr<FileStorePathFactory>& path_factory,
+    const std::shared_ptr<SnapshotManager>& snapshot_manager) {
+    if (core_options.GetBucket() <= 0) {
+        return Status::Invalid("real-time union read requires fixed bucket mode");
+    }
+    if (!table_schema.PrimaryKeys().empty()) {
+        if (core_options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
+            return Status::NotImplemented(
+                "PK real-time read only supports the DEDUPLICATE merge engine");
+        }
+        if (!core_options.GetFieldsSequenceGroups().empty()) {
+            return Status::NotImplemented("PK real-time read does not support sequence groups");
+        }
+        if (core_options.IgnoreDelete() || core_options.PartialUpdateRemoveRecordOnDelete() ||
+            core_options.AggregationRemoveRecordOnDelete() ||
+            !core_options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
+            return Status::NotImplemented("PK real-time read requires default delete behavior");
+        }
+        if (!core_options.GetSequenceField().empty()) {
+            return Status::NotImplemented("PK real-time read does not support sequence.field");
+        }
+        if (core_options.NeedLookup() || core_options.DeletionVectorsEnabled() ||
+            core_options.GetChangelogProducer() != ChangelogProducer::NONE) {
+            return Status::NotImplemented("PK real-time read does not support lookup or early MOR");
+        }
+        if (!core_options.GetWriteBufferSpillable()) {
+            return Status::Invalid("PK real-time read requires write-buffer spill");
+        }
+    }
+    if (core_options.DataEvolutionEnabled()) {
+        return Status::Invalid("real-time union read does not support data evolution");
+    }
+    if (context.IsStreamingMode()) {
+        return Status::Invalid("real-time union read currently supports batch scans only");
+    }
+    if (context.GetLimit()) {
+        return Status::Invalid("real-time union read does not support scan limit pushdown");
+    }
+    if (context.GetGlobalIndexResult()) {
+        return Status::Invalid("real-time union read does not support global index splits");
+    }
+    StartupMode startup_mode = core_options.GetStartupMode();
+    if (!(startup_mode == StartupMode::LatestFull() || startup_mode == StartupMode::Latest())) {
+        return Status::Invalid("real-time union read requires the latest snapshot");
+    }
+    return std::unique_ptr<TableScan>(new RealtimeTableScan(
+        std::move(disk_scan), context.GetRealtimeContext(), path_factory, snapshot_manager,
+        core_options.GetFileSystem(), context.GetScanFilters()));
+}
 
 int64_t RealtimeTableScan::GetCommittedOffset(const RealtimeOffsetMap& committed_offsets,
                                               const RealtimePartitionBucket& partition_bucket) {

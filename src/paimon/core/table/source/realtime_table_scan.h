@@ -30,20 +30,22 @@
 
 namespace paimon {
 
+class CoreOptions;
 class FileStorePathFactory;
 class FileSystem;
 class ScanFilter;
+class ScanContext;
 class SnapshotManager;
+class TableSchema;
 
 /// Adds process-local memory splits to a normal data-table batch scan.
 class RealtimeTableScan : public TableScan {
  public:
-    RealtimeTableScan(std::unique_ptr<TableScan>&& disk_scan,
-                      const std::shared_ptr<RealtimeContext>& realtime_context,
-                      const std::shared_ptr<FileStorePathFactory>& path_factory,
-                      const std::shared_ptr<SnapshotManager>& snapshot_manager,
-                      const std::shared_ptr<FileSystem>& file_system,
-                      const std::shared_ptr<ScanFilter>& scan_filter);
+    static Result<std::unique_ptr<TableScan>> Create(
+        std::unique_ptr<TableScan>&& disk_scan, const TableSchema& table_schema,
+        const CoreOptions& core_options, const ScanContext& context,
+        const std::shared_ptr<FileStorePathFactory>& path_factory,
+        const std::shared_ptr<SnapshotManager>& snapshot_manager);
 
     Result<std::shared_ptr<Plan>> CreatePlan() override;
 
@@ -64,6 +66,13 @@ class RealtimeTableScan : public TableScan {
     Result<std::vector<std::shared_ptr<Split>>> CreateRealtimeSplits(
         const std::vector<std::shared_ptr<Split>>& disk_splits, MemoryViewMap&& active_memory,
         const RealtimeOffsetMap& committed_offsets) const;
+
+    RealtimeTableScan(std::unique_ptr<TableScan>&& disk_scan,
+                      const std::shared_ptr<RealtimeContext>& realtime_context,
+                      const std::shared_ptr<FileStorePathFactory>& path_factory,
+                      const std::shared_ptr<SnapshotManager>& snapshot_manager,
+                      const std::shared_ptr<FileSystem>& file_system,
+                      const std::shared_ptr<ScanFilter>& scan_filter);
 
     std::unique_ptr<TableScan> disk_scan_;
     std::shared_ptr<RealtimeContext> realtime_context_;

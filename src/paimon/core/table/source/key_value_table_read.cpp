@@ -24,7 +24,6 @@
 #include "paimon/core/io/key_value_record_reader.h"
 #include "paimon/core/operation/merge_file_split_read.h"
 #include "paimon/core/operation/raw_file_split_read.h"
-#include "paimon/core/options/merge_engine.h"
 #include "paimon/core/realtime/primary_key_merge_input.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
@@ -39,15 +38,19 @@ class InternalReadContext;
 class MemoryPool;
 
 KeyValueTableRead::KeyValueTableRead(std::vector<std::unique_ptr<SplitRead>>&& split_reads,
+                                     std::unique_ptr<MergeFileSplitRead>&& merge_file_split_read,
                                      const std::shared_ptr<FileStorePathFactory>& path_factory,
                                      const std::shared_ptr<InternalReadContext>& context,
                                      const std::shared_ptr<MemoryPool>& memory_pool,
                                      const std::shared_ptr<Executor>& executor)
     : TableRead(memory_pool),
       split_reads_(std::move(split_reads)),
+      merge_file_split_read_(std::move(merge_file_split_read)),
       path_factory_(path_factory),
       context_(context),
       executor_(executor) {}
+
+KeyValueTableRead::~KeyValueTableRead() = default;
 
 Result<std::unique_ptr<TableRead>> KeyValueTableRead::Create(
     const std::shared_ptr<FileStorePathFactory>& path_factory,
@@ -60,43 +63,28 @@ Result<std::unique_ptr<TableRead>> KeyValueTableRead::Create(
     PAIMON_ASSIGN_OR_RAISE(
         std::unique_ptr<MergeFileSplitRead> merge_file_split_read,
         MergeFileSplitRead::Create(path_factory, context, memory_pool, executor));
-    split_reads.emplace_back(std::move(merge_file_split_read));
 
-    return std::unique_ptr<TableRead>(new KeyValueTableRead(std::move(split_reads), path_factory,
-                                                            context, memory_pool, executor));
+    return std::unique_ptr<TableRead>(
+        new KeyValueTableRead(std::move(split_reads), std::move(merge_file_split_read),
+                              path_factory, context, memory_pool, executor));
 }
 
 void KeyValueTableRead::ForceKeepDelete(bool force_keep_delete) {
     force_keep_delete_ = force_keep_delete;
-    for (const auto& read : split_reads_) {
-        auto* merge_read = dynamic_cast<MergeFileSplitRead*>(read.get());
-        if (merge_read != nullptr) {
-            merge_read->ForceKeepDelete(force_keep_delete);
-        }
-    }
+    merge_file_split_read_->ForceKeepDelete(force_keep_delete);
 }
 
 Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
     const std::shared_ptr<Split>& split) {
     std::shared_ptr<RealtimeSplit> realtime_split = std::dynamic_pointer_cast<RealtimeSplit>(split);
     if (realtime_split) {
-        if (context_->GetCoreOptions().GetMergeEngine() != MergeEngine::DEDUPLICATE) {
-            return Status::NotImplemented(
-                "PK real-time read only supports the DEDUPLICATE merge engine");
-        }
-        for (const auto& read : split_reads_) {
-            auto* merge_read = dynamic_cast<MergeFileSplitRead*>(read.get());
-            if (merge_read != nullptr) {
-                PAIMON_ASSIGN_OR_RAISE(
-                    std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
-                    PrimaryKeyMergeInput::Create(realtime_split, merge_read->GetKeySchema(),
-                                                 merge_read->GetValueSchema(), context_,
-                                                 GetMemoryPool()));
-                return merge_read->CreateReader(realtime_split->DiskSplits(),
-                                                std::move(memory_readers));
-            }
-        }
-        return Status::Invalid("create reader failed, merge file split read not found.");
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
+            PrimaryKeyMergeInput::Create(realtime_split, merge_file_split_read_->GetKeySchema(),
+                                         merge_file_split_read_->GetValueSchema(), context_,
+                                         GetMemoryPool()));
+        return merge_file_split_read_->CreateReader(realtime_split->DiskSplits(),
+                                                    std::move(memory_readers));
     }
     auto data_split = std::dynamic_pointer_cast<DataSplit>(split);
     if (!data_split) {
@@ -107,6 +95,11 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
         if (matched) {
             return read->CreateReader(data_split);
         }
+    }
+    PAIMON_ASSIGN_OR_RAISE(bool matched,
+                           merge_file_split_read_->Match(data_split, force_keep_delete_));
+    if (matched) {
+        return merge_file_split_read_->CreateReader(data_split);
     }
     return Status::Invalid("create reader failed, not read match with data split.");
 }
