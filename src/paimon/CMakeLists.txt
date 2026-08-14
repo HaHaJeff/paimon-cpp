@@ -759,6 +759,7 @@ if(PAIMON_BUILD_TESTS)
                     core/manifest/index_manifest_file_handler_test.cpp
                     core/memory/writer_memory_manager_test.cpp
                     core/realtime/arrow_mem_indexer_test.cpp
+                    core/realtime/primary_key_mem_indexer_test.cpp
                     core/realtime/primary_key_realtime_options_test.cpp
                     core/realtime/realtime_context_test.cpp
                     core/mergetree/levels_test.cpp

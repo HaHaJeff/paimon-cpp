@@ -25,5 +25,6 @@ namespace paimon {
 class CoreOptions;
 
 Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options);
+Status ValidatePrimaryKeyRealtimeWriteOptions(const CoreOptions& options);
 
 }  // namespace paimon

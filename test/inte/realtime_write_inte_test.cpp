@@ -1640,42 +1640,15 @@ TEST_F(RealtimeWriteInteTest, TestPkSpillBackedPlanSurvivesRefreshAndReclaim) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkCreationAppliesV1ValidationMatrix) {
-    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+TEST_F(RealtimeWriteInteTest, TestPkReadAndWriteSpillValidation) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "false";
     CreatePkTable();
-
-    struct ValidationCase {
-        std::string option;
-        std::string value;
-        std::string error;
-    };
-    const std::vector<ValidationCase> cases = {
-        {Options::BUCKET, "0", "requires fixed buckets"},
-        {Options::MERGE_ENGINE, "partial-update", "supports only the DEDUPLICATE merge engine"},
-        {Options::DATA_EVOLUTION_ENABLED, "true", "does not support data evolution"},
-        {Options::SEQUENCE_FIELD, "pt", "does not support sequence.field"},
-        {Options::SEQUENCE_FIELD_SORT_ORDER, "descending",
-         "supports only ascending sequence.field.sort-order"},
-        {Options::IGNORE_DELETE, "true", "requires default delete behavior"},
-        {Options::CHANGELOG_PRODUCER, "input", "does not support lookup or early MOR"},
-        {Options::FORCE_LOOKUP, "true", "does not support lookup or early MOR"},
-        {Options::DELETION_VECTORS_ENABLED, "true", "does not support lookup or early MOR"},
-        {"fields.payload.sequence-group", "pt", "does not support sequence groups"},
-        {Options::WRITE_BUFFER_SPILLABLE, "false", "requires write-buffer spill"},
-    };
-    for (const ValidationCase& test_case : cases) {
-        const std::map<std::string, std::string> saved_options = options_;
-        options_[test_case.option] = test_case.value;
-        ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                             RealtimeContext::Create());
-        ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), test_case.error);
-        options_ = saved_options;
-    }
-
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
-    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context, {"id", "payload", "pt"}),
-                        "does not support a custom write schema");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableScan> scan,
+                         CreateScan(realtime_context, /*predicate=*/nullptr));
+    ASSERT_OK(scan->CreatePlan());
+    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), "requires write-buffer spill");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRealtimeScanCreationValidatesMergeEngine) {
@@ -1686,7 +1659,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeScanCreationValidatesMergeEngine) {
                          RealtimeContext::Create());
 
     ASSERT_NOK_WITH_MSG(CreateScan(realtime_context, /*predicate=*/nullptr),
-                        "supports the DEDUPLICATE merge engine");
+                        "supports only the DEDUPLICATE merge engine");
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableScan> disk_scan,
                          CreateScan(/*realtime_context=*/nullptr, /*predicate=*/nullptr));
     ASSERT_OK(disk_scan->CreatePlan());

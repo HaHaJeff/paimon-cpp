@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "arrow/api.h"
-#include "arrow/array/concatenate.h"
 #include "arrow/c/bridge.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/row_kind.h"
@@ -138,13 +137,6 @@ Result<std::unique_ptr<RecordBatch>> RealtimePrimaryKeyWriter::ToMutationRecordB
     }
     PAIMON_ASSIGN_OR_RAISE(struct_array, ArrowUtils::RemoveFieldFromStructArray(
                                              struct_array, SpecialFields::ValueKind().Name()));
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-        std::shared_ptr<arrow::Array> owned,
-        arrow::Concatenate({struct_array}, arrow::default_memory_pool()));
-    struct_array = std::dynamic_pointer_cast<arrow::StructArray>(owned);
-    if (!struct_array) {
-        return Status::Invalid("PK mem indexer commit batch is not a StructArray");
-    }
     auto output = std::make_unique<ArrowArray>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*struct_array, output.get()));
     RecordBatchBuilder builder(output.get());

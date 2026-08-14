@@ -28,6 +28,7 @@
 #include "arrow/type.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/table/special_fields.h"
+#include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/disk/io_manager.h"
@@ -113,6 +114,7 @@ class Segment {
     }
 
     uint64_t GetMemoryUsage() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return buffer_->GetMemoryUsage();
     }
 
@@ -122,7 +124,7 @@ class Segment {
  private:
     std::unique_ptr<WriteBuffer> buffer_;
     std::shared_ptr<CommitSpillFile> commit_file_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 };
 
 Result<std::unique_ptr<SegmentBatchReader>> SegmentBatchReader::Create(
@@ -236,6 +238,7 @@ class PrimaryKeyMemIndexer::Impl {
           io_manager_(io_manager),
           enable_multi_thread_spill_(enable_multi_thread_spill),
           memory_pool_(memory_pool),
+          arrow_pool_(GetArrowPool(memory_pool)),
           next_sequence_number_(next_sequence_number) {
         arrow::FieldVector key_fields;
         key_fields.reserve(trimmed_primary_keys_.size());
@@ -263,10 +266,10 @@ class PrimaryKeyMemIndexer::Impl {
         if (!building_ || building_->IsEmpty()) {
             return Status::OK();
         }
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteBuffer> replacement, CreateBuffer());
         PAIMON_RETURN_NOT_OK(commit_writer_->Close());
         auto commit_file = std::make_shared<CommitSpillFile>(commit_writer_->GetChannelId(),
                                                              commit_channel_manager_);
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteBuffer> replacement, CreateBuffer());
         segments_.push_back(std::make_shared<Segment>(building_offset_range_.value(),
                                                       std::move(building_), commit_file));
         building_ = std::move(replacement);
@@ -310,8 +313,8 @@ class PrimaryKeyMemIndexer::Impl {
         if (!commit_writer_) {
             PAIMON_RETURN_NOT_OK(CreateCommitWriter());
         }
-        arrow::Int64Builder sequence_builder;
-        arrow::Int8Builder kind_builder;
+        arrow::Int64Builder sequence_builder(arrow_pool_.get());
+        arrow::Int8Builder kind_builder(arrow_pool_.get());
         PAIMON_RETURN_NOT_OK_FROM_ARROW(sequence_builder.Reserve(row_count));
         PAIMON_RETURN_NOT_OK_FROM_ARROW(kind_builder.Reserve(row_count));
         for (int64_t i = 0; i < row_count; ++i) {
@@ -515,6 +518,7 @@ class PrimaryKeyMemIndexer::Impl {
     std::shared_ptr<IOManager> io_manager_;
     bool enable_multi_thread_spill_;
     std::shared_ptr<MemoryPool> memory_pool_;
+    std::unique_ptr<arrow::MemoryPool> arrow_pool_;
     mutable std::mutex mutex_;
     std::unique_ptr<WriteBuffer> building_;
     std::shared_ptr<SpillChannelManager> commit_channel_manager_;

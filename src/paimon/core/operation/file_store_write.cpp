@@ -210,7 +210,7 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(options));
+            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeWriteOptions(options));
             PAIMON_RETURN_NOT_OK(
                 ValidatePrimaryKeyRealtimeWriteContext(*ctx, ignore_previous_files));
             PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,

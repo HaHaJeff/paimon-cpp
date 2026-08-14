@@ -43,10 +43,19 @@ Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options) {
     if (!options.GetSequenceField().empty()) {
         return Status::NotImplemented("PK realtime v1 does not support sequence.field");
     }
+    if (!options.SequenceFieldSortOrderIsAscending()) {
+        return Status::NotImplemented(
+            "PK realtime v1 supports only ascending sequence.field.sort-order");
+    }
     if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
         options.GetChangelogProducer() != ChangelogProducer::NONE) {
         return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
     }
+    return Status::OK();
+}
+
+Status ValidatePrimaryKeyRealtimeWriteOptions(const CoreOptions& options) {
+    PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(options));
     if (!options.GetWriteBufferSpillable()) {
         return Status::Invalid("PK realtime v1 requires write-buffer spill");
     }

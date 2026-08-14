@@ -30,11 +30,9 @@
 namespace paimon::test {
 
 TEST(PrimaryKeyRealtimeOptionsTest, TestSupportedOptions) {
-    ASSERT_OK_AND_ASSIGN(
-        CoreOptions options,
-        CoreOptions::FromMap(
-            {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD_SORT_ORDER, "descending"}}));
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
     ASSERT_OK(ValidatePrimaryKeyRealtimeOptions(options));
+    ASSERT_OK(ValidatePrimaryKeyRealtimeWriteOptions(options));
 }
 
 TEST(PrimaryKeyRealtimeOptionsTest, TestUnsupportedOptions) {
@@ -51,16 +49,26 @@ TEST(PrimaryKeyRealtimeOptionsTest, TestUnsupportedOptions) {
         {{Options::BUCKET, "1"},
          {Options::PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP, "group"}},
         {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD_SORT_ORDER, "descending"}},
         {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
         {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
         {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
-        {{Options::BUCKET, "1"}, {Options::WRITE_BUFFER_SPILLABLE, "false"}},
     };
 
     for (const auto& option_map : unsupported_options) {
         ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
         ASSERT_NOK(ValidatePrimaryKeyRealtimeOptions(options));
+        ASSERT_NOK(ValidatePrimaryKeyRealtimeWriteOptions(options));
     }
+}
+
+TEST(PrimaryKeyRealtimeOptionsTest, TestWriteRequiresSpill) {
+    ASSERT_OK_AND_ASSIGN(
+        CoreOptions options,
+        CoreOptions::FromMap({{Options::BUCKET, "1"}, {Options::WRITE_BUFFER_SPILLABLE, "false"}}));
+    ASSERT_OK(ValidatePrimaryKeyRealtimeOptions(options));
+    ASSERT_NOK_WITH_MSG(ValidatePrimaryKeyRealtimeWriteOptions(options),
+                        "requires write-buffer spill");
 }
 
 }  // namespace paimon::test
