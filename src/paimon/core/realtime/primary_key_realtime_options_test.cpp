@@ -49,7 +49,6 @@ TEST(PrimaryKeyRealtimeOptionsTest, TestUnsupportedOptions) {
         {{Options::BUCKET, "1"},
          {Options::PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP, "group"}},
         {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
-        {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD_SORT_ORDER, "descending"}},
         {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
         {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
         {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
@@ -60,6 +59,16 @@ TEST(PrimaryKeyRealtimeOptionsTest, TestUnsupportedOptions) {
         ASSERT_NOK(ValidatePrimaryKeyRealtimeOptions(options));
         ASSERT_NOK(ValidatePrimaryKeyRealtimeWriteOptions(options));
     }
+}
+
+TEST(PrimaryKeyRealtimeOptionsTest, TestDescendingSequenceSortOrder) {
+    ASSERT_OK_AND_ASSIGN(
+        CoreOptions options,
+        CoreOptions::FromMap(
+            {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD_SORT_ORDER, "descending"}}));
+    Status status = ValidatePrimaryKeyRealtimeOptions(options);
+    ASSERT_TRUE(status.IsNotImplemented());
+    ASSERT_EQ("PK realtime v1 supports only ascending sequence.field.sort-order", status.message());
 }
 
 TEST(PrimaryKeyRealtimeOptionsTest, TestWriteRequiresSpill) {

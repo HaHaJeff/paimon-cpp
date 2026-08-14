@@ -1731,6 +1731,26 @@ TEST_F(RealtimeWriteInteTest, TestPkReadAndWriteSpillValidation) {
     ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), "requires write-buffer spill");
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkScanRequiresFixedBucket) {
+    options_[Options::BUCKET] = "-2";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    Result<std::unique_ptr<TableScan>> scan = CreateScan(realtime_context, /*predicate=*/nullptr);
+    ASSERT_TRUE(scan.status().IsInvalid());
+    ASSERT_EQ("real-time union read requires fixed bucket mode", scan.status().message());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkScanRejectsDataEvolution) {
+    CreatePkTable();
+    options_[Options::DATA_EVOLUTION_ENABLED] = "true";
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    Result<std::unique_ptr<TableScan>> scan = CreateScan(realtime_context, /*predicate=*/nullptr);
+    ASSERT_TRUE(scan.status().IsInvalid());
+    ASSERT_EQ("real-time union read does not support data evolution", scan.status().message());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkWriteFailure) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();

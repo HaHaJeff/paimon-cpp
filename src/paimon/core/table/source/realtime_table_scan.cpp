@@ -45,15 +45,14 @@ Result<std::unique_ptr<TableScan>> RealtimeTableScan::Create(
     const CoreOptions& core_options, const ScanContext& context,
     const std::shared_ptr<FileStorePathFactory>& path_factory,
     const std::shared_ptr<SnapshotManager>& snapshot_manager) {
+    if (core_options.GetBucket() <= 0) {
+        return Status::Invalid("real-time union read requires fixed bucket mode");
+    }
+    if (core_options.DataEvolutionEnabled()) {
+        return Status::Invalid("real-time union read does not support data evolution");
+    }
     if (!table_schema.PrimaryKeys().empty()) {
         PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options));
-    } else {
-        if (core_options.GetBucket() <= 0) {
-            return Status::Invalid("real-time union read requires fixed bucket mode");
-        }
-        if (core_options.DataEvolutionEnabled()) {
-            return Status::Invalid("real-time union read does not support data evolution");
-        }
     }
     if (context.IsStreamingMode()) {
         return Status::Invalid("real-time union read currently supports batch scans only");
