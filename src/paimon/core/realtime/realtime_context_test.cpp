@@ -59,7 +59,8 @@ class TestingReadView : public MemReadView {
 
 class TestingMemIndexer : public MemIndexer {
  public:
-    Status Write(RealtimeWriteBatch&&) override {
+    Status Write(RealtimeWriteBatch&& batch) override {
+        write_ranges.push_back(batch.offset_range);
         return Status::OK();
     }
 
@@ -101,6 +102,7 @@ class TestingMemIndexer : public MemIndexer {
     bool fail_next_advance = false;
     std::optional<Range> offset_range;
     std::vector<int64_t> committed_offsets;
+    std::vector<Range> write_ranges;
 };
 
 class TestingMemIndexerFactory : public MemIndexerFactory {
@@ -290,21 +292,29 @@ TEST(RealtimeContextTest, TestRejectsNullCreatedIndexer) {
     ASSERT_EQ(state.indexer, views[0].indexer);
 }
 
-TEST(RealtimeContextTest, TestPrimaryKeyWriterRejectsReusedCustomIndexer) {
+TEST(RealtimeContextTest, TestPrimaryKeyWriterReusesCompatibleCustomIndexer) {
     auto factory = std::make_shared<TestingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
                          RealtimeContext::Create(factory));
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
-    ASSERT_OK(
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeMemIndexerState state,
         context->GetOrCreateMemIndexer(partition, 3, MakeWriteSchema(), {}, GetDefaultPool()));
+    std::shared_ptr<TestingMemIndexer> custom_indexer = factory->indexers.at(0);
+    custom_indexer->offset_range = Range(0, 4);
 
-    ASSERT_NOK_WITH_MSG(
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<RealtimePrimaryKeyWriter> writer,
         RealtimePrimaryKeyWriter::Create(
             partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
             /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
             /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
-            /*restore_max_seq_number=*/-1),
-        "registered PK mem indexer is not PrimaryKeyMemIndexer");
+            /*restore_max_seq_number=*/-1));
+    ASSERT_EQ(custom_indexer, state.indexer);
+    ASSERT_EQ(1, factory->create_count);
+
+    ASSERT_OK(writer->Write(MakeWriteBatch("[[1], [2]]")));
+    ASSERT_EQ(std::vector<Range>({Range(5, 6)}), custom_indexer->write_ranges);
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {

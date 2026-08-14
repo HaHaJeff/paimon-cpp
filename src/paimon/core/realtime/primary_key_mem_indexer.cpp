@@ -40,6 +40,7 @@
 #include "paimon/core/mergetree/spill_reader.h"
 #include "paimon/core/mergetree/spill_writer.h"
 #include "paimon/core/mergetree/write_buffer.h"
+#include "paimon/logging.h"
 #include "paimon/macros.h"
 
 namespace paimon {
@@ -54,7 +55,12 @@ class CommitSpillFile {
         : channel_id_(channel_id), manager_(manager) {}
 
     ~CommitSpillFile() {
-        [[maybe_unused]] Status status = manager_->DeleteChannel(channel_id_);
+        Status status = manager_->DeleteChannel(channel_id_);
+        if (!status.ok()) {
+            static std::shared_ptr<Logger> logger = Logger::GetLogger("CommitSpillFile");
+            PAIMON_LOG_WARN(logger, "Failed to delete commit spill channel %s: %s",
+                            channel_id_.GetPath().c_str(), status.ToString().c_str());
+        }
     }
 
     FileIOChannel::ID channel_id_;

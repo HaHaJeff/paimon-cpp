@@ -30,7 +30,6 @@
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/core/mergetree/merge_tree_writer.h"
-#include "paimon/core/realtime/primary_key_mem_indexer.h"
 #include "paimon/core/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/core/utils/commit_increment.h"
 #include "paimon/macros.h"
@@ -58,17 +57,13 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
         RealtimeMemIndexerState indexer_state,
         realtime_context->GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
                                                 memory_pool, factory));
-    std::shared_ptr<PrimaryKeyMemIndexer> indexer =
-        std::dynamic_pointer_cast<PrimaryKeyMemIndexer>(indexer_state.indexer);
-    if (!indexer) {
-        return Status::Invalid("registered PK mem indexer is not PrimaryKeyMemIndexer");
-    }
     return std::shared_ptr<RealtimePrimaryKeyWriter>(
-        new RealtimePrimaryKeyWriter(indexer, merge_tree_writer, indexer_state.initial_offset));
+        new RealtimePrimaryKeyWriter(indexer_state.indexer, merge_tree_writer,
+                                     indexer_state.initial_offset));
 }
 
 RealtimePrimaryKeyWriter::RealtimePrimaryKeyWriter(
-    const std::shared_ptr<PrimaryKeyMemIndexer>& mem_indexer,
+    const std::shared_ptr<MemIndexer>& mem_indexer,
     const std::shared_ptr<MergeTreeWriter>& merge_tree_writer, int64_t next_offset)
     : mem_indexer_(mem_indexer), merge_tree_writer_(merge_tree_writer), next_offset_(next_offset) {}
 

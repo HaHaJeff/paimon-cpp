@@ -35,7 +35,6 @@ namespace paimon {
 class FileSystem;
 class MemoryPool;
 class MergeTreeWriter;
-class PrimaryKeyMemIndexer;
 class RealtimeContext;
 
 class RealtimePrimaryKeyWriter final : public BatchWriter {
@@ -62,14 +61,14 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
     std::shared_ptr<Metrics> GetMetrics() const override;
 
  private:
-    RealtimePrimaryKeyWriter(const std::shared_ptr<PrimaryKeyMemIndexer>& mem_indexer,
+    RealtimePrimaryKeyWriter(const std::shared_ptr<MemIndexer>& mem_indexer,
                              const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
                              int64_t next_offset);
 
     Result<std::unique_ptr<RecordBatch>> ToMutationRecordBatch(BatchReader::ReadBatch&& batch);
     Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment);
 
-    std::shared_ptr<PrimaryKeyMemIndexer> mem_indexer_;
+    std::shared_ptr<MemIndexer> mem_indexer_;
     std::shared_ptr<MergeTreeWriter> merge_tree_writer_;
     int64_t next_offset_;
 };
