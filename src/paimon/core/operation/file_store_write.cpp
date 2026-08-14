@@ -58,21 +58,18 @@ class MergeFunctionWrapper;
 
 namespace {
 
-Status ValidatePkRealtimeV1Options(const std::shared_ptr<TableSchema>& table_schema,
-                                   const CoreOptions& options,
-                                   const std::vector<std::string>& write_fields) {
-    if (table_schema->PrimaryKeys().empty()) {
-        return Status::Invalid("PK realtime v1 requires a primary-key table");
-    }
+Status ValidatePkRealtimeV1Options(const CoreOptions& options, bool has_write_schema) {
     if (options.GetBucket() <= 0) {
         return Status::NotImplemented("PK realtime v1 requires fixed buckets");
     }
     if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
         return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
     }
-    if (write_fields != table_schema->FieldNames()) {
-        return Status::NotImplemented(
-            "PK realtime v1 requires full-row writes in table field order");
+    if (options.DataEvolutionEnabled()) {
+        return Status::NotImplemented("PK realtime v1 does not support data evolution");
+    }
+    if (has_write_schema) {
+        return Status::NotImplemented("PK realtime v1 does not support a custom write schema");
     }
     if (!options.GetFieldsSequenceGroups().empty()) {
         return Status::NotImplemented("PK realtime v1 does not support sequence groups");
@@ -84,6 +81,10 @@ Status ValidatePkRealtimeV1Options(const std::shared_ptr<TableSchema>& table_sch
     }
     if (!options.GetSequenceField().empty()) {
         return Status::NotImplemented("PK realtime v1 does not support sequence.field");
+    }
+    if (!options.SequenceFieldSortOrderIsAscending()) {
+        return Status::NotImplemented(
+            "PK realtime v1 supports only ascending sequence.field.sort-order");
     }
     if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
         options.GetChangelogProducer() != ChangelogProducer::NONE) {
@@ -236,9 +237,8 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                 return Status::NotImplemented(
                     "PK realtime v1 requires restore from the latest snapshot");
             }
-            const std::vector<std::string> write_fields =
-                ctx->GetWriteSchema().empty() ? schema->FieldNames() : ctx->GetWriteSchema();
-            PAIMON_RETURN_NOT_OK(ValidatePkRealtimeV1Options(schema, options, write_fields));
+            PAIMON_RETURN_NOT_OK(
+                ValidatePkRealtimeV1Options(options, !ctx->GetWriteSchema().empty()));
             if (ctx->GetTempDirectory().empty()) {
                 return Status::Invalid("PK realtime v1 requires a spill temp directory");
             }

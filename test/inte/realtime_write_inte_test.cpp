@@ -180,12 +180,16 @@ class RealtimeWriteInteTest : public ::testing::Test {
     }
 
     Result<std::unique_ptr<FileStoreWrite>> CreateRealtimeWriter(
-        const std::shared_ptr<RealtimeContext>& realtime_context) const {
+        const std::shared_ptr<RealtimeContext>& realtime_context,
+        const std::vector<std::string>& write_schema = {}) const {
         WriteContextBuilder builder(table_path_, commit_user_);
         builder.SetOptions(options_)
             .WithStreamingMode(true)
             .WithRealtimeContext(realtime_context)
             .WithTempDirectory(PathUtil::JoinPath(dir_->Str(), "spill"));
+        if (!write_schema.empty()) {
+            builder.WithWriteSchema(write_schema);
+        }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteContext> context, builder.Finish());
         return FileStoreWrite::Create(std::move(context));
     }
@@ -368,56 +372,6 @@ class RealtimeWriteInteTest : public ::testing::Test {
                     return Status::Invalid("unexpected null or row kind in real-time test result");
                 }
                 rows.emplace_back(ids->Value(i), payloads->GetString(i), partitions->GetString(i));
-            }
-        }
-        return rows;
-    }
-
-    Result<std::vector<Row>> ReadRows(const RealtimePartitionBucketView& view) const {
-        auto read_schema = std::make_unique<ArrowSchema>();
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, read_schema.get()));
-        MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
-                                /*enable_predicate_pushdown=*/false};
-        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
-                               view.indexer->CreateQueryReaders(
-                                   view.read_view, /*offset_lower_exclusive=*/-1, context));
-        std::vector<Row> rows;
-        for (const std::unique_ptr<BatchReader>& reader : readers) {
-            if (!reader) {
-                return Status::Invalid("PK read view returned a null query reader");
-            }
-            while (true) {
-                PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader->NextBatch());
-                if (BatchReader::IsEofBatch(batch)) {
-                    break;
-                }
-                PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                    std::shared_ptr<arrow::Array> array,
-                    arrow::ImportArray(batch.first.get(), batch.second.get()));
-                std::shared_ptr<arrow::StructArray> data =
-                    std::dynamic_pointer_cast<arrow::StructArray>(array);
-                if (!data || data->num_fields() != 4) {
-                    return Status::Invalid("unexpected PK read-view schema");
-                }
-                std::shared_ptr<arrow::Int8Array> row_kinds =
-                    std::dynamic_pointer_cast<arrow::Int8Array>(data->field(0));
-                std::shared_ptr<arrow::Int64Array> ids =
-                    std::dynamic_pointer_cast<arrow::Int64Array>(data->field(1));
-                std::shared_ptr<arrow::StringArray> payloads =
-                    std::dynamic_pointer_cast<arrow::StringArray>(data->field(2));
-                std::shared_ptr<arrow::StringArray> partitions =
-                    std::dynamic_pointer_cast<arrow::StringArray>(data->field(3));
-                if (!row_kinds || !ids || !payloads || !partitions) {
-                    return Status::Invalid("unexpected PK read-view field type");
-                }
-                for (int64_t index = 0; index < data->length(); ++index) {
-                    if (row_kinds->IsNull(index) || ids->IsNull(index) || payloads->IsNull(index) ||
-                        partitions->IsNull(index)) {
-                        return Status::Invalid("unexpected null in PK read view");
-                    }
-                    rows.emplace_back(ids->Value(index), payloads->GetString(index),
-                                      partitions->GetString(index));
-                }
             }
         }
         return rows;
@@ -1344,7 +1298,7 @@ TEST_F(RealtimeWriteInteTest, TestPkMutationSequencesAreIndependentFromOffsets) 
               actual);
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkSequentialRestartRestoresOffsetAndSequence) {
+TEST_F(RealtimeWriteInteTest, TestPkFreshContextRecoversLatestSnapshotBeforePrepare) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
 
@@ -1360,11 +1314,16 @@ TEST_F(RealtimeWriteInteTest, TestPkSequentialRestartRestoresOffsetAndSequence) 
     ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
     ASSERT_OK(first_writer->Close());
 
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer, CreateRealtimeWriter());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> second_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
+                         CreateRealtimeWriter(second_context));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
                          MakeBatch({Row{1, "one-new", "p0"}}, /*partitioned=*/false,
                                    /*bucket=*/0, {RecordBatch::RowKind::UPDATE_AFTER}));
     ASSERT_OK(second_writer->Write(std::move(second_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> before_prepare, ReadRows(second_context));
+    ASSERT_EQ((std::vector<Row>{{1, "one-new", "p0"}, {2, "two", "p0"}}), before_prepare);
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
                          second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
     ASSERT_EQ(Range(2, 2), second_progress.at(0).offset_range);
@@ -1466,6 +1425,63 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
     ASSERT_OK(writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkProjectionAndPredicateOverDiskAndMemory) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> scan_filtered_batch,
+                         MakeBatch({Row{0, "disk-zero", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(scan_filtered_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> scan_filtered_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK(Commit(scan_filtered_progress, /*commit_identifier=*/0));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> disk_batch,
+                         MakeBatch({Row{2, "read-filtered", "p0"}, Row{4, "disk-old", "p0"},
+                                    Row{5, "disk-five", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(disk_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_OK(Commit(disk_progress, /*commit_identifier=*/1));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> memory_batch,
+        MakeBatch({Row{3, "memory-three", "p0"}, Row{4, "memory-four", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/0,
+                  {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(writer->Write(std::move(memory_batch)));
+
+    std::shared_ptr<Predicate> scan_predicate =
+        PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"id", FieldType::BIGINT,
+                                      Literal(static_cast<int64_t>(1)));
+    std::shared_ptr<Predicate> read_predicate = PredicateBuilder::NotEqual(
+        /*field_index=*/0, /*field_name=*/"payload", FieldType::STRING,
+        Literal(FieldType::STRING, "read-filtered", 13));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan, CreatePlan(realtime_context, scan_predicate));
+    ASSERT_OK_AND_ASSIGN(
+        CollectedReadResult result,
+        ReadPlan(plan, {"payload", "id"}, read_predicate, /*enable_predicate_filter=*/true));
+    std::shared_ptr<arrow::DataType> result_type = arrow::struct_(
+        {arrow::field("_VALUE_KIND", arrow::int8()), arrow::field("payload", arrow::utf8()),
+         arrow::field("id", arrow::int64())});
+    std::shared_ptr<arrow::Array> expected =
+        arrow::ipc::internal::json::ArrayFromJSON(result_type, R"([
+            [0, "memory-three", 3],
+            [0, "memory-four", 4],
+            [0, "disk-five", 5]
+        ])")
+            .ValueOrDie();
+    ASSERT_NE(nullptr, result.data);
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(*result.data))
+        << result.data->ToString();
+    ASSERT_OK(writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkQuotaExhaustionRotatesAcceptedWrites) {
     options_[Options::WRITE_BUFFER_SIZE] = "1";
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
@@ -1530,17 +1546,10 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeReadsMemoryOnlyRoute) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkSequenceFieldRejected) {
+TEST_F(RealtimeWriteInteTest, TestPkSpillBackedPlanSurvivesRefreshAndReclaim) {
+    options_[Options::WRITE_BUFFER_SIZE] = "1";
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
-    options_[Options::SEQUENCE_FIELD] = "pt";
-    CreatePkTable();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
-    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), "does not support sequence.field");
-}
-
-TEST_F(RealtimeWriteInteTest, TestPkRealtimePlanPinsDiskAndMemory) {
-    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    options_[Options::WRITE_BUFFER_SPILL_MAX_DISK_SIZE] = "1b";
     CreatePkTable();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
@@ -1567,7 +1576,9 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimePlanPinsDiskAndMemory) {
     ASSERT_OK(writer->Write(std::move(later_batch)));
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> later_progress,
                          writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
-    ASSERT_OK(Commit(later_progress, /*commit_identifier=*/1));
+    ASSERT_OK_AND_ASSIGN(int64_t committed_snapshot,
+                         Commit(later_progress, /*commit_identifier=*/1));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(committed_snapshot));
 
     ASSERT_OK_AND_ASSIGN(std::vector<Row> pinned_result, ReadRows(pinned_plan));
     ASSERT_EQ((std::vector<Row>{{1, "pinned", "p0"}}), pinned_result);
@@ -1576,14 +1587,42 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimePlanPinsDiskAndMemory) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkCreationAppliesV1Gates) {
-    options_[Options::MERGE_ENGINE] = "partial-update";
+TEST_F(RealtimeWriteInteTest, TestPkCreationAppliesV1ValidationMatrix) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
+
+    struct ValidationCase {
+        std::string option;
+        std::string value;
+        std::string error;
+    };
+    const std::vector<ValidationCase> cases = {
+        {Options::BUCKET, "0", "requires fixed buckets"},
+        {Options::MERGE_ENGINE, "partial-update", "supports only the DEDUPLICATE merge engine"},
+        {Options::DATA_EVOLUTION_ENABLED, "true", "does not support data evolution"},
+        {Options::SEQUENCE_FIELD, "pt", "does not support sequence.field"},
+        {Options::SEQUENCE_FIELD_SORT_ORDER, "descending",
+         "supports only ascending sequence.field.sort-order"},
+        {Options::IGNORE_DELETE, "true", "requires default delete behavior"},
+        {Options::CHANGELOG_PRODUCER, "input", "does not support lookup or early MOR"},
+        {Options::FORCE_LOOKUP, "true", "does not support lookup or early MOR"},
+        {Options::DELETION_VECTORS_ENABLED, "true", "does not support lookup or early MOR"},
+        {"fields.payload.sequence-group", "pt", "does not support sequence groups"},
+        {Options::WRITE_BUFFER_SPILLABLE, "false", "requires write-buffer spill"},
+    };
+    for (const ValidationCase& test_case : cases) {
+        const std::map<std::string, std::string> saved_options = options_;
+        options_[test_case.option] = test_case.value;
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                             RealtimeContext::Create());
+        ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), test_case.error);
+        options_ = saved_options;
+    }
+
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
-    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context),
-                        "supports only the DEDUPLICATE merge engine");
+    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context, {"id", "payload", "pt"}),
+                        "does not support a custom write schema");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRealtimeScanCreationValidatesMergeEngine) {

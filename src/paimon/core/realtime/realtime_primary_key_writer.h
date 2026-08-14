@@ -33,11 +33,11 @@ struct ArrowSchema;
 
 namespace paimon {
 
+class FileSystem;
 class MemoryPool;
 class MergeTreeWriter;
 class PrimaryKeyMemIndexer;
 class RealtimeContext;
-struct PrimaryKeyMemIndexerContext;
 
 class RealtimePrimaryKeyWriter final : public BatchWriter {
  public:
@@ -48,7 +48,9 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
         const std::shared_ptr<RealtimeContext>& realtime_context,
         const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
         const std::map<std::string, std::string>& options,
-        const PrimaryKeyMemIndexerContext& indexer_context);
+        const std::shared_ptr<MemoryPool>& memory_pool,
+        const std::shared_ptr<FileSystem>& file_system, const std::string& temp_directory,
+        bool enable_multi_thread_spill);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<CommitIncrement> PrepareCommit(bool wait_compaction) override;

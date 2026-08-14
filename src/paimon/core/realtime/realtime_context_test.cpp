@@ -29,6 +29,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
+#include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/realtime/mem_indexer.h"
 #include "paimon/testing/utils/testharness.h"
@@ -38,9 +39,15 @@ namespace {
 
 class TestingReadView : public MemReadView {
  public:
+    explicit TestingReadView(const std::optional<Range>& offset_range)
+        : offset_range_(offset_range) {}
+
     std::optional<Range> GetOffsetRange() const override {
-        return std::nullopt;
+        return offset_range_;
     }
+
+ private:
+    std::optional<Range> offset_range_;
 };
 
 class TestingMemIndexer : public MemIndexer {
@@ -60,7 +67,7 @@ class TestingMemIndexer : public MemIndexer {
 
     Result<std::shared_ptr<MemReadView>> AcquireReadView() override {
         ++acquire_count;
-        return std::make_shared<TestingReadView>();
+        return std::make_shared<TestingReadView>(offset_range);
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
@@ -85,6 +92,7 @@ class TestingMemIndexer : public MemIndexer {
     int32_t acquire_count = 0;
     int32_t advance_count = 0;
     bool fail_next_advance = false;
+    std::optional<Range> offset_range;
     std::vector<int64_t> committed_offsets;
 };
 
@@ -151,6 +159,84 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(2, factory->indexers[0]->acquire_count);
     ASSERT_EQ(1, factory->indexers[1]->acquire_count);
     ASSERT_EQ(1, factory->indexers[2]->acquire_count);
+}
+
+TEST(RealtimeContextTest, TestGenericCreatorIsLazyAndPreservesInitialOffset) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+    const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/3);
+    ASSERT_OK(context->AdvanceCommittedProgress(5, {{partition_bucket, /*offset=*/7}}));
+
+    auto testing_indexer = std::make_shared<TestingMemIndexer>();
+    int32_t creator_count = 0;
+    RealtimeContext::MemIndexerCreator creator = [&]() -> Result<std::shared_ptr<MemIndexer>> {
+        ++creator_count;
+        return std::shared_ptr<MemIndexer>(testing_indexer);
+    };
+    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState first_state,
+                         context->GetOrCreateMemIndexer(partition, 3, creator));
+    ASSERT_EQ(testing_indexer, first_state.indexer);
+    ASSERT_EQ(8, first_state.initial_offset);
+    ASSERT_EQ(1, creator_count);
+
+    testing_indexer->offset_range = Range(8, 12);
+    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState reused_state,
+                         context->GetOrCreateMemIndexer(partition, 3, creator));
+    ASSERT_EQ(first_state.indexer, reused_state.indexer);
+    ASSERT_EQ(13, reused_state.initial_offset);
+    ASSERT_EQ(1, creator_count);
+    ASSERT_EQ(1, testing_indexer->acquire_count);
+}
+
+TEST(RealtimeContextTest, TestPropagatesCreatorFailure) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    RealtimeContext::MemIndexerCreator creator = []() -> Result<std::shared_ptr<MemIndexer>> {
+        return Status::IOError("creator failed");
+    };
+
+    Result<RealtimeMemIndexerState> result =
+        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, creator);
+    ASSERT_TRUE(result.status().IsIOError());
+    ASSERT_NOK_WITH_MSG(result, "creator failed");
+}
+
+TEST(RealtimeContextTest, TestRejectsNullCreatedIndexer) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    RealtimeContext::MemIndexerCreator null_creator = []() -> Result<std::shared_ptr<MemIndexer>> {
+        return std::shared_ptr<MemIndexer>();
+    };
+    ASSERT_NOK_WITH_MSG(
+        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, null_creator),
+        "mem indexer creator returned null");
+
+    auto testing_indexer = std::make_shared<TestingMemIndexer>();
+    RealtimeContext::MemIndexerCreator valid_creator = [&]() {
+        return Result<std::shared_ptr<MemIndexer>>(testing_indexer);
+    };
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeMemIndexerState state,
+        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, valid_creator));
+    ASSERT_EQ(testing_indexer, state.indexer);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
+                         context->AcquireReadViews());
+    ASSERT_EQ(1, views.size());
+    ASSERT_EQ(testing_indexer, views[0].indexer);
+}
+
+TEST(RealtimeContextTest, TestPrimaryKeyWriterRejectsReusedCustomIndexer) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+    RealtimeContext::MemIndexerCreator creator = []() -> Result<std::shared_ptr<MemIndexer>> {
+        return std::shared_ptr<MemIndexer>(std::make_shared<TestingMemIndexer>());
+    };
+    ASSERT_OK(context->GetOrCreateMemIndexer(partition, 3, creator));
+
+    ASSERT_NOK_WITH_MSG(
+        RealtimePrimaryKeyWriter::Create(
+            partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
+            /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
+            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false),
+        "registered PK mem indexer is not PrimaryKeyMemIndexer");
 }
 
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {

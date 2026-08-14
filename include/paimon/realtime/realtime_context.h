@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -36,17 +37,7 @@ namespace paimon {
 class MemIndexer;
 class MemIndexerFactory;
 class MemReadView;
-class FileSystem;
 class MemoryPool;
-class PrimaryKeyMemIndexer;
-
-/// Resources supplied when creating a spillable primary-key memory indexer.
-struct PAIMON_EXPORT PrimaryKeyMemIndexerContext {
-    std::shared_ptr<MemoryPool> memory_pool;
-    std::shared_ptr<FileSystem> file_system;
-    std::string temp_directory;
-    bool enable_multi_thread_spill = false;
-};
 
 /// Identifies one partition-bucket by its logical partition values.
 struct PAIMON_EXPORT RealtimePartitionBucket {
@@ -84,12 +75,6 @@ struct PAIMON_EXPORT RealtimeMemIndexerState {
     int64_t initial_offset;
 };
 
-/// Primary-key memory indexer and its next writable offset.
-struct PAIMON_EXPORT RealtimePrimaryKeyMemIndexerState {
-    std::shared_ptr<PrimaryKeyMemIndexer> indexer;
-    int64_t initial_offset;
-};
-
 /// One partition-bucket and the immutable plugin view captured for a table scan.
 struct PAIMON_EXPORT RealtimePartitionBucketView {
     /// Partition-bucket associated with this view.
@@ -102,12 +87,15 @@ struct PAIMON_EXPORT RealtimePartitionBucketView {
 
 /// Shared context that owns the `MemIndexer` instances used by a real-time writer.
 ///
-/// Applications share one context between `WriteContext` and `ScanContext`. Append tables use
-/// either the default Arrow implementation or an application-provided factory. Primary-key tables
-/// use Paimon's dedicated indexer. The context retains each indexer across writes, prepare-commit
-/// operations, and process-local reads.
+/// Applications share one context between `WriteContext` and `ScanContext`. A context belongs to
+/// one table and one effective table configuration; it must not be reused across tables or
+/// configurations. The context retains each indexer across writes, prepare-commit operations, and
+/// process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
+    /// Creates a memory indexer for a partition-bucket that is not yet registered.
+    using MemIndexerCreator = std::function<Result<std::shared_ptr<MemIndexer>>()>;
+
     /// Creates a context backed by Paimon's default Arrow `MemIndexer`.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 
@@ -127,15 +115,14 @@ class PAIMON_EXPORT RealtimeContext {
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
-    /// Returns the stable primary-key indexer for a partition-bucket.
+    /// Returns the stable indexer and next writable offset associated with a partition-bucket.
     ///
-    /// `trimmed_primary_keys` is supplied by the table schema and is never inferred from options.
-    Result<RealtimePrimaryKeyMemIndexerState> GetOrCreatePrimaryKeyMemIndexer(
+    /// The creator is invoked only when the partition-bucket has no registered indexer. The offset
+    /// follows both committed progress and any building or sealed rows retained by a reused
+    /// indexer.
+    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
         const std::map<std::string, std::string>& partition, int32_t bucket,
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::vector<std::string>& trimmed_primary_keys,
-        const std::map<std::string, std::string>& options,
-        const PrimaryKeyMemIndexerContext& context);
+        const MemIndexerCreator& creator);
 
     /// Captures an immutable read view from every currently registered indexer.
     ///
