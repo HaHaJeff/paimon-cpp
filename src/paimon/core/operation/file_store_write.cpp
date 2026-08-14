@@ -36,6 +36,7 @@
 #include "paimon/core/operation/key_value_file_store_write.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/postpone/postpone_bucket_file_store_write.h"
+#include "paimon/core/realtime/primary_key_realtime_options.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/table/bucket_mode.h"
@@ -58,40 +59,16 @@ class MergeFunctionWrapper;
 
 namespace {
 
-Status ValidatePkRealtimeV1Options(const CoreOptions& options, bool has_write_schema) {
-    if (options.GetBucket() <= 0) {
-        return Status::NotImplemented("PK realtime v1 requires fixed buckets");
+Status ValidatePrimaryKeyRealtimeWriteContext(const WriteContext& context,
+                                              bool ignore_previous_files) {
+    if (ignore_previous_files) {
+        return Status::NotImplemented("PK realtime v1 requires restore from the latest snapshot");
     }
-    if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
-        return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
-    }
-    if (options.DataEvolutionEnabled()) {
-        return Status::NotImplemented("PK realtime v1 does not support data evolution");
-    }
-    if (has_write_schema) {
+    if (!context.GetWriteSchema().empty()) {
         return Status::NotImplemented("PK realtime v1 does not support a custom write schema");
     }
-    if (!options.GetFieldsSequenceGroups().empty()) {
-        return Status::NotImplemented("PK realtime v1 does not support sequence groups");
-    }
-    if (options.IgnoreDelete() || options.PartialUpdateRemoveRecordOnDelete() ||
-        options.AggregationRemoveRecordOnDelete() ||
-        !options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
-        return Status::NotImplemented("PK realtime v1 requires default delete behavior");
-    }
-    if (!options.GetSequenceField().empty()) {
-        return Status::NotImplemented("PK realtime v1 does not support sequence.field");
-    }
-    if (!options.SequenceFieldSortOrderIsAscending()) {
-        return Status::NotImplemented(
-            "PK realtime v1 supports only ascending sequence.field.sort-order");
-    }
-    if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
-        options.GetChangelogProducer() != ChangelogProducer::NONE) {
-        return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
-    }
-    if (!options.GetWriteBufferSpillable()) {
-        return Status::Invalid("PK realtime v1 requires write-buffer spill");
+    if (context.GetTempDirectory().empty()) {
+        return Status::Invalid("PK realtime v1 requires a spill temp directory");
     }
     return Status::OK();
 }
@@ -233,15 +210,9 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            if (ignore_previous_files) {
-                return Status::NotImplemented(
-                    "PK realtime v1 requires restore from the latest snapshot");
-            }
+            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(options));
             PAIMON_RETURN_NOT_OK(
-                ValidatePkRealtimeV1Options(options, !ctx->GetWriteSchema().empty()));
-            if (ctx->GetTempDirectory().empty()) {
-                return Status::Invalid("PK realtime v1 requires a spill temp directory");
-            }
+                ValidatePrimaryKeyRealtimeWriteContext(*ctx, ignore_previous_files));
             PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
                                    snapshot_manager->LatestSnapshot());
             if (latest_snapshot) {
