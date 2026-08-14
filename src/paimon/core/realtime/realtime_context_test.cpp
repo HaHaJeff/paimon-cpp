@@ -19,6 +19,7 @@
 
 #include "paimon/realtime/realtime_context.h"
 
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -29,9 +30,13 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
+#include "arrow/ipc/json_simple.h"
+#include "paimon/core/core_options.h"
+#include "paimon/core/realtime/primary_key_mem_indexer.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/realtime/mem_indexer.h"
+#include "paimon/record_batch.h"
 #include "paimon/testing/utils/testharness.h"
 
 namespace paimon::test {
@@ -105,11 +110,21 @@ class TestingMemIndexerFactory : public MemIndexerFactory {
             return Status::Invalid("testing write schema is null");
         }
         ArrowSchemaRelease(write_schema.get());
+        ++create_count;
+        if (create_error) {
+            return create_error.value();
+        }
+        if (return_null) {
+            return std::shared_ptr<MemIndexer>();
+        }
         auto indexer = std::make_shared<TestingMemIndexer>();
         indexers.push_back(indexer);
         return indexer;
     }
 
+    int32_t create_count = 0;
+    std::optional<Status> create_error;
+    bool return_null = false;
     std::vector<std::shared_ptr<TestingMemIndexer>> indexers;
 };
 
@@ -119,6 +134,15 @@ std::unique_ptr<ArrowSchema> MakeWriteSchema() {
         arrow::ExportSchema(*arrow::schema({arrow::field("id", arrow::int64())}), c_schema.get())
             .ok());
     return c_schema;
+}
+
+std::unique_ptr<RecordBatch> MakeWriteBatch(const std::string& json) {
+    std::shared_ptr<arrow::DataType> type = arrow::struct_({arrow::field("id", arrow::int64())});
+    std::shared_ptr<arrow::Array> array =
+        arrow::ipc::internal::json::ArrayFromJSON(type, json).ValueOrDie();
+    ArrowArray c_array;
+    EXPECT_TRUE(arrow::ExportArray(*array, &c_array).ok());
+    return RecordBatchBuilder(&c_array).Finish().value();
 }
 
 TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
@@ -161,82 +185,117 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(1, factory->indexers[2]->acquire_count);
 }
 
-TEST(RealtimeContextTest, TestGenericCreatorIsLazyAndPreservesInitialOffset) {
+TEST(RealtimeContextTest, TestFactoryOverrideIsLazyAndPreservesInitialOffset) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    std::shared_ptr<MemoryPool> pool = GetDefaultPool();
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
     const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/3);
     ASSERT_OK(context->AdvanceCommittedProgress(5, {{partition_bucket, /*offset=*/7}}));
 
-    auto testing_indexer = std::make_shared<TestingMemIndexer>();
-    int32_t creator_count = 0;
-    RealtimeContext::MemIndexerCreator creator = [&]() -> Result<std::shared_ptr<MemIndexer>> {
-        ++creator_count;
-        return std::shared_ptr<MemIndexer>(testing_indexer);
-    };
-    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState first_state,
-                         context->GetOrCreateMemIndexer(partition, 3, creator));
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeMemIndexerState first_state,
+        context->GetOrCreateMemIndexer(partition, 3, MakeWriteSchema(), {}, pool, factory));
+    std::shared_ptr<TestingMemIndexer> testing_indexer = factory->indexers.at(0);
     ASSERT_EQ(testing_indexer, first_state.indexer);
     ASSERT_EQ(8, first_state.initial_offset);
-    ASSERT_EQ(1, creator_count);
+    ASSERT_EQ(1, factory->create_count);
 
     testing_indexer->offset_range = Range(8, 12);
     ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState reused_state,
-                         context->GetOrCreateMemIndexer(partition, 3, creator));
+                         context->GetOrCreateMemIndexer(partition, 3, MakeWriteSchema(), {}, pool,
+                                                        /*factory=*/nullptr));
     ASSERT_EQ(first_state.indexer, reused_state.indexer);
     ASSERT_EQ(13, reused_state.initial_offset);
-    ASSERT_EQ(1, creator_count);
+    ASSERT_EQ(1, factory->create_count);
     ASSERT_EQ(1, testing_indexer->acquire_count);
 }
 
-TEST(RealtimeContextTest, TestPropagatesCreatorFailure) {
+TEST(RealtimeContextTest, TestPropagatesFactoryFailure) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
-    RealtimeContext::MemIndexerCreator creator = []() -> Result<std::shared_ptr<MemIndexer>> {
-        return Status::IOError("creator failed");
-    };
+    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    factory->create_error = Status::IOError("factory failed");
 
-    Result<RealtimeMemIndexerState> result =
-        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, creator);
+    Result<RealtimeMemIndexerState> result = context->GetOrCreateMemIndexer(
+        /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), {}, GetDefaultPool(), factory);
     ASSERT_TRUE(result.status().IsIOError());
-    ASSERT_NOK_WITH_MSG(result, "creator failed");
+    ASSERT_NOK_WITH_MSG(result, "factory failed");
 }
 
 TEST(RealtimeContextTest, TestRejectsNullCreatedIndexer) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
-    RealtimeContext::MemIndexerCreator null_creator = []() -> Result<std::shared_ptr<MemIndexer>> {
-        return std::shared_ptr<MemIndexer>();
-    };
+    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    factory->return_null = true;
     ASSERT_NOK_WITH_MSG(
-        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, null_creator),
-        "mem indexer creator returned null");
+        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), {},
+                                       GetDefaultPool(), factory),
+        "mem indexer factory returned null");
 
-    auto testing_indexer = std::make_shared<TestingMemIndexer>();
-    RealtimeContext::MemIndexerCreator valid_creator = [&]() {
-        return Result<std::shared_ptr<MemIndexer>>(testing_indexer);
-    };
+    factory->return_null = false;
     ASSERT_OK_AND_ASSIGN(
         RealtimeMemIndexerState state,
-        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, valid_creator));
-    ASSERT_EQ(testing_indexer, state.indexer);
+        context->GetOrCreateMemIndexer(/*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), {},
+                                       GetDefaultPool(), factory));
+    ASSERT_EQ(factory->indexers.at(0), state.indexer);
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
                          context->AcquireReadViews());
     ASSERT_EQ(1, views.size());
-    ASSERT_EQ(testing_indexer, views[0].indexer);
+    ASSERT_EQ(state.indexer, views[0].indexer);
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyWriterRejectsReusedCustomIndexer) {
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
+                         RealtimeContext::Create(factory));
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
-    RealtimeContext::MemIndexerCreator creator = []() -> Result<std::shared_ptr<MemIndexer>> {
-        return std::shared_ptr<MemIndexer>(std::make_shared<TestingMemIndexer>());
-    };
-    ASSERT_OK(context->GetOrCreateMemIndexer(partition, 3, creator));
+    ASSERT_OK(
+        context->GetOrCreateMemIndexer(partition, 3, MakeWriteSchema(), {}, GetDefaultPool()));
 
     ASSERT_NOK_WITH_MSG(
         RealtimePrimaryKeyWriter::Create(
             partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
             /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
-            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false),
+            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
+            /*restore_max_seq_number=*/-1),
         "registered PK mem indexer is not PrimaryKeyMemIndexer");
+}
+
+TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    std::unique_ptr<UniqueTestDirectory> temp_directory = UniqueTestDirectory::Create();
+    ASSERT_NOK_WITH_MSG(
+        RealtimePrimaryKeyWriter::Create(
+            /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"},
+            context, /*merge_tree_writer=*/nullptr, {{Options::WRITE_BUFFER_SPILLABLE, "true"}},
+            GetDefaultPool(), temp_directory->GetFileSystem(), temp_directory->Str(),
+            /*enable_multi_thread_spill=*/false,
+            /*restore_max_seq_number=*/std::numeric_limits<int64_t>::max()),
+        "PK sequence number has reached INT64_MAX");
+}
+
+TEST(RealtimeContextTest, TestPrimaryKeyFactoryRestoresSequence) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+    std::unique_ptr<UniqueTestDirectory> temp_directory = UniqueTestDirectory::Create();
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<RealtimePrimaryKeyWriter> writer,
+        RealtimePrimaryKeyWriter::Create(
+            /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"},
+            context, /*merge_tree_writer=*/nullptr, {{Options::WRITE_BUFFER_SPILLABLE, "true"}},
+            GetDefaultPool(), temp_directory->GetFileSystem(), temp_directory->Str(),
+            /*enable_multi_thread_spill=*/false, /*restore_max_seq_number=*/7));
+    ASSERT_OK(writer->Write(MakeWriteBatch("[[1]]")));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
+                         context->AcquireReadViews());
+    ASSERT_EQ(1, views.size());
+    std::shared_ptr<PrimaryKeyMemIndexer> indexer =
+        std::dynamic_pointer_cast<PrimaryKeyMemIndexer>(views[0].indexer);
+    ASSERT_TRUE(indexer);
+    ASSERT_OK_AND_ASSIGN(std::optional<Range> sequence_range,
+                         indexer->GetPrimaryKeyQuerySequenceRange(views[0].read_view,
+                                                                  /*offset_lower_exclusive=*/-1));
+    ASSERT_EQ(std::optional<Range>(Range(8, 8)), sequence_range);
+    ASSERT_EQ(std::optional<Range>(Range(0, 0)), views[0].read_view->GetOffsetRange());
 }
 
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {

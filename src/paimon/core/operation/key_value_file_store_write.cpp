@@ -156,10 +156,10 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
                                                      partition_values.end());
     auto c_write_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, c_write_schema.get()));
-    return RealtimePrimaryKeyWriter::Create(partition_map, bucket, std::move(c_write_schema),
-                                            trimmed_primary_keys, realtime_context_, writer,
-                                            options_.ToMap(), pool_, options_.GetFileSystem(),
-                                            io_manager_->GetTempDir(), enable_multi_thread_spill_);
+    return RealtimePrimaryKeyWriter::Create(
+        partition_map, bucket, std::move(c_write_schema), trimmed_primary_keys, realtime_context_,
+        writer, options_.ToMap(), pool_, options_.GetFileSystem(), io_manager_->GetTempDir(),
+        enable_multi_thread_spill_, restore_max_seq_number);
 }
 
 Status KeyValueFileStoreWrite::Close() {

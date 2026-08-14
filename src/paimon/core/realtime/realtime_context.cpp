@@ -46,21 +46,21 @@ class RealtimeContext::Impl {
         std::unique_ptr<ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool) {
+        return GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
+                                     memory_pool, factory_);
+    }
+
+    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
+        const std::map<std::string, std::string>& partition, int32_t bucket,
+        std::unique_ptr<ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& options,
+        const std::shared_ptr<MemoryPool>& memory_pool,
+        const std::shared_ptr<MemIndexerFactory>& factory) {
         ScopeGuard schema_guard([&write_schema]() {
             if (write_schema) {
                 ArrowSchemaRelease(write_schema.get());
             }
         });
-        RealtimeContext::MemIndexerCreator creator = [this, &write_schema, &options,
-                                                      &memory_pool]() mutable {
-            return factory_->Create(std::move(write_schema), options, memory_pool);
-        };
-        return GetOrCreateMemIndexer(partition, bucket, creator);
-    }
-
-    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
-        const std::map<std::string, std::string>& partition, int32_t bucket,
-        const RealtimeContext::MemIndexerCreator& creator) {
         std::lock_guard<std::mutex> progress_lock(progress_mutex_);
         std::lock_guard<std::mutex> registry_lock(mutex_);
         const RealtimePartitionBucket key(partition, bucket);
@@ -92,12 +92,13 @@ class RealtimeContext::Impl {
             }
             return RealtimeMemIndexerState{iter->second, initial_offset};
         }
-        if (!creator) {
-            return Status::Invalid("mem indexer creator is null");
+        if (!factory) {
+            return Status::Invalid("mem indexer factory is null");
         }
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer, creator());
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer,
+                               factory->Create(std::move(write_schema), options, memory_pool));
         if (!indexer) {
-            return Status::Invalid("mem indexer creator returned null");
+            return Status::Invalid("mem indexer factory returned null");
         }
         indexers_.emplace(key, indexer);
         if (offset_iter != committed_offsets_.end()) {
@@ -212,8 +213,11 @@ Result<RealtimeMemIndexerState> RealtimeContext::GetOrCreateMemIndexer(
 
 Result<RealtimeMemIndexerState> RealtimeContext::GetOrCreateMemIndexer(
     const std::map<std::string, std::string>& partition, int32_t bucket,
-    const MemIndexerCreator& creator) {
-    return impl_->GetOrCreateMemIndexer(partition, bucket, creator);
+    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
+    const std::shared_ptr<MemoryPool>& memory_pool,
+    const std::shared_ptr<MemIndexerFactory>& factory) {
+    return impl_->GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
+                                        memory_pool, factory);
 }
 
 Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadViews() {

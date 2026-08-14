@@ -230,8 +230,9 @@ class PrimaryKeyMemIndexer::Impl {
          std::vector<std::string> trimmed_primary_keys,
          const std::shared_ptr<FieldsComparator>& key_comparator,
          const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
-         const CoreOptions& options, const std::shared_ptr<IOManager>& io_manager,
-         bool enable_multi_thread_spill, const std::shared_ptr<MemoryPool>& memory_pool)
+         int64_t next_sequence_number, const CoreOptions& options,
+         const std::shared_ptr<IOManager>& io_manager, bool enable_multi_thread_spill,
+         const std::shared_ptr<MemoryPool>& memory_pool)
         : write_schema_(write_schema),
           trimmed_primary_keys_(std::move(trimmed_primary_keys)),
           key_comparator_(key_comparator),
@@ -239,7 +240,8 @@ class PrimaryKeyMemIndexer::Impl {
           options_(options),
           io_manager_(io_manager),
           enable_multi_thread_spill_(enable_multi_thread_spill),
-          memory_pool_(memory_pool) {
+          memory_pool_(memory_pool),
+          next_sequence_number_(next_sequence_number) {
         arrow::FieldVector key_fields;
         key_fields.reserve(trimmed_primary_keys_.size());
         for (const std::string& key : trimmed_primary_keys_) {
@@ -542,7 +544,7 @@ class PrimaryKeyMemIndexer::Impl {
     std::optional<Range> building_sequence_range_;
     std::vector<std::shared_ptr<Segment>> segments_;
     std::optional<int64_t> last_offset_;
-    int64_t next_sequence_number_ = 0;
+    int64_t next_sequence_number_;
 };
 
 Result<std::shared_ptr<PrimaryKeyMemIndexer>> PrimaryKeyMemIndexer::Create(
@@ -550,8 +552,12 @@ Result<std::shared_ptr<PrimaryKeyMemIndexer>> PrimaryKeyMemIndexer::Create(
     const std::vector<std::string>& trimmed_primary_keys,
     const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
-    const CoreOptions& options, const std::shared_ptr<IOManager>& io_manager,
-    bool enable_multi_thread_spill, const std::shared_ptr<MemoryPool>& memory_pool) {
+    int64_t restore_max_seq_number, const CoreOptions& options,
+    const std::shared_ptr<IOManager>& io_manager, bool enable_multi_thread_spill,
+    const std::shared_ptr<MemoryPool>& memory_pool) {
+    if (restore_max_seq_number == std::numeric_limits<int64_t>::max()) {
+        return Status::Invalid("PK sequence number has reached INT64_MAX");
+    }
     if (trimmed_primary_keys.empty() || !key_comparator || !merge_function_wrapper) {
         return Status::Invalid("PK mem indexer requires primary keys and merge helpers");
     }
@@ -564,8 +570,8 @@ Result<std::shared_ptr<PrimaryKeyMemIndexer>> PrimaryKeyMemIndexer::Create(
         }
     }
     auto impl = std::make_unique<Impl>(write_schema, trimmed_primary_keys, key_comparator,
-                                       merge_function_wrapper, options, io_manager,
-                                       enable_multi_thread_spill, memory_pool);
+                                       merge_function_wrapper, restore_max_seq_number + 1, options,
+                                       io_manager, enable_multi_thread_spill, memory_pool);
     return std::shared_ptr<PrimaryKeyMemIndexer>(new PrimaryKeyMemIndexer(std::move(impl)));
 }
 

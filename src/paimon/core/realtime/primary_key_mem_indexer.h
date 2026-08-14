@@ -52,8 +52,9 @@ class PrimaryKeyMemIndexer : public MemIndexer {
         const std::vector<std::string>& trimmed_primary_keys,
         const std::shared_ptr<FieldsComparator>& key_comparator,
         const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
-        const CoreOptions& options, const std::shared_ptr<IOManager>& io_manager,
-        bool enable_multi_thread_spill, const std::shared_ptr<MemoryPool>& memory_pool);
+        int64_t restore_max_seq_number, const CoreOptions& options,
+        const std::shared_ptr<IOManager>& io_manager, bool enable_multi_thread_spill,
+        const std::shared_ptr<MemoryPool>& memory_pool);
 
     Status Write(RealtimeWriteBatch&& write_batch) override;
     Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override;

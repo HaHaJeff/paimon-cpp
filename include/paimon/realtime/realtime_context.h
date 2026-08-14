@@ -20,7 +20,6 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -93,9 +92,6 @@ struct PAIMON_EXPORT RealtimePartitionBucketView {
 /// process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
-    /// Creates a memory indexer for a partition-bucket that is not yet registered.
-    using MemIndexerCreator = std::function<Result<std::shared_ptr<MemIndexer>>()>;
-
     /// Creates a context backed by Paimon's default Arrow `MemIndexer`.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 
@@ -117,12 +113,15 @@ class PAIMON_EXPORT RealtimeContext {
 
     /// Returns the stable indexer and next writable offset associated with a partition-bucket.
     ///
-    /// The creator is invoked only when the partition-bucket has no registered indexer. The offset
-    /// follows both committed progress and any building or sealed rows retained by a reused
-    /// indexer.
+    /// The supplied factory overrides the context factory only when the partition-bucket has no
+    /// registered indexer. The offset follows both committed progress and any building or sealed
+    /// rows retained by a reused indexer.
     Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
         const std::map<std::string, std::string>& partition, int32_t bucket,
-        const MemIndexerCreator& creator);
+        std::unique_ptr<::ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& options,
+        const std::shared_ptr<MemoryPool>& memory_pool,
+        const std::shared_ptr<MemIndexerFactory>& factory);
 
     /// Captures an immutable read view from every currently registered indexer.
     ///

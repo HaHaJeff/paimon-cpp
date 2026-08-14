@@ -50,7 +50,7 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool,
         const std::shared_ptr<FileSystem>& file_system, const std::string& temp_directory,
-        bool enable_multi_thread_spill);
+        bool enable_multi_thread_spill, int64_t restore_max_seq_number);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<CommitIncrement> PrepareCommit(bool wait_compaction) override;
