@@ -232,7 +232,7 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(1, factory->indexers[2]->acquire_count);
 }
 
-TEST(RealtimeContextTest, TestFactoryOverrideIsLazyAndPreservesInitialOffset) {
+TEST(RealtimeContextTest, TestLazyFactoryPreservesOffset) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
     auto factory = std::make_shared<TestingMemIndexerFactory>();
     std::shared_ptr<MemoryPool> pool = GetDefaultPool();
