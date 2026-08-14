@@ -99,13 +99,9 @@ class SegmentBatchReader : public BatchReader {
 
 class Segment {
  public:
-    Segment(const Range& offset_range, const Range& sequence_range,
-            std::unique_ptr<WriteBuffer>&& buffer,
+    Segment(const Range& offset_range, std::unique_ptr<WriteBuffer>&& buffer,
             const std::shared_ptr<CommitSpillFile>& commit_file)
-        : offset_range_(offset_range),
-          sequence_range_(sequence_range),
-          buffer_(std::move(buffer)),
-          commit_file_(commit_file) {}
+        : offset_range_(offset_range), buffer_(std::move(buffer)), commit_file_(commit_file) {}
 
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -121,7 +117,6 @@ class Segment {
     }
 
     Range offset_range_;
-    Range sequence_range_;
     bool prepared_ = false;
 
  private:
@@ -273,12 +268,10 @@ class PrimaryKeyMemIndexer::Impl {
                                                              commit_channel_manager_);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteBuffer> replacement, CreateBuffer());
         segments_.push_back(std::make_shared<Segment>(building_offset_range_.value(),
-                                                      building_sequence_range_.value(),
                                                       std::move(building_), commit_file));
         building_ = std::move(replacement);
         commit_writer_.reset();
         building_offset_range_.reset();
-        building_sequence_range_.reset();
         return Status::OK();
     }
 
@@ -344,11 +337,9 @@ class PrimaryKeyMemIndexer::Impl {
         PAIMON_ASSIGN_OR_RAISE(bool can_accept_more, building_->Write(std::move(buffer_batch)));
         if (!building_offset_range_) {
             building_offset_range_ = write_batch.offset_range;
-            building_sequence_range_ = sequence_range;
         } else {
             building_offset_range_ =
                 Range(building_offset_range_->from, write_batch.offset_range.to);
-            building_sequence_range_ = Range(building_sequence_range_->from, sequence_range.to);
         }
         last_offset_ = write_batch.offset_range.to;
         next_sequence_number_ += row_count;
@@ -432,18 +423,7 @@ class PrimaryKeyMemIndexer::Impl {
         return selected;
     }
 
-    Result<std::optional<Range>> GetPrimaryKeyQuerySequenceRange(
-        const std::shared_ptr<MemReadView>& view, int64_t lower) const {
-        PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<Segment>> selected,
-                               SelectSegments(view, lower));
-        if (selected.empty()) {
-            return std::optional<Range>();
-        }
-        return std::optional<Range>(
-            Range(selected.front()->sequence_range_.from, selected.back()->sequence_range_.to));
-    }
-
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreatePrimaryKeyQueryReaders(
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<MemReadView>& view, int64_t lower, const MemQueryContext& context) {
         if (!context.read_schema || !context.read_schema->release) {
             return Status::Invalid("PK mem query read schema is null");
@@ -451,8 +431,8 @@ class PrimaryKeyMemIndexer::Impl {
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> requested,
                                           arrow::ImportSchema(context.read_schema));
         arrow::FieldVector value_fields;
-        std::vector<int32_t> projection = {KeyValueProjectionConsumer::kSequenceNumberProjection,
-                                           KeyValueProjectionConsumer::kValueKindProjection};
+        std::vector<int32_t> projection = {KeyValueProjectionConsumer::kValueKindProjection,
+                                           KeyValueProjectionConsumer::kSequenceNumberProjection};
         for (const std::shared_ptr<arrow::Field>& field : requested->fields()) {
             if (field->name() == SpecialFields::SequenceNumber().Name() ||
                 field->name() == SpecialFields::ValueKind().Name()) {
@@ -467,8 +447,8 @@ class PrimaryKeyMemIndexer::Impl {
             projection.push_back(index);
         }
         arrow::FieldVector output_fields = {
-            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber()),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())};
+            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind()),
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())};
         output_fields.insert(output_fields.end(), value_fields.begin(), value_fields.end());
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<Segment>> selected,
                                SelectSegments(view, lower));
@@ -482,7 +462,7 @@ class PrimaryKeyMemIndexer::Impl {
         result.reserve(segments.size());
         for (const std::shared_ptr<Segment>& segment : segments) {
             std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
-            if (projection.front() == KeyValueProjectionConsumer::kValueKindProjection) {
+            if (schema->GetFieldIndex(SpecialFields::SequenceNumber().Name()) < 0) {
                 PAIMON_ASSIGN_OR_RAISE(
                     std::unique_ptr<SpillReader> commit_reader,
                     SpillReader::Create(options_.GetFileSystem(), key_schema_, write_schema_,
@@ -541,7 +521,6 @@ class PrimaryKeyMemIndexer::Impl {
     std::shared_ptr<FileIOChannel::Enumerator> commit_channel_enumerator_;
     std::unique_ptr<SpillWriter> commit_writer_;
     std::optional<Range> building_offset_range_;
-    std::optional<Range> building_sequence_range_;
     std::vector<std::shared_ptr<Segment>> segments_;
     std::optional<int64_t> last_offset_;
     int64_t next_sequence_number_;
@@ -598,19 +577,8 @@ Result<std::shared_ptr<MemReadView>> PrimaryKeyMemIndexer::AcquireReadView() {
 }
 
 Result<std::vector<std::unique_ptr<BatchReader>>> PrimaryKeyMemIndexer::CreateQueryReaders(
-    const std::shared_ptr<MemReadView>&, int64_t, const MemQueryContext&) {
-    return Status::Invalid("PK mem indexer queries require primary-key merge readers");
-}
-
-Result<std::optional<Range>> PrimaryKeyMemIndexer::GetPrimaryKeyQuerySequenceRange(
-    const std::shared_ptr<MemReadView>& view, int64_t lower) {
-    return impl_->GetPrimaryKeyQuerySequenceRange(view, lower);
-}
-
-Result<std::vector<std::unique_ptr<BatchReader>>>
-PrimaryKeyMemIndexer::CreatePrimaryKeyQueryReaders(const std::shared_ptr<MemReadView>& view,
-                                                   int64_t lower, const MemQueryContext& context) {
-    return impl_->CreatePrimaryKeyQueryReaders(view, lower, context);
+    const std::shared_ptr<MemReadView>& view, int64_t lower, const MemQueryContext& context) {
+    return impl_->CreateQueryReaders(view, lower, context);
 }
 
 Status PrimaryKeyMemIndexer::AdvanceCommittedOffset(int64_t committed_offset) {

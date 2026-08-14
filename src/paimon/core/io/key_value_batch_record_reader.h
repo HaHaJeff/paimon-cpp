@@ -19,7 +19,6 @@
 
 #pragma once
 
-#include <cstdint>
 #include <memory>
 
 #include "arrow/type_fwd.h"
@@ -38,7 +37,7 @@ struct ColumnarBatchContext;
 /// Adapts sorted Arrow batches with PK merge metadata to a KeyValueRecordReader.
 class KeyValueBatchRecordReader : public KeyValueRecordReader {
  public:
-    KeyValueBatchRecordReader(std::unique_ptr<BatchReader>&& reader, int64_t sequence_shift,
+    KeyValueBatchRecordReader(std::unique_ptr<BatchReader>&& reader,
                               const std::shared_ptr<arrow::Schema>& key_schema,
                               const std::shared_ptr<arrow::Schema>& value_schema,
                               const std::shared_ptr<MemoryPool>& pool);
@@ -51,7 +50,6 @@ class KeyValueBatchRecordReader : public KeyValueRecordReader {
     class Iterator;
 
     std::unique_ptr<BatchReader> reader_;
-    int64_t sequence_shift_;
     std::shared_ptr<arrow::Schema> key_schema_;
     std::shared_ptr<arrow::Schema> value_schema_;
     std::shared_ptr<MemoryPool> pool_;

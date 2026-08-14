@@ -20,11 +20,18 @@
 #include "paimon/core/table/source/key_value_table_read.h"
 
 #include <utility>
+#include <vector>
 
+#include "arrow/c/bridge.h"
+#include "arrow/type.h"
+#include "paimon/common/table/special_fields.h"
+#include "paimon/common/types/data_field.h"
+#include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/scope_guard.h"
+#include "paimon/core/io/key_value_batch_record_reader.h"
 #include "paimon/core/io/key_value_record_reader.h"
 #include "paimon/core/operation/merge_file_split_read.h"
 #include "paimon/core/operation/raw_file_split_read.h"
-#include "paimon/core/realtime/primary_key_merge_input.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
 #include "paimon/core/table/source/realtime_split.h"
@@ -36,6 +43,43 @@ class Executor;
 class FileStorePathFactory;
 class InternalReadContext;
 class MemoryPool;
+
+namespace {
+
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreatePrimaryKeyMemoryReaders(
+    const std::shared_ptr<RealtimeSplit>& split, const std::shared_ptr<arrow::Schema>& key_schema,
+    const std::shared_ptr<arrow::Schema>& value_schema,
+    const std::shared_ptr<InternalReadContext>& context,
+    const std::shared_ptr<MemoryPool>& memory_pool) {
+    arrow::FieldVector memory_fields = value_schema->fields();
+    for (const std::shared_ptr<arrow::Field>& key_field : key_schema->fields()) {
+        if (value_schema->GetFieldIndex(key_field->name()) < 0) {
+            memory_fields.push_back(key_field);
+        }
+    }
+    std::shared_ptr<arrow::Schema> memory_schema = arrow::schema(std::move(memory_fields));
+    arrow::FieldVector requested_fields = {
+        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())};
+    requested_fields.insert(requested_fields.end(), memory_schema->fields().begin(),
+                            memory_schema->fields().end());
+    auto c_schema = std::make_unique<ArrowSchema>();
+    PAIMON_RETURN_NOT_OK_FROM_ARROW(
+        arrow::ExportSchema(*arrow::schema(std::move(requested_fields)), c_schema.get()));
+    ScopeGuard schema_guard([schema = c_schema.get()]() { ArrowSchemaRelease(schema); });
+    MemQueryContext query_context{c_schema.get(), context->GetPredicate(), false};
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> batch_readers,
+                           split->Indexer()->CreateQueryReaders(
+                               split->ReadView(), split->CommittedOffset(), query_context));
+    std::vector<std::unique_ptr<KeyValueRecordReader>> result;
+    result.reserve(batch_readers.size());
+    for (std::unique_ptr<BatchReader>& reader : batch_readers) {
+        result.push_back(std::make_unique<KeyValueBatchRecordReader>(std::move(reader), key_schema,
+                                                                     memory_schema, memory_pool));
+    }
+    return result;
+}
+
+}  // namespace
 
 KeyValueTableRead::KeyValueTableRead(std::vector<std::unique_ptr<SplitRead>>&& split_reads,
                                      std::unique_ptr<MergeFileSplitRead>&& merge_file_split_read,
@@ -80,9 +124,9 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
     if (realtime_split) {
         PAIMON_ASSIGN_OR_RAISE(
             std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
-            PrimaryKeyMergeInput::Create(realtime_split, merge_file_split_read_->GetKeySchema(),
-                                         merge_file_split_read_->GetValueSchema(), context_,
-                                         GetMemoryPool()));
+            CreatePrimaryKeyMemoryReaders(realtime_split, merge_file_split_read_->GetKeySchema(),
+                                          merge_file_split_read_->GetValueSchema(), context_,
+                                          GetMemoryPool()));
         return merge_file_split_read_->CreateReader(realtime_split->DiskSplits(),
                                                     std::move(memory_readers));
     }

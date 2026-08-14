@@ -35,12 +35,15 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "arrow/ipc/json_simple.h"
 #include "gtest/gtest.h"
 #include "paimon/catalog/catalog.h"
 #include "paimon/catalog/identifier.h"
 #include "paimon/commit_context.h"
+#include "paimon/common/table/special_fields.h"
 #include "paimon/common/utils/path_util.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
@@ -390,6 +393,53 @@ class RealtimeWriteInteTest : public ::testing::Test {
             memory_usage += view.indexer->GetMemoryUsage();
         }
         return memory_usage;
+    }
+
+    Result<std::vector<int64_t>> ReadPkQuerySequences(
+        const std::shared_ptr<RealtimeContext>& realtime_context) const {
+        PAIMON_ASSIGN_OR_RAISE(std::vector<RealtimePartitionBucketView> views,
+                               realtime_context->AcquireReadViews());
+        if (views.size() != 1) {
+            return Status::Invalid("expected one PK real-time read view");
+        }
+        auto read_schema = std::make_unique<ArrowSchema>();
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, read_schema.get()));
+        ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });
+        MemQueryContext query_context{read_schema.get(), /*predicate=*/nullptr,
+                                      /*enable_predicate_pushdown=*/false};
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<std::unique_ptr<BatchReader>> readers,
+            views[0].indexer->CreateQueryReaders(views[0].read_view,
+                                                 /*offset_lower_exclusive=*/-1, query_context));
+
+        std::vector<int64_t> sequences;
+        for (const std::unique_ptr<BatchReader>& reader : readers) {
+            while (true) {
+                PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader->NextBatch());
+                if (BatchReader::IsEofBatch(batch)) {
+                    break;
+                }
+                PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                    std::shared_ptr<arrow::Array> imported,
+                    arrow::ImportArray(batch.first.get(), batch.second.get()));
+                std::shared_ptr<arrow::StructArray> values =
+                    std::dynamic_pointer_cast<arrow::StructArray>(imported);
+                if (!values) {
+                    return Status::Invalid("PK query reader did not return a StructArray");
+                }
+                std::shared_ptr<arrow::Int64Array> sequence_array =
+                    std::dynamic_pointer_cast<arrow::Int64Array>(
+                        values->GetFieldByName(SpecialFields::SequenceNumber().Name()));
+                if (!sequence_array) {
+                    return Status::Invalid("PK query reader did not return sequence numbers");
+                }
+                for (int64_t i = 0; i < sequence_array->length(); ++i) {
+                    sequences.push_back(sequence_array->Value(i));
+                }
+            }
+            reader->Close();
+        }
+        return sequences;
     }
 
     static Status ValidateReadPrefix(const std::vector<Row>& rows, int64_t total_rows) {
@@ -1280,6 +1330,9 @@ TEST_F(RealtimeWriteInteTest, TestPkMutationSequencesAreIndependentFromOffsets) 
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
                          MakeBatch(mutations, /*partitioned=*/false, /*bucket=*/0, row_kinds));
     ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<int64_t> memory_sequences,
+                         ReadPkQuerySequences(realtime_context));
+    ASSERT_EQ(std::vector<int64_t>({2, 3, 4}), memory_sequences);
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
                          writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
     ASSERT_EQ(1, progress.size());
@@ -1287,8 +1340,8 @@ TEST_F(RealtimeWriteInteTest, TestPkMutationSequencesAreIndependentFromOffsets) 
     ASSERT_EQ(1, NewFiles(progress).size());
     ASSERT_EQ(3, NewFiles(progress)[0]->row_count);
     ASSERT_EQ(std::optional<int64_t>(1), NewFiles(progress)[0]->delete_row_count);
-    ASSERT_EQ(2, NewFiles(progress)[0]->min_sequence_number);
-    ASSERT_EQ(4, NewFiles(progress)[0]->max_sequence_number);
+    ASSERT_EQ(memory_sequences.front(), NewFiles(progress)[0]->min_sequence_number);
+    ASSERT_EQ(memory_sequences.back(), NewFiles(progress)[0]->max_sequence_number);
     ASSERT_NE(progress[0].offset_range.to, NewFiles(progress)[0]->max_sequence_number);
     ASSERT_OK(Commit(progress, /*commit_identifier=*/1));
     ASSERT_OK(writer->Close());

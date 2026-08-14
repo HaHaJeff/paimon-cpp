@@ -47,7 +47,7 @@ class KeyValueBatchRecordReader::Iterator : public KeyValueRecordReader::Iterato
         }
         PAIMON_ASSIGN_OR_RAISE(const RowKind* row_kind,
                                RowKind::FromByteValue(reader_->row_kinds_->Value(cursor_)));
-        int64_t sequence = reader_->sequences_->Value(cursor_) + reader_->sequence_shift_;
+        int64_t sequence = reader_->sequences_->Value(cursor_);
         std::shared_ptr<InternalRow> key =
             std::make_shared<ColumnarRowRef>(reader_->key_context_, cursor_);
         auto value = std::make_unique<ColumnarRowRef>(reader_->value_context_, cursor_++);
@@ -61,11 +61,9 @@ class KeyValueBatchRecordReader::Iterator : public KeyValueRecordReader::Iterato
 };
 
 KeyValueBatchRecordReader::KeyValueBatchRecordReader(
-    std::unique_ptr<BatchReader>&& reader, int64_t sequence_shift,
-    const std::shared_ptr<arrow::Schema>& key_schema,
+    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema, const std::shared_ptr<MemoryPool>& pool)
     : reader_(std::move(reader)),
-      sequence_shift_(sequence_shift),
       key_schema_(key_schema),
       value_schema_(value_schema),
       pool_(pool) {}

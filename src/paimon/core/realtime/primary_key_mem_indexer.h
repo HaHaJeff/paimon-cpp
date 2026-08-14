@@ -64,11 +64,6 @@ class PrimaryKeyMemIndexer : public MemIndexer {
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
         const MemQueryContext& context) override;
-    Result<std::optional<Range>> GetPrimaryKeyQuerySequenceRange(
-        const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive);
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreatePrimaryKeyQueryReaders(
-        const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
-        const MemQueryContext& context);
     Status AdvanceCommittedOffset(int64_t committed_offset) override;
     uint64_t GetMemoryUsage() const override;
 

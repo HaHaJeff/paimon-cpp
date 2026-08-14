@@ -31,10 +31,12 @@
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
 #include "arrow/ipc/json_simple.h"
+#include "paimon/common/table/special_fields.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
-#include "paimon/core/realtime/primary_key_mem_indexer.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/reader/batch_reader.h"
 #include "paimon/realtime/mem_indexer.h"
 #include "paimon/record_batch.h"
 #include "paimon/testing/utils/testharness.h"
@@ -143,6 +145,51 @@ std::unique_ptr<RecordBatch> MakeWriteBatch(const std::string& json) {
     ArrowArray c_array;
     EXPECT_TRUE(arrow::ExportArray(*array, &c_array).ok());
     return RecordBatchBuilder(&c_array).Finish().value();
+}
+
+Result<std::vector<int64_t>> ReadQuerySequences(const std::shared_ptr<MemIndexer>& indexer,
+                                                const std::shared_ptr<MemReadView>& view) {
+    std::unique_ptr<ArrowSchema> read_schema = MakeWriteSchema();
+    ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });
+    MemQueryContext query_context{read_schema.get(), /*predicate=*/nullptr,
+                                  /*enable_predicate_pushdown=*/false};
+    PAIMON_ASSIGN_OR_RAISE(
+        std::vector<std::unique_ptr<BatchReader>> readers,
+        indexer->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, query_context));
+
+    std::vector<int64_t> sequences;
+    for (const std::unique_ptr<BatchReader>& reader : readers) {
+        while (true) {
+            PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader->NextBatch());
+            if (BatchReader::IsEofBatch(batch)) {
+                break;
+            }
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                std::shared_ptr<arrow::Array> imported,
+                arrow::ImportArray(batch.first.get(), batch.second.get()));
+            std::shared_ptr<arrow::StructArray> values =
+                std::dynamic_pointer_cast<arrow::StructArray>(imported);
+            if (!values) {
+                return Status::Invalid("PK query reader did not return a StructArray");
+            }
+            if (values->num_fields() < 2 ||
+                values->type()->field(0)->name() != SpecialFields::ValueKind().Name() ||
+                values->type()->field(1)->name() != SpecialFields::SequenceNumber().Name()) {
+                return Status::Invalid("PK query reader did not return PK mutation metadata");
+            }
+            std::shared_ptr<arrow::Int64Array> sequence_array =
+                std::dynamic_pointer_cast<arrow::Int64Array>(
+                    values->GetFieldByName(SpecialFields::SequenceNumber().Name()));
+            if (!sequence_array) {
+                return Status::Invalid("PK query reader did not return sequence numbers");
+            }
+            for (int64_t i = 0; i < sequence_array->length(); ++i) {
+                sequences.push_back(sequence_array->Value(i));
+            }
+        }
+        reader->Close();
+    }
+    return sequences;
 }
 
 TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
@@ -288,13 +335,9 @@ TEST(RealtimeContextTest, TestPrimaryKeyFactoryRestoresSequence) {
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
                          context->AcquireReadViews());
     ASSERT_EQ(1, views.size());
-    std::shared_ptr<PrimaryKeyMemIndexer> indexer =
-        std::dynamic_pointer_cast<PrimaryKeyMemIndexer>(views[0].indexer);
-    ASSERT_TRUE(indexer);
-    ASSERT_OK_AND_ASSIGN(std::optional<Range> sequence_range,
-                         indexer->GetPrimaryKeyQuerySequenceRange(views[0].read_view,
-                                                                  /*offset_lower_exclusive=*/-1));
-    ASSERT_EQ(std::optional<Range>(Range(8, 8)), sequence_range);
+    ASSERT_OK_AND_ASSIGN(std::vector<int64_t> sequences,
+                         ReadQuerySequences(views[0].indexer, views[0].read_view));
+    ASSERT_EQ(std::vector<int64_t>({8}), sequences);
     ASSERT_EQ(std::optional<Range>(Range(0, 0)), views[0].read_view->GetOffsetRange());
 }
 
