@@ -29,6 +29,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/ipc/json_simple.h"
+#include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/fields_comparator.h"
@@ -116,6 +117,15 @@ TEST_F(PrimaryKeyMemIndexerTest, TestMemoryPoolLifecycle) {
             arrow::ImportArray(batch.first.get(), batch.second.get());
         ASSERT_TRUE(imported_result.ok()) << imported_result.status();
         imported = std::move(imported_result).ValueOrDie();
+        std::shared_ptr<arrow::StructArray> values =
+            std::dynamic_pointer_cast<arrow::StructArray>(imported);
+        ASSERT_TRUE(values);
+        std::shared_ptr<arrow::StructType> struct_type =
+            std::static_pointer_cast<arrow::StructType>(values->type());
+        ASSERT_EQ(3, values->num_fields());
+        ASSERT_EQ(SpecialFields::ValueKind().Name(), struct_type->field(0)->name());
+        ASSERT_EQ("id", struct_type->field(1)->name());
+        ASSERT_EQ("value", struct_type->field(2)->name());
     }
     readers[0]->Close();
     readers.clear();

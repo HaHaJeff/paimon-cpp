@@ -37,6 +37,7 @@ class MemIndexer;
 class MemIndexerFactory;
 class MemReadView;
 class MemoryPool;
+class RealtimePrimaryKeyWriter;
 
 /// Identifies one partition-bucket by its logical partition values.
 struct PAIMON_EXPORT RealtimePartitionBucket {
@@ -111,18 +112,6 @@ class PAIMON_EXPORT RealtimeContext {
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
-    /// Returns the stable indexer and next writable offset associated with a partition-bucket.
-    ///
-    /// The supplied factory overrides the context factory only when the partition-bucket has no
-    /// registered indexer. The offset follows both committed progress and any building or sealed
-    /// rows retained by a reused indexer.
-    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
-        const std::map<std::string, std::string>& partition, int32_t bucket,
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool,
-        const std::shared_ptr<MemIndexerFactory>& factory);
-
     /// Captures an immutable read view from every currently registered indexer.
     ///
     /// The indexer registry is fixed during this call and each returned plugin view is stable. New
@@ -142,9 +131,18 @@ class PAIMON_EXPORT RealtimeContext {
     ~RealtimeContext();
 
  private:
+    friend class RealtimePrimaryKeyWriter;
+
     class Impl;
 
     explicit RealtimeContext(std::unique_ptr<Impl>&& impl);
+
+    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
+        const std::map<std::string, std::string>& partition, int32_t bucket,
+        std::unique_ptr<::ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& options,
+        const std::shared_ptr<MemoryPool>& memory_pool,
+        const std::shared_ptr<MemIndexerFactory>& factory);
 
     std::unique_ptr<Impl> impl_;
 };

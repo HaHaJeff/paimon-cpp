@@ -439,12 +439,15 @@ class PrimaryKeyMemIndexer::Impl {
         }
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> requested,
                                           arrow::ImportSchema(context.read_schema));
-        arrow::FieldVector value_fields;
-        std::vector<int32_t> projection = {KeyValueProjectionConsumer::kValueKindProjection,
-                                           KeyValueProjectionConsumer::kSequenceNumberProjection};
+        arrow::FieldVector requested_fields;
+        std::vector<int32_t> projection = {KeyValueProjectionConsumer::kValueKindProjection};
         for (const std::shared_ptr<arrow::Field>& field : requested->fields()) {
-            if (field->name() == SpecialFields::SequenceNumber().Name() ||
-                field->name() == SpecialFields::ValueKind().Name()) {
+            if (field->name() == SpecialFields::ValueKind().Name()) {
+                continue;
+            }
+            if (field->name() == SpecialFields::SequenceNumber().Name()) {
+                requested_fields.push_back(field);
+                projection.push_back(KeyValueProjectionConsumer::kSequenceNumberProjection);
                 continue;
             }
             int32_t index = write_schema_->GetFieldIndex(field->name());
@@ -452,13 +455,12 @@ class PrimaryKeyMemIndexer::Impl {
                 return Status::Invalid("PK mem query field is missing from write schema: ",
                                        field->name());
             }
-            value_fields.push_back(field);
+            requested_fields.push_back(field);
             projection.push_back(index);
         }
         arrow::FieldVector output_fields = {
-            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind()),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())};
-        output_fields.insert(output_fields.end(), value_fields.begin(), value_fields.end());
+            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())};
+        output_fields.insert(output_fields.end(), requested_fields.begin(), requested_fields.end());
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<Segment>> selected,
                                SelectSegments(view, lower));
         return CreateReaders(selected, arrow::schema(output_fields), projection);

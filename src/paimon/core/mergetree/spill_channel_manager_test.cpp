@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "paimon/common/factories/io_hook.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/disk/io_manager.h"
 #include "paimon/testing/utils/testharness.h"
 
@@ -145,6 +147,26 @@ TEST_F(SpillChannelManagerTest, ResetDeletesAllFiles) {
     ASSERT_FALSE(a1);
     ASSERT_FALSE(a2);
     ASSERT_FALSE(a3);
+}
+
+TEST_F(SpillChannelManagerTest, DestructorRetriesFailedDeleteAfterLastOwner) {
+    auto manager = std::make_shared<SpillChannelManager>(file_system_, 1);
+    FileIOChannel::ID channel = CreateTempFile();
+    manager->AddChannel(channel);
+    std::shared_ptr<SpillChannelManager> segment_owner = manager;
+
+    IOHook* io_hook = IOHook::GetInstance();
+    ScopeGuard hook_guard([io_hook]() { io_hook->Clear(); });
+    io_hook->Reset(/*pos=*/0, IOHook::Mode::RETURN_ERROR);
+    ASSERT_NOK(manager->DeleteChannel(channel));
+    io_hook->Clear();
+
+    manager.reset();
+    ASSERT_OK_AND_ASSIGN(bool exists_while_owned, file_system_->Exists(channel.GetPath()));
+    ASSERT_TRUE(exists_while_owned);
+    segment_owner.reset();
+    ASSERT_OK_AND_ASSIGN(bool exists_after_finalize, file_system_->Exists(channel.GetPath()));
+    ASSERT_FALSE(exists_after_finalize);
 }
 
 }  // namespace paimon::test

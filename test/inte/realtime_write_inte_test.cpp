@@ -41,7 +41,9 @@
 #include "paimon/catalog/catalog.h"
 #include "paimon/catalog/identifier.h"
 #include "paimon/commit_context.h"
+#include "paimon/common/factories/io_hook.h"
 #include "paimon/common/table/special_fields.h"
+#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
@@ -405,7 +407,12 @@ class RealtimeWriteInteTest : public ::testing::Test {
             return Status::Invalid("expected one PK real-time read view");
         }
         auto read_schema = std::make_unique<ArrowSchema>();
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, read_schema.get()));
+        arrow::FieldVector requested_fields = {
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())};
+        requested_fields.insert(requested_fields.end(), schema_->fields().begin(),
+                                schema_->fields().end());
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(
+            arrow::ExportSchema(*arrow::schema(std::move(requested_fields)), read_schema.get()));
         ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });
         MemQueryContext query_context{read_schema.get(), /*predicate=*/nullptr,
                                       /*enable_predicate_pushdown=*/false};
@@ -1751,18 +1758,24 @@ TEST_F(RealtimeWriteInteTest, TestPkScanRejectsDataEvolution) {
     ASSERT_EQ("real-time union read does not support data evolution", scan.status().message());
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkWriteFailure) {
+TEST_F(RealtimeWriteInteTest, TestPkWritePropagatesIoFailure) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> invalid_batch,
-                         MakeBatch({Row{1, "invalid", "p0"}}, /*partitioned=*/false,
-                                   /*bucket=*/1));
-    Status operation_error = writer->Write(std::move(invalid_batch));
-    ASSERT_NOK_WITH_MSG(operation_error, "fixed bucketed mode");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false,
+                                   /*bucket=*/0));
+
+    IOHook* io_hook = IOHook::GetInstance();
+    ScopeGuard hook_guard([io_hook]() { io_hook->Clear(); });
+    io_hook->Reset(/*pos=*/0, IOHook::Mode::RETURN_ERROR);
+    Status operation_error = writer->Write(std::move(batch));
+    io_hook->Clear();
+    ASSERT_TRUE(operation_error.IsIOError()) << operation_error.ToString();
+    ASSERT_NOK_WITH_MSG(operation_error, "io hook triggered io error");
     ASSERT_OK(writer->Close());
 }
 

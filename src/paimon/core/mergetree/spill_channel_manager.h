@@ -33,6 +33,10 @@ class SpillChannelManager {
         channels_.reserve(initial_capacity);
     }
 
+    ~SpillChannelManager() {
+        Reset();
+    }
+
     void AddChannel(const FileIOChannel::ID& channel_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         channels_.emplace(channel_id);
@@ -47,10 +51,14 @@ class SpillChannelManager {
 
     void Reset() {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& channel : channels_) {
-            [[maybe_unused]] auto status = fs_->Delete(channel.GetPath());
+        for (auto iter = channels_.begin(); iter != channels_.end();) {
+            Status status = fs_->Delete(iter->GetPath());
+            if (status.ok()) {
+                iter = channels_.erase(iter);
+            } else {
+                ++iter;
+            }
         }
-        channels_.clear();
     }
 
     std::unordered_set<FileIOChannel::ID, FileIOChannel::ID::Hash> GetChannels() const {
