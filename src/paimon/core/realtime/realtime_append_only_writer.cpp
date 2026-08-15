@@ -52,9 +52,11 @@ Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Crea
     if (!realtime_context) {
         return Status::Invalid("real-time context is null");
     }
+    MemIndexerCreateRequest request{
+        std::move(write_schema),       options, memory_pool, partition, bucket,
+        AppendMemIndexerCreateConfig{}};
     PAIMON_ASSIGN_OR_RAISE(RealtimeMemIndexerState indexer_state,
-                           realtime_context->GetOrCreateMemIndexer(
-                               partition, bucket, std::move(write_schema), options, memory_pool));
+                           realtime_context->GetOrCreateMemIndexer(std::move(request)));
     return std::shared_ptr<RealtimeAppendOnlyWriter>(
         new RealtimeAppendOnlyWriter(indexer_state.indexer, file_writer, input_schema,
                                      indexer_state.initial_offset, memory_pool));

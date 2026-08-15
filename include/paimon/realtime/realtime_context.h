@@ -29,16 +29,12 @@
 #include "paimon/result.h"
 #include "paimon/visibility.h"
 
-struct ArrowSchema;
-
 namespace paimon {
 
 class MemIndexer;
 class MemIndexerFactory;
 class MemReadView;
-class MemoryPool;
-class PrimaryKeyMemIndexerFactory;
-class RealtimePrimaryKeyWriter;
+struct MemIndexerCreateRequest;
 
 /// Identifies one partition-bucket by its logical partition values.
 struct PAIMON_EXPORT RealtimePartitionBucket {
@@ -94,34 +90,20 @@ struct PAIMON_EXPORT RealtimePartitionBucketView {
 /// process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
-    /// Creates a context with no application-provided indexer factory.
-    ///
-    /// Append-only writers use Paimon's default Arrow indexer, while primary-key writers supply
-    /// their primary-key indexer as the fallback.
+    /// Creates a context backed by Paimon's unified Arrow indexer factory.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 
-    /// Creates a context backed by an application-provided append indexer factory.
+    /// Creates a context backed by one application-provided indexer factory.
     ///
     /// @param factory Non-null factory used to create indexers on demand.
     static Result<std::shared_ptr<RealtimeContext>> Create(
         const std::shared_ptr<MemIndexerFactory>& factory);
 
-    /// Creates a context backed by an application-provided primary-key indexer factory.
-    ///
-    /// The factory receives the partition, bucket, and restored sequence number for every
-    /// indexer it creates.
-    static Result<std::shared_ptr<RealtimeContext>> CreatePrimaryKey(
-        const std::shared_ptr<PrimaryKeyMemIndexerFactory>& factory);
-
     /// Returns the stable indexer and next writable offset associated with a partition-bucket.
     ///
     /// The offset follows both committed progress and any building or sealed rows retained by a
     /// reused indexer.
-    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
-        const std::map<std::string, std::string>& partition, int32_t bucket,
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool);
+    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(MemIndexerCreateRequest&& request);
 
     /// Captures an immutable read view from every currently registered indexer.
     ///
@@ -142,21 +124,9 @@ class PAIMON_EXPORT RealtimeContext {
     ~RealtimeContext();
 
  private:
-    friend class RealtimePrimaryKeyWriter;
-
     class Impl;
-    template <typename Factory>
-    class FactoryImpl;
 
     explicit RealtimeContext(std::unique_ptr<Impl>&& impl);
-
-    Result<RealtimeMemIndexerState> GetOrCreatePrimaryKeyMemIndexer(
-        const std::map<std::string, std::string>& partition, int32_t bucket,
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool,
-        const std::shared_ptr<PrimaryKeyMemIndexerFactory>& factory,
-        int64_t restore_max_sequence_number);
 
     std::unique_ptr<Impl> impl_;
 };

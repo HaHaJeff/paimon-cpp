@@ -25,12 +25,10 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
-#include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/row_kind.h"
-#include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/scope_guard.h"
+#include "paimon/core/io/key_value_batch_record_reader.h"
 #include "paimon/core/mergetree/merge_tree_writer.h"
-#include "paimon/core/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/core/utils/commit_increment.h"
 #include "paimon/macros.h"
 #include "paimon/realtime/realtime_context.h"
@@ -50,20 +48,51 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
     if (!realtime_context) {
         return Status::Invalid("PK real-time context is null");
     }
-    auto factory = std::make_shared<ArrowPrimaryKeyMemIndexerFactory>(
-        trimmed_primary_keys, file_system, temp_directory, enable_multi_thread_spill);
+    if (!write_schema || !write_schema->release) {
+        return Status::Invalid("PK real-time write schema is null");
+    }
+    ScopeGuard schema_guard([schema = write_schema.get()]() { ArrowSchemaRelease(schema); });
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> value_schema,
+                                      arrow::ImportSchema(write_schema.get()));
+    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*value_schema, write_schema.get()));
+    arrow::FieldVector key_fields;
+    key_fields.reserve(trimmed_primary_keys.size());
+    for (const std::string& primary_key : trimmed_primary_keys) {
+        std::shared_ptr<arrow::Field> key_field = value_schema->GetFieldByName(primary_key);
+        if (!key_field) {
+            return Status::Invalid("primary key ", primary_key, " is missing from write schema");
+        }
+        key_fields.push_back(std::move(key_field));
+    }
+    std::shared_ptr<arrow::Schema> key_schema = arrow::schema(std::move(key_fields));
+    MemIndexerCreateRequest request{
+        std::move(write_schema),
+        options,
+        memory_pool,
+        partition,
+        bucket,
+        PrimaryKeyMemIndexerCreateConfig{trimmed_primary_keys, restore_max_seq_number, file_system,
+                                         temp_directory, enable_multi_thread_spill}};
+    schema_guard.Release();
     PAIMON_ASSIGN_OR_RAISE(RealtimeMemIndexerState indexer_state,
-                           realtime_context->GetOrCreatePrimaryKeyMemIndexer(
-                               partition, bucket, std::move(write_schema), options, memory_pool,
-                               factory, restore_max_seq_number));
-    return std::shared_ptr<RealtimePrimaryKeyWriter>(new RealtimePrimaryKeyWriter(
-        indexer_state.indexer, merge_tree_writer, indexer_state.initial_offset));
+                           realtime_context->GetOrCreateMemIndexer(std::move(request)));
+    return std::shared_ptr<RealtimePrimaryKeyWriter>(
+        new RealtimePrimaryKeyWriter(indexer_state.indexer, merge_tree_writer, key_schema,
+                                     value_schema, memory_pool, indexer_state.initial_offset));
 }
 
 RealtimePrimaryKeyWriter::RealtimePrimaryKeyWriter(
     const std::shared_ptr<MemIndexer>& mem_indexer,
-    const std::shared_ptr<MergeTreeWriter>& merge_tree_writer, int64_t next_offset)
-    : mem_indexer_(mem_indexer), merge_tree_writer_(merge_tree_writer), next_offset_(next_offset) {}
+    const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
+    const std::shared_ptr<arrow::Schema>& key_schema,
+    const std::shared_ptr<arrow::Schema>& value_schema,
+    const std::shared_ptr<MemoryPool>& memory_pool, int64_t next_offset)
+    : mem_indexer_(mem_indexer),
+      merge_tree_writer_(merge_tree_writer),
+      key_schema_(key_schema),
+      value_schema_(value_schema),
+      memory_pool_(memory_pool),
+      next_offset_(next_offset) {}
 
 Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
     const int64_t row_count = batch->GetData()->length;
@@ -94,66 +123,17 @@ Result<CommitIncrement> RealtimePrimaryKeyWriter::PrepareCommit(bool wait_compac
     return increment;
 }
 
-Result<std::unique_ptr<RecordBatch>> RealtimePrimaryKeyWriter::ToMutationRecordBatch(
-    BatchReader::ReadBatch&& batch) {
-    auto& [c_array, c_schema] = batch;
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> imported,
-                                      arrow::ImportArray(c_array.get(), c_schema.get()));
-    std::shared_ptr<arrow::StructArray> struct_array =
-        std::dynamic_pointer_cast<arrow::StructArray>(imported);
-    if (!struct_array) {
-        return Status::Invalid("PK mem indexer commit batch is not a StructArray");
-    }
-    std::shared_ptr<arrow::Array> value_kind =
-        struct_array->GetFieldByName(SpecialFields::ValueKind().Name());
-    std::shared_ptr<arrow::Int8Array> kind_array =
-        std::dynamic_pointer_cast<arrow::Int8Array>(value_kind);
-    if (!kind_array) {
-        return Status::Invalid("PK mem indexer commit batch is missing _VALUE_KIND");
-    }
-    std::vector<RecordBatch::RowKind> row_kinds;
-    row_kinds.reserve(static_cast<size_t>(kind_array->length()));
-    for (int64_t index = 0; index < kind_array->length(); ++index) {
-        if (kind_array->IsNull(index)) {
-            return Status::Invalid("PK mem indexer commit reader returned a null _VALUE_KIND");
-        }
-        PAIMON_ASSIGN_OR_RAISE(const RowKind* row_kind,
-                               RowKind::FromByteValue(kind_array->Value(index)));
-        row_kinds.push_back(static_cast<RecordBatch::RowKind>(row_kind->ToByteValue()));
-    }
-    PAIMON_ASSIGN_OR_RAISE(struct_array, ArrowUtils::RemoveFieldFromStructArray(
-                                             struct_array, SpecialFields::ValueKind().Name()));
-    auto output = std::make_unique<ArrowArray>();
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*struct_array, output.get()));
-    RecordBatchBuilder builder(output.get());
-    builder.SetRowKinds(row_kinds);
-    return builder.Finish();
-}
-
 Status RealtimePrimaryKeyWriter::FlushSegment(
     const std::shared_ptr<RealtimeSegmentHandle>& segment) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                            mem_indexer_->CreateCommitReaders(segment));
-    ScopeGuard reader_guard([&readers]() {
-        for (const std::unique_ptr<BatchReader>& commit_reader : readers) {
-            commit_reader->Close();
-        }
-    });
-    for (const std::unique_ptr<BatchReader>& commit_reader : readers) {
-        while (true) {
-            PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, commit_reader->NextBatch());
-            if (BatchReader::IsEofBatch(batch)) {
-                break;
-            }
-            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<RecordBatch> mutation_batch,
-                                   ToMutationRecordBatch(std::move(batch)));
-            if (mutation_batch->GetData()->length == 0) {
-                continue;
-            }
-            PAIMON_RETURN_NOT_OK(merge_tree_writer_->Write(std::move(mutation_batch)));
-        }
+    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
+    sorted_readers.reserve(readers.size());
+    for (std::unique_ptr<BatchReader>& reader : readers) {
+        sorted_readers.push_back(std::make_unique<KeyValueBatchRecordReader>(
+            std::move(reader), key_schema_, value_schema_, memory_pool_));
     }
-    return Status::OK();
+    return merge_tree_writer_->WriteSortedReaders(std::move(sorted_readers));
 }
 
 Status RealtimePrimaryKeyWriter::Compact(bool) {

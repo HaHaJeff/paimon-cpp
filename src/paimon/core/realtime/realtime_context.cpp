@@ -33,28 +33,23 @@
 #include "paimon/macros.h"
 #include "paimon/realtime/arrow_mem_indexer_factory.h"
 #include "paimon/realtime/mem_indexer.h"
-#include "paimon/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/status.h"
 
 namespace paimon {
 
 class RealtimeContext::Impl {
  public:
-    virtual ~Impl() = default;
+    explicit Impl(std::shared_ptr<MemIndexerFactory> factory) : factory_(std::move(factory)) {}
 
-    template <typename CreateIndexer>
-    Result<RealtimeMemIndexerState> GetOrCreate(const std::map<std::string, std::string>& partition,
-                                                int32_t bucket,
-                                                std::unique_ptr<ArrowSchema> write_schema,
-                                                CreateIndexer&& create_indexer) {
-        ScopeGuard schema_guard([&write_schema]() {
-            if (write_schema) {
-                ArrowSchemaRelease(write_schema.get());
+    Result<RealtimeMemIndexerState> GetOrCreate(MemIndexerCreateRequest&& request) {
+        ScopeGuard schema_guard([schema = request.write_schema.get()]() {
+            if (schema && schema->release) {
+                ArrowSchemaRelease(schema);
             }
         });
         std::lock_guard<std::mutex> progress_lock(progress_mutex_);
         std::lock_guard<std::mutex> registry_lock(mutex_);
-        const RealtimePartitionBucket key(partition, bucket);
+        const RealtimePartitionBucket key(request.partition, request.bucket);
         int64_t initial_offset = 0;
         auto offset_iter = committed_offsets_.find(key);
         if (offset_iter != committed_offsets_.end()) {
@@ -83,8 +78,9 @@ class RealtimeContext::Impl {
             }
             return RealtimeMemIndexerState{iter->second, initial_offset};
         }
+        schema_guard.Release();
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer,
-                               create_indexer(std::move(write_schema)));
+                               factory_->Create(std::move(request)));
         if (!indexer) {
             return Status::Invalid("mem indexer factory returned null");
         }
@@ -166,6 +162,7 @@ class RealtimeContext::Impl {
     }
 
  private:
+    std::shared_ptr<MemIndexerFactory> factory_;
     std::mutex mutex_;
     std::mutex progress_mutex_;
     std::map<RealtimePartitionBucket, std::shared_ptr<MemIndexer>> indexers_;
@@ -174,21 +171,8 @@ class RealtimeContext::Impl {
     std::optional<int64_t> last_refreshed_snapshot_id_;
 };
 
-template <typename Factory>
-class RealtimeContext::FactoryImpl final : public RealtimeContext::Impl {
- public:
-    explicit FactoryImpl(std::shared_ptr<Factory> factory) : factory_(std::move(factory)) {}
-
-    const std::shared_ptr<Factory>& GetFactory() const {
-        return factory_;
-    }
-
- private:
-    std::shared_ptr<Factory> factory_;
-};
-
 Result<std::shared_ptr<RealtimeContext>> RealtimeContext::Create() {
-    return std::shared_ptr<RealtimeContext>(new RealtimeContext(std::make_unique<Impl>()));
+    return Create(std::make_shared<ArrowMemIndexerFactory>());
 }
 
 Result<std::shared_ptr<RealtimeContext>> RealtimeContext::Create(
@@ -196,17 +180,7 @@ Result<std::shared_ptr<RealtimeContext>> RealtimeContext::Create(
     if (!factory) {
         return Status::Invalid("mem indexer factory is null");
     }
-    return std::shared_ptr<RealtimeContext>(
-        new RealtimeContext(std::make_unique<FactoryImpl<MemIndexerFactory>>(factory)));
-}
-
-Result<std::shared_ptr<RealtimeContext>> RealtimeContext::CreatePrimaryKey(
-    const std::shared_ptr<PrimaryKeyMemIndexerFactory>& factory) {
-    if (!factory) {
-        return Status::Invalid("primary-key mem indexer factory is null");
-    }
-    return std::shared_ptr<RealtimeContext>(
-        new RealtimeContext(std::make_unique<FactoryImpl<PrimaryKeyMemIndexerFactory>>(factory)));
+    return std::shared_ptr<RealtimeContext>(new RealtimeContext(std::make_unique<Impl>(factory)));
 }
 
 RealtimeContext::RealtimeContext(std::unique_ptr<Impl>&& impl) : impl_(std::move(impl)) {}
@@ -214,47 +188,8 @@ RealtimeContext::RealtimeContext(std::unique_ptr<Impl>&& impl) : impl_(std::move
 RealtimeContext::~RealtimeContext() = default;
 
 Result<RealtimeMemIndexerState> RealtimeContext::GetOrCreateMemIndexer(
-    const std::map<std::string, std::string>& partition, int32_t bucket,
-    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
-    if (dynamic_cast<FactoryImpl<PrimaryKeyMemIndexerFactory>*>(impl_.get())) {
-        return Status::Invalid("primary-key mem indexer factory cannot create append indexers");
-    }
-    FactoryImpl<MemIndexerFactory>* configured_factory =
-        dynamic_cast<FactoryImpl<MemIndexerFactory>*>(impl_.get());
-    return impl_->GetOrCreate(
-        partition, bucket, std::move(write_schema),
-        [&options, &memory_pool, configured_factory](std::unique_ptr<ArrowSchema> schema) {
-            if (configured_factory) {
-                return configured_factory->GetFactory()->Create(std::move(schema), options,
-                                                                memory_pool);
-            }
-            ArrowMemIndexerFactory factory;
-            return factory.Create(std::move(schema), options, memory_pool);
-        });
-}
-
-Result<RealtimeMemIndexerState> RealtimeContext::GetOrCreatePrimaryKeyMemIndexer(
-    const std::map<std::string, std::string>& partition, int32_t bucket,
-    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool,
-    const std::shared_ptr<PrimaryKeyMemIndexerFactory>& factory,
-    int64_t restore_max_sequence_number) {
-    if (dynamic_cast<FactoryImpl<MemIndexerFactory>*>(impl_.get())) {
-        return Status::Invalid("generic mem indexer factory cannot create primary-key indexers");
-    }
-    FactoryImpl<PrimaryKeyMemIndexerFactory>* configured_factory =
-        dynamic_cast<FactoryImpl<PrimaryKeyMemIndexerFactory>*>(impl_.get());
-    const std::shared_ptr<PrimaryKeyMemIndexerFactory>& effective_factory =
-        configured_factory ? configured_factory->GetFactory() : factory;
-    const PrimaryKeyMemIndexerCreationContext creation_context{partition, bucket,
-                                                               restore_max_sequence_number};
-    return impl_->GetOrCreate(partition, bucket, std::move(write_schema),
-                              [&options, &memory_pool, &effective_factory,
-                               &creation_context](std::unique_ptr<ArrowSchema> schema) {
-                                  return effective_factory->Create(std::move(schema), options,
-                                                                   memory_pool, creation_context);
-                              });
+    MemIndexerCreateRequest&& request) {
+    return impl_->GetOrCreate(std::move(request));
 }
 
 Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadViews() {

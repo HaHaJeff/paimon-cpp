@@ -28,7 +28,9 @@
 #include "arrow/c/bridge.h"
 #include "arrow/ipc/json_simple.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
+#include "paimon/core/core_options.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/realtime/arrow_mem_indexer_factory.h"
 #include "paimon/record_batch.h"
 #include "paimon/testing/utils/testharness.h"
 
@@ -223,6 +225,54 @@ TEST_F(ArrowMemIndexerTest, TestRejectsHandlesFromAnotherIndexerImplementation) 
     context.read_schema = nullptr;
     ASSERT_NOK_WITH_MSG(indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context),
                         "mem query read schema is null");
+}
+
+TEST_F(ArrowMemIndexerTest, TestFactoryCreatesAppendAndPrimaryKeyIndexers) {
+    ArrowMemIndexerFactory factory;
+    std::unique_ptr<ArrowSchema> append_schema = MakeReadSchema(schema_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemIndexer> append_indexer,
+                         factory.Create(MemIndexerCreateRequest{std::move(append_schema),
+                                                                /*options=*/{}, pool_,
+                                                                /*partition=*/{}, /*bucket=*/0,
+                                                                AppendMemIndexerCreateConfig{}}));
+    ASSERT_OK(
+        append_indexer->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "append"]])"), Range(0, 0)}));
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> append_segment,
+                         append_indexer->SealForCommit());
+    ASSERT_TRUE(append_segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> append_readers,
+                         append_indexer->CreateCommitReaders(append_segment.value()));
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch append_batch, append_readers[0]->NextBatch());
+    ASSERT_EQ(3, append_batch.second->n_children);
+    append_readers[0]->Close();
+
+    std::unique_ptr<UniqueTestDirectory> temp_directory = UniqueTestDirectory::Create();
+    std::unique_ptr<ArrowSchema> primary_key_schema = MakeReadSchema(schema_);
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<MemIndexer> primary_key_indexer,
+        factory.Create(MemIndexerCreateRequest{
+            std::move(primary_key_schema),
+            {{Options::WRITE_BUFFER_SPILLABLE, "true"}},
+            pool_,
+            /*partition=*/{},
+            /*bucket=*/0,
+            PrimaryKeyMemIndexerCreateConfig{{"id"},
+                                             /*restore_max_sequence_number=*/7,
+                                             temp_directory->GetFileSystem(),
+                                             temp_directory->Str(),
+                                             /*enable_multi_thread_spill=*/false}}));
+    ASSERT_OK(primary_key_indexer->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[1, "primary-key"]])"), Range(0, 0)}));
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> primary_key_segment,
+                         primary_key_indexer->SealForCommit());
+    ASSERT_TRUE(primary_key_segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> primary_key_readers,
+                         primary_key_indexer->CreateCommitReaders(primary_key_segment.value()));
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch primary_key_batch,
+                         primary_key_readers[0]->NextBatch());
+    ASSERT_EQ(4, primary_key_batch.second->n_children);
+    ASSERT_STREQ("_SEQUENCE_NUMBER", primary_key_batch.second->children[0]->name);
+    primary_key_readers[0]->Close();
 }
 
 }  // namespace

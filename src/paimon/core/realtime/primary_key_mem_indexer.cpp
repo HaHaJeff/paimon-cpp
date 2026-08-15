@@ -28,44 +28,22 @@
 #include "arrow/type.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/table/special_fields.h"
-#include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/checked_cast.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/disk/io_manager.h"
 #include "paimon/core/io/key_value_projection_consumer.h"
 #include "paimon/core/io/key_value_record_reader.h"
 #include "paimon/core/io/row_to_arrow_array_converter.h"
 #include "paimon/core/key_value.h"
-#include "paimon/core/mergetree/spill_channel_manager.h"
-#include "paimon/core/mergetree/spill_reader.h"
-#include "paimon/core/mergetree/spill_writer.h"
 #include "paimon/core/mergetree/write_buffer.h"
-#include "paimon/logging.h"
 #include "paimon/macros.h"
 
 namespace paimon {
 namespace {
 
 class Segment;
-
-class CommitSpillFile {
- public:
-    CommitSpillFile(const FileIOChannel::ID& channel_id,
-                    const std::shared_ptr<SpillChannelManager>& manager)
-        : channel_id_(channel_id), manager_(manager) {}
-
-    ~CommitSpillFile() {
-        Status status = manager_->DeleteChannel(channel_id_);
-        if (!status.ok()) {
-            static std::shared_ptr<Logger> logger = Logger::GetLogger("CommitSpillFile");
-            PAIMON_LOG_WARN(logger, "Failed to delete commit spill channel %s: %s",
-                            channel_id_.GetPath().c_str(), status.ToString().c_str());
-        }
-    }
-
-    FileIOChannel::ID channel_id_;
-    std::shared_ptr<SpillChannelManager> manager_;
-};
 
 class SegmentBatchReader : public BatchReader {
  public:
@@ -106,17 +84,14 @@ class SegmentBatchReader : public BatchReader {
 
 class Segment {
  public:
-    Segment(const Range& offset_range, std::unique_ptr<WriteBuffer>&& buffer,
-            const std::shared_ptr<CommitSpillFile>& commit_file)
-        : offset_range_(offset_range), buffer_(std::move(buffer)), commit_file_(commit_file) {}
+    Segment(const Range& offset_range, std::unique_ptr<WriteBuffer>&& buffer)
+        : offset_range_(offset_range), buffer_(std::move(buffer)) {}
 
-    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() {
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders(
+        const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+            merge_function_wrapper_factory) {
         std::lock_guard<std::mutex> lock(mutex_);
-        return buffer_->CreateReaders();
-    }
-
-    const std::shared_ptr<CommitSpillFile>& GetCommitFile() const {
-        return commit_file_;
+        return buffer_->CreateReaders(merge_function_wrapper_factory);
     }
 
     uint64_t GetMemoryUsage() const {
@@ -129,7 +104,6 @@ class Segment {
 
  private:
     std::unique_ptr<WriteBuffer> buffer_;
-    std::shared_ptr<CommitSpillFile> commit_file_;
     mutable std::mutex mutex_;
 };
 
@@ -228,39 +202,34 @@ class ReadView : public MemReadView {
 }  // namespace
 
 class PrimaryKeyMemIndexer::Impl {
- private:
-    enum class ReaderMode { COMMIT, QUERY };
-
  public:
     Impl(const std::shared_ptr<arrow::Schema>& write_schema,
          std::vector<std::string> trimmed_primary_keys,
          const std::shared_ptr<FieldsComparator>& key_comparator,
-         const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
+         const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+             merge_function_wrapper_factory,
          int64_t next_sequence_number, const CoreOptions& options,
          const std::shared_ptr<IOManager>& io_manager, bool enable_multi_thread_spill,
          const std::shared_ptr<MemoryPool>& memory_pool)
         : write_schema_(write_schema),
           trimmed_primary_keys_(std::move(trimmed_primary_keys)),
           key_comparator_(key_comparator),
-          merge_function_wrapper_(merge_function_wrapper),
+          merge_function_wrapper_factory_(merge_function_wrapper_factory),
           options_(options),
           io_manager_(io_manager),
           enable_multi_thread_spill_(enable_multi_thread_spill),
           memory_pool_(memory_pool),
-          arrow_pool_(GetArrowPool(memory_pool)),
-          next_sequence_number_(next_sequence_number) {
-        arrow::FieldVector key_fields;
-        key_fields.reserve(trimmed_primary_keys_.size());
-        for (const std::string& key : trimmed_primary_keys_) {
-            key_fields.push_back(write_schema_->GetFieldByName(key));
-        }
-        key_schema_ = arrow::schema(std::move(key_fields));
-    }
+          next_sequence_number_(next_sequence_number) {}
 
     Result<std::unique_ptr<WriteBuffer>> CreateBuffer() const {
+        std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper =
+            merge_function_wrapper_factory_();
+        if (!merge_function_wrapper) {
+            return Status::Invalid("merge function wrapper factory returned null");
+        }
         return WriteBuffer::Create(next_sequence_number_ - 1, write_schema_, trimmed_primary_keys_,
                                    /*user_defined_sequence_fields=*/{}, key_comparator_,
-                                   /*user_defined_seq_comparator=*/nullptr, merge_function_wrapper_,
+                                   /*user_defined_seq_comparator=*/nullptr, merge_function_wrapper,
                                    options_, io_manager_, enable_multi_thread_spill_, memory_pool_);
     }
 
@@ -276,13 +245,9 @@ class PrimaryKeyMemIndexer::Impl {
             return Status::OK();
         }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteBuffer> replacement, CreateBuffer());
-        PAIMON_RETURN_NOT_OK(commit_writer_->Close());
-        auto commit_file = std::make_shared<CommitSpillFile>(commit_writer_->GetChannelId(),
-                                                             commit_channel_manager_);
-        segments_.push_back(std::make_shared<Segment>(building_offset_range_.value(),
-                                                      std::move(building_), commit_file));
+        segments_.push_back(
+            std::make_shared<Segment>(building_offset_range_.value(), std::move(building_)));
         building_ = std::move(replacement);
-        commit_writer_.reset();
         building_offset_range_.reset();
         return Status::OK();
     }
@@ -305,42 +270,19 @@ class PrimaryKeyMemIndexer::Impl {
             return Status::Invalid("PK sequence range exceeds INT64_MAX");
         }
         PAIMON_RETURN_NOT_OK(EnsureBuilding());
-        const Range sequence_range(next_sequence_number_, next_sequence_number_ + row_count - 1);
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
             std::shared_ptr<arrow::Array> imported,
             arrow::ImportArray(write_batch.batch->GetData(),
                                arrow::struct_(write_schema_->fields())));
-        std::shared_ptr<arrow::StructArray> values =
-            std::dynamic_pointer_cast<arrow::StructArray>(imported);
-        if (!values) {
+        if (!imported || imported->type_id() != arrow::Type::STRUCT) {
             return Status::Invalid("PK real-time write data is not a StructArray");
         }
+        std::shared_ptr<arrow::StructArray> values =
+            checked_pointer_cast<arrow::StructArray>(imported);
         std::vector<RecordBatch::RowKind> row_kinds = write_batch.batch->GetRowKind();
         if (!row_kinds.empty() && static_cast<int64_t>(row_kinds.size()) != row_count) {
             return Status::Invalid("PK real-time row-kind count does not match row count");
         }
-        if (!commit_writer_) {
-            PAIMON_RETURN_NOT_OK(CreateCommitWriter());
-        }
-        arrow::Int64Builder sequence_builder(arrow_pool_.get());
-        arrow::Int8Builder kind_builder(arrow_pool_.get());
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(sequence_builder.Reserve(row_count));
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(kind_builder.Reserve(row_count));
-        for (int64_t i = 0; i < row_count; ++i) {
-            sequence_builder.UnsafeAppend(sequence_range.from + i);
-            kind_builder.UnsafeAppend(row_kinds.empty()
-                                          ? static_cast<int8_t>(RecordBatch::RowKind::INSERT)
-                                          : static_cast<int8_t>(row_kinds[static_cast<size_t>(i)]));
-        }
-        std::shared_ptr<arrow::Array> sequences;
-        std::shared_ptr<arrow::Array> kinds;
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(sequence_builder.Finish(&sequences));
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(kind_builder.Finish(&kinds));
-        arrow::ArrayVector commit_columns = {sequences, kinds};
-        commit_columns.insert(commit_columns.end(), values->fields().begin(),
-                              values->fields().end());
-        PAIMON_RETURN_NOT_OK(commit_writer_->WriteBatch(
-            arrow::RecordBatch::Make(commit_schema_, row_count, commit_columns)));
         auto c_array = std::make_unique<ArrowArray>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*values, c_array.get()));
         RecordBatchBuilder batch_builder(c_array.get());
@@ -358,22 +300,6 @@ class PrimaryKeyMemIndexer::Impl {
         if (!can_accept_more) {
             PAIMON_RETURN_NOT_OK(RotateBuilding());
         }
-        return Status::OK();
-    }
-
-    Status CreateCommitWriter() {
-        if (!commit_channel_manager_) {
-            commit_channel_manager_ = std::make_shared<SpillChannelManager>(
-                options_.GetFileSystem(), options_.GetLocalSortMaxNumFileHandles());
-            PAIMON_ASSIGN_OR_RAISE(commit_channel_enumerator_,
-                                   io_manager_->CreateChannelEnumerator());
-        }
-        const CompressOptions& compression = options_.GetSpillCompressOptions();
-        PAIMON_ASSIGN_OR_RAISE(
-            commit_writer_, SpillWriter::Create(options_.GetFileSystem(), commit_schema_,
-                                                commit_channel_enumerator_, commit_channel_manager_,
-                                                compression.compress, compression.zstd_level,
-                                                enable_multi_thread_spill_, memory_pool_));
         return Status::OK();
     }
 
@@ -401,14 +327,15 @@ class PrimaryKeyMemIndexer::Impl {
             return Status::Invalid("segment was not created by the PK mem indexer");
         }
         arrow::FieldVector fields = {
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber()),
             DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())};
         fields.insert(fields.end(), write_schema_->fields().begin(), write_schema_->fields().end());
-        std::vector<int32_t> projection = {KeyValueProjectionConsumer::kValueKindProjection};
+        std::vector<int32_t> projection = {KeyValueProjectionConsumer::kSequenceNumberProjection,
+                                           KeyValueProjectionConsumer::kValueKindProjection};
         for (int32_t i = 0; i < write_schema_->num_fields(); ++i) {
             projection.push_back(i);
         }
-        return CreateReaders(typed->segments_, arrow::schema(fields), projection,
-                             ReaderMode::COMMIT);
+        return CreateReaders(typed->segments_, arrow::schema(fields), projection);
     }
 
     Result<std::shared_ptr<MemReadView>> AcquireReadView() {
@@ -467,27 +394,22 @@ class PrimaryKeyMemIndexer::Impl {
         output_fields.insert(output_fields.end(), requested_fields.begin(), requested_fields.end());
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<Segment>> selected,
                                SelectSegments(view, lower));
-        return CreateReaders(selected, arrow::schema(output_fields), projection, ReaderMode::QUERY);
+        return CreateReaders(selected, arrow::schema(output_fields), projection);
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateReaders(
         const std::vector<std::shared_ptr<Segment>>& segments,
-        const std::shared_ptr<arrow::Schema>& schema, const std::vector<int32_t>& projection,
-        ReaderMode mode) {
+        const std::shared_ptr<arrow::Schema>& schema, const std::vector<int32_t>& projection) {
         std::vector<std::unique_ptr<BatchReader>> result;
         result.reserve(segments.size());
-        for (const std::shared_ptr<Segment>& segment : segments) {
-            std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
-            if (mode == ReaderMode::COMMIT) {
-                PAIMON_ASSIGN_OR_RAISE(
-                    std::unique_ptr<SpillReader> commit_reader,
-                    SpillReader::Create(options_.GetFileSystem(), key_schema_, write_schema_,
-                                        enable_multi_thread_spill_,
-                                        segment->GetCommitFile()->channel_id_, memory_pool_));
-                readers.push_back(std::move(commit_reader));
-            } else {
-                PAIMON_ASSIGN_OR_RAISE(readers, segment->CreateReaders());
+        ScopeGuard reader_guard([&result]() {
+            for (const std::unique_ptr<BatchReader>& reader : result) {
+                reader->Close();
             }
+        });
+        for (const std::shared_ptr<Segment>& segment : segments) {
+            PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
+                                   segment->CreateReaders(merge_function_wrapper_factory_));
             for (std::unique_ptr<KeyValueRecordReader>& key_value_reader : readers) {
                 std::vector<std::unique_ptr<KeyValueRecordReader>> single_reader;
                 single_reader.push_back(std::move(key_value_reader));
@@ -498,6 +420,7 @@ class PrimaryKeyMemIndexer::Impl {
                 result.push_back(std::move(reader));
             }
         }
+        reader_guard.Release();
         return result;
     }
 
@@ -521,22 +444,16 @@ class PrimaryKeyMemIndexer::Impl {
     }
 
     std::shared_ptr<arrow::Schema> write_schema_;
-    std::shared_ptr<arrow::Schema> key_schema_ = arrow::schema({});
-    std::shared_ptr<arrow::Schema> commit_schema_ =
-        SpecialFields::CompleteSequenceAndValueKindField(write_schema_);
     std::vector<std::string> trimmed_primary_keys_;
     std::shared_ptr<FieldsComparator> key_comparator_;
-    std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper_;
+    std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>
+        merge_function_wrapper_factory_;
     CoreOptions options_;
     std::shared_ptr<IOManager> io_manager_;
     bool enable_multi_thread_spill_;
     std::shared_ptr<MemoryPool> memory_pool_;
-    std::unique_ptr<arrow::MemoryPool> arrow_pool_;
     mutable std::mutex mutex_;
     std::unique_ptr<WriteBuffer> building_;
-    std::shared_ptr<SpillChannelManager> commit_channel_manager_;
-    std::shared_ptr<FileIOChannel::Enumerator> commit_channel_enumerator_;
-    std::unique_ptr<SpillWriter> commit_writer_;
     std::optional<Range> building_offset_range_;
     std::vector<std::shared_ptr<Segment>> segments_;
     std::optional<int64_t> last_offset_;
@@ -547,14 +464,15 @@ Result<std::shared_ptr<PrimaryKeyMemIndexer>> PrimaryKeyMemIndexer::Create(
     const std::shared_ptr<arrow::Schema>& write_schema,
     const std::vector<std::string>& trimmed_primary_keys,
     const std::shared_ptr<FieldsComparator>& key_comparator,
-    const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
+    const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+        merge_function_wrapper_factory,
     int64_t restore_max_seq_number, const CoreOptions& options,
     const std::shared_ptr<IOManager>& io_manager, bool enable_multi_thread_spill,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     if (restore_max_seq_number == std::numeric_limits<int64_t>::max()) {
         return Status::Invalid("PK sequence number has reached INT64_MAX");
     }
-    if (trimmed_primary_keys.empty() || !key_comparator || !merge_function_wrapper) {
+    if (trimmed_primary_keys.empty() || !key_comparator || !merge_function_wrapper_factory) {
         return Status::Invalid("PK mem indexer requires primary keys and merge helpers");
     }
     if (!options.GetWriteBufferSpillable() || !io_manager) {
@@ -566,8 +484,8 @@ Result<std::shared_ptr<PrimaryKeyMemIndexer>> PrimaryKeyMemIndexer::Create(
         }
     }
     auto impl = std::make_unique<Impl>(write_schema, trimmed_primary_keys, key_comparator,
-                                       merge_function_wrapper, restore_max_seq_number + 1, options,
-                                       io_manager, enable_multi_thread_spill, memory_pool);
+                                       merge_function_wrapper_factory, restore_max_seq_number + 1,
+                                       options, io_manager, enable_multi_thread_spill, memory_pool);
     return std::shared_ptr<PrimaryKeyMemIndexer>(new PrimaryKeyMemIndexer(std::move(impl)));
 }
 

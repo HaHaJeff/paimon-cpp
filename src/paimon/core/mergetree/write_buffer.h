@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,6 +72,11 @@ class WriteBuffer {
     /// The caller should invoke Clear() after consuming the readers.
     /// @return list of KeyValueRecordReaders built from buffered data
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders();
+
+    /// Create readers with an independent merge function wrapper for each reader.
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders(
+        const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+            merge_function_wrapper_factory);
 
     /// Try to spill current buffered data. Return false when the call completed normally but the
     /// caller should fall back to FlushWriteBuffer before buffering more data.

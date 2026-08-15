@@ -30,6 +30,10 @@
 
 struct ArrowSchema;
 
+namespace arrow {
+class Schema;
+}
+
 namespace paimon {
 
 class FileSystem;
@@ -63,13 +67,17 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
  private:
     RealtimePrimaryKeyWriter(const std::shared_ptr<MemIndexer>& mem_indexer,
                              const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
-                             int64_t next_offset);
+                             const std::shared_ptr<arrow::Schema>& key_schema,
+                             const std::shared_ptr<arrow::Schema>& value_schema,
+                             const std::shared_ptr<MemoryPool>& memory_pool, int64_t next_offset);
 
-    Result<std::unique_ptr<RecordBatch>> ToMutationRecordBatch(BatchReader::ReadBatch&& batch);
     Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment);
 
     std::shared_ptr<MemIndexer> mem_indexer_;
     std::shared_ptr<MergeTreeWriter> merge_tree_writer_;
+    std::shared_ptr<arrow::Schema> key_schema_;
+    std::shared_ptr<arrow::Schema> value_schema_;
+    std::shared_ptr<MemoryPool> memory_pool_;
     int64_t next_offset_;
 };
 

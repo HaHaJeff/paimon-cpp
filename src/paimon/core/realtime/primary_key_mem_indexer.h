@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,7 +52,8 @@ class PrimaryKeyMemIndexer : public MemIndexer {
         const std::shared_ptr<arrow::Schema>& write_schema,
         const std::vector<std::string>& trimmed_primary_keys,
         const std::shared_ptr<FieldsComparator>& key_comparator,
-        const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
+        const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+            merge_function_wrapper_factory,
         int64_t restore_max_seq_number, const CoreOptions& options,
         const std::shared_ptr<IOManager>& io_manager, bool enable_multi_thread_spill,
         const std::shared_ptr<MemoryPool>& memory_pool);

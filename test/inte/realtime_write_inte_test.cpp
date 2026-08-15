@@ -48,7 +48,6 @@
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
-#include "paimon/core/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
 #include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/defs.h"
@@ -57,8 +56,8 @@
 #include "paimon/memory/memory_pool.h"
 #include "paimon/predicate/predicate_builder.h"
 #include "paimon/read_context.h"
+#include "paimon/realtime/arrow_mem_indexer_factory.h"
 #include "paimon/realtime/mem_indexer.h"
-#include "paimon/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/realtime/realtime_context.h"
 #include "paimon/record_batch.h"
 #include "paimon/scan_context.h"
@@ -110,35 +109,28 @@ class DelegatingMemIndexer : public MemIndexer {
     std::shared_ptr<MemIndexer> delegate_;
 };
 
-class DelegatingPrimaryKeyMemIndexerFactory : public PrimaryKeyMemIndexerFactory {
+class DelegatingMemIndexerFactory : public MemIndexerFactory {
  public:
-    DelegatingPrimaryKeyMemIndexerFactory(std::vector<std::string> trimmed_primary_keys,
-                                          const std::shared_ptr<FileSystem>& file_system,
-                                          std::string temp_directory,
-                                          bool enable_multi_thread_spill)
-        : delegate_(std::make_shared<ArrowPrimaryKeyMemIndexerFactory>(
-              std::move(trimmed_primary_keys), file_system, std::move(temp_directory),
-              enable_multi_thread_spill)) {}
+    struct CapturedRequest {
+        std::map<std::string, std::string> partition;
+        int32_t bucket;
+        MemIndexerCreateConfig mode_config;
+    };
 
-    Result<std::shared_ptr<MemIndexer>> Create(
-        std::unique_ptr<ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool,
-        const PrimaryKeyMemIndexerCreationContext& context) override {
+    Result<std::shared_ptr<MemIndexer>> Create(MemIndexerCreateRequest&& request) override {
         ++create_count;
-        contexts.push_back(context);
-        PAIMON_ASSIGN_OR_RAISE(
-            std::shared_ptr<MemIndexer> delegate,
-            delegate_->Create(std::move(write_schema), options, memory_pool, context));
+        requests.push_back(CapturedRequest{request.partition, request.bucket, request.mode_config});
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> delegate,
+                               delegate_.Create(std::move(request)));
         return std::shared_ptr<MemIndexer>(
             std::make_shared<DelegatingMemIndexer>(std::move(delegate)));
     }
 
     int32_t create_count = 0;
-    std::vector<PrimaryKeyMemIndexerCreationContext> contexts;
+    std::vector<CapturedRequest> requests;
 
  private:
-    std::shared_ptr<ArrowPrimaryKeyMemIndexerFactory> delegate_;
+    ArrowMemIndexerFactory delegate_;
 };
 
 class ConcurrentTestState {
@@ -1495,12 +1487,9 @@ TEST_F(RealtimeWriteInteTest, TestPkCustomFactoryRecoversBuckets) {
     ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
     ASSERT_OK(first_writer->Close());
 
-    auto factory = std::make_shared<DelegatingPrimaryKeyMemIndexerFactory>(
-        std::vector<std::string>{"id"}, dir_->GetFileSystem(),
-        PathUtil::JoinPath(dir_->Str(), "custom-spill"),
-        /*enable_multi_thread_spill=*/false);
+    auto factory = std::make_shared<DelegatingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> second_context,
-                         RealtimeContext::CreatePrimaryKey(factory));
+                         RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
                          CreateRealtimeWriter(second_context));
     ASSERT_OK_AND_ASSIGN(bucket0_batch,
@@ -1514,9 +1503,13 @@ TEST_F(RealtimeWriteInteTest, TestPkCustomFactoryRecoversBuckets) {
 
     ASSERT_EQ(2, factory->create_count);
     std::map<int32_t, int64_t> restored_sequences;
-    for (const PrimaryKeyMemIndexerCreationContext& context : factory->contexts) {
-        ASSERT_TRUE(context.partition.empty());
-        restored_sequences.emplace(context.bucket, context.restore_max_sequence_number);
+    for (const DelegatingMemIndexerFactory::CapturedRequest& request : factory->requests) {
+        ASSERT_TRUE(std::holds_alternative<PrimaryKeyMemIndexerCreateConfig>(request.mode_config));
+        const PrimaryKeyMemIndexerCreateConfig& primary_key_config =
+            std::get<PrimaryKeyMemIndexerCreateConfig>(request.mode_config);
+        ASSERT_EQ(std::vector<std::string>({"id"}), primary_key_config.primary_keys);
+        ASSERT_TRUE(request.partition.empty());
+        restored_sequences.emplace(request.bucket, primary_key_config.restore_max_sequence_number);
     }
     ASSERT_EQ(1, restored_sequences.at(0));
     ASSERT_EQ(2, restored_sequences.at(1));
@@ -1651,12 +1644,9 @@ TEST_F(RealtimeWriteInteTest, TestPkPartitionedWrites) {
 TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
-    auto factory = std::make_shared<DelegatingPrimaryKeyMemIndexerFactory>(
-        std::vector<std::string>{"id"}, dir_->GetFileSystem(),
-        PathUtil::JoinPath(dir_->Str(), "spill"),
-        /*enable_multi_thread_spill=*/false);
+    auto factory = std::make_shared<DelegatingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::CreatePrimaryKey(factory));
+                         RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
 
@@ -1708,6 +1698,161 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
     ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_only, ReadRows());
     ASSERT_EQ(expected, disk_only);
     ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkConcurrentRead) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    constexpr int32_t kReaderCount = 4;
+    std::atomic<int32_t> phase{0};
+    std::atomic<bool> done{false};
+    std::vector<int32_t> observed_phases(kReaderCount, 0);
+    std::vector<int32_t> read_counts(kReaderCount, 0);
+    ConcurrentTestState state;
+    const std::vector<Row> expected = {
+        {1, "v1", "p0"}, {3, "v0", "p0"}, {4, "v0", "p0"}, {5, "v1", "p0"}};
+
+    auto validate_rows = [&expected](std::vector<Row> rows) -> Status {
+        std::map<int64_t, std::string> values_by_id;
+        for (const Row& row : rows) {
+            const int64_t id = std::get<0>(row);
+            const std::string& payload = std::get<1>(row);
+            if (!values_by_id.emplace(id, payload).second) {
+                return Status::Invalid("duplicate primary key in concurrent PK read");
+            }
+            if (payload != "v0" && payload != "v1") {
+                return Status::Invalid("invalid versioned value in concurrent PK read");
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        if (rows != expected) {
+            return Status::Invalid("unexpected rows in concurrent PK read");
+        }
+        return Status::OK();
+    };
+
+    auto wait_for_readers = [&](int32_t expected_phase) -> bool {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.progress_cv.wait(lock, [&]() {
+            return state.ShouldStop() || std::all_of(observed_phases.begin(), observed_phases.end(),
+                                                     [expected_phase](int32_t observed) {
+                                                         return observed >= expected_phase;
+                                                     });
+        });
+        return !state.ShouldStop();
+    };
+
+    std::thread control_thread([&]() {
+        state.WaitForStart();
+        Result<std::unique_ptr<RecordBatch>> seed_batch = MakeBatch(
+            {Row{1, "v0", "p0"}, Row{2, "v0", "p0"}, Row{3, "v0", "p0"}, Row{4, "v0", "p0"}},
+            /*partitioned=*/false);
+        if (state.RecordErrorIfNotOk(seed_batch) ||
+            state.RecordErrorIfNotOk(writer->Write(std::move(seed_batch).value()))) {
+            return;
+        }
+        Result<std::vector<RealtimeCommitProgress>> seed_progress =
+            writer->PrepareCommitWithProgress(/*commit_identifier=*/0);
+        if (state.RecordErrorIfNotOk(seed_progress)) {
+            return;
+        }
+        Result<int64_t> seed_snapshot = Commit(seed_progress.value(), /*commit_identifier=*/0);
+        if (state.RecordErrorIfNotOk(seed_snapshot) ||
+            state.RecordErrorIfNotOk(writer->RefreshCommittedSnapshot(seed_snapshot.value()))) {
+            return;
+        }
+
+        Result<std::unique_ptr<RecordBatch>> mutation_batch =
+            MakeBatch({Row{1, "v1", "p0"}, Row{2, "v0", "p0"}, Row{5, "v1", "p0"}},
+                      /*partitioned=*/false, /*bucket=*/0,
+                      {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE,
+                       RecordBatch::RowKind::INSERT});
+        if (state.RecordErrorIfNotOk(mutation_batch) ||
+            state.RecordErrorIfNotOk(writer->Write(std::move(mutation_batch).value()))) {
+            return;
+        }
+        phase.store(1, std::memory_order_release);
+        state.progress_cv.notify_all();
+        if (!wait_for_readers(1)) {
+            return;
+        }
+
+        Result<std::vector<RealtimeCommitProgress>> progress =
+            writer->PrepareCommitWithProgress(/*commit_identifier=*/1);
+        if (state.RecordErrorIfNotOk(progress)) {
+            return;
+        }
+        Result<int64_t> committed_snapshot = Commit(progress.value(), /*commit_identifier=*/1);
+        if (state.RecordErrorIfNotOk(committed_snapshot)) {
+            return;
+        }
+        phase.store(2, std::memory_order_release);
+        state.progress_cv.notify_all();
+        if (!wait_for_readers(2)) {
+            return;
+        }
+
+        if (state.RecordErrorIfNotOk(
+                writer->RefreshCommittedSnapshot(committed_snapshot.value()))) {
+            return;
+        }
+        phase.store(3, std::memory_order_release);
+        state.progress_cv.notify_all();
+        if (!wait_for_readers(3) || state.RecordErrorIfNotOk(writer->Close())) {
+            return;
+        }
+        done.store(true, std::memory_order_release);
+        state.progress_cv.notify_all();
+    });
+
+    std::vector<std::thread> reader_threads;
+    reader_threads.reserve(kReaderCount);
+    for (int32_t reader_index = 0; reader_index < kReaderCount; ++reader_index) {
+        reader_threads.emplace_back([&, reader_index]() {
+            state.WaitForStart();
+            while (!done.load(std::memory_order_acquire) && !state.ShouldStop()) {
+                const int32_t read_phase = phase.load(std::memory_order_acquire);
+                if (read_phase == 0) {
+                    std::unique_lock<std::mutex> lock(state.mutex);
+                    state.progress_cv.wait(lock, [&]() {
+                        return phase.load(std::memory_order_acquire) > 0 || state.ShouldStop();
+                    });
+                    continue;
+                }
+                Result<std::vector<Row>> rows = ReadRows(realtime_context);
+                if (state.RecordErrorIfNotOk(rows) ||
+                    state.RecordErrorIfNotOk(validate_rows(std::move(rows).value()))) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    observed_phases[reader_index] =
+                        std::max(observed_phases[reader_index], read_phase);
+                    ++read_counts[reader_index];
+                }
+                state.progress_cv.notify_all();
+            }
+        });
+    }
+
+    state.StartWhenReady(kReaderCount + 1);
+    control_thread.join();
+    for (std::thread& reader_thread : reader_threads) {
+        reader_thread.join();
+    }
+
+    ASSERT_TRUE(state.Errors().empty()) << (state.Errors().empty() ? "" : state.Errors().front());
+    for (int32_t reader_index = 0; reader_index < kReaderCount; ++reader_index) {
+        ASSERT_EQ(3, observed_phases[reader_index]);
+        ASSERT_GT(read_counts[reader_index], 0);
+    }
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows());
+    ASSERT_OK(validate_rows(std::move(final_rows)));
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkProjectionAndPredicateOverDiskAndMemory) {

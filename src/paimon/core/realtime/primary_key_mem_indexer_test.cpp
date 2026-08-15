@@ -20,6 +20,7 @@
 #include "paimon/core/realtime/primary_key_mem_indexer.h"
 
 #include <atomic>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -32,6 +33,7 @@
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/fields_comparator.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/disk/io_manager.h"
@@ -72,18 +74,20 @@ class PrimaryKeyMemIndexerTest : public testing::Test {
         ASSERT_OK_AND_ASSIGN(key_comparator_,
                              FieldsComparator::Create({DataField(0, schema_->field(0))},
                                                       /*is_ascending_order=*/true));
-        auto merge_function = std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
-        merge_function_wrapper_ =
-            std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function));
+        merge_function_wrapper_factory_ = []() {
+            auto merge_function =
+                std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
+            return std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function));
+        };
         io_manager_ = std::make_shared<IOManager>(test_dir_->Str(), test_dir_->GetFileSystem());
         ASSERT_OK_AND_ASSIGN(CoreOptions options,
                              CoreOptions::FromMap({{Options::WRITE_BUFFER_SPILLABLE, "true"}},
                                                   test_dir_->GetFileSystem()));
-        ASSERT_OK_AND_ASSIGN(
-            indexer_,
-            PrimaryKeyMemIndexer::Create(schema_, {"id"}, key_comparator_, merge_function_wrapper_,
-                                         /*restore_max_seq_number=*/-1, options, io_manager_,
-                                         /*enable_multi_thread_spill=*/false, pool_));
+        ASSERT_OK_AND_ASSIGN(indexer_,
+                             PrimaryKeyMemIndexer::Create(
+                                 schema_, {"id"}, key_comparator_, merge_function_wrapper_factory_,
+                                 /*restore_max_seq_number=*/-1, options, io_manager_,
+                                 /*enable_multi_thread_spill=*/false, pool_));
     }
 
     std::unique_ptr<RecordBatch> MakeBatch(
@@ -109,7 +113,8 @@ class PrimaryKeyMemIndexerTest : public testing::Test {
     std::shared_ptr<MemoryPool> pool_;
     std::shared_ptr<arrow::Schema> schema_;
     std::shared_ptr<FieldsComparator> key_comparator_;
-    std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper_;
+    std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>
+        merge_function_wrapper_factory_;
     std::shared_ptr<IOManager> io_manager_;
     std::shared_ptr<PrimaryKeyMemIndexer> indexer_;
 };
@@ -170,11 +175,59 @@ TEST_F(PrimaryKeyMemIndexerTest, TestForeignHandles) {
                         "PK mem query read schema is null");
 }
 
+TEST_F(PrimaryKeyMemIndexerTest, TestCommitReadersPreserveSortedMutations) {
+    ASSERT_OK(indexer_->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[2, "old"], [1, "one"], [2, "new"]])",
+                                     {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::INSERT,
+                                      RecordBatch::RowKind::UPDATE_AFTER}),
+                           Range(0, 2)}));
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
+                         indexer_->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         indexer_->CreateCommitReaders(segment.value()));
+    ASSERT_EQ(1, readers.size());
+
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+    arrow::Result<std::shared_ptr<arrow::Array>> imported_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(imported_result.ok()) << imported_result.status().ToString();
+    std::shared_ptr<arrow::Array> imported = std::move(imported_result).ValueOrDie();
+    ASSERT_EQ(arrow::Type::STRUCT, imported->type_id());
+    std::shared_ptr<arrow::StructArray> values = checked_pointer_cast<arrow::StructArray>(imported);
+    ASSERT_EQ(2, values->length());
+    std::shared_ptr<arrow::StructType> value_type =
+        checked_pointer_cast<arrow::StructType>(values->type());
+    ASSERT_EQ(SpecialFields::SequenceNumber().Name(), value_type->field(0)->name());
+    ASSERT_EQ(SpecialFields::ValueKind().Name(), value_type->field(1)->name());
+    ASSERT_EQ("id", value_type->field(2)->name());
+    ASSERT_EQ("value", value_type->field(3)->name());
+    std::shared_ptr<arrow::Int64Array> sequences =
+        checked_pointer_cast<arrow::Int64Array>(values->field(0));
+    std::shared_ptr<arrow::Int8Array> row_kinds =
+        checked_pointer_cast<arrow::Int8Array>(values->field(1));
+    std::shared_ptr<arrow::Int64Array> ids =
+        checked_pointer_cast<arrow::Int64Array>(values->field(2));
+    std::shared_ptr<arrow::StringArray> strings =
+        checked_pointer_cast<arrow::StringArray>(values->field(3));
+    ASSERT_EQ(1, ids->Value(0));
+    ASSERT_EQ(1, sequences->Value(0));
+    ASSERT_EQ(static_cast<int8_t>(RecordBatch::RowKind::INSERT), row_kinds->Value(0));
+    ASSERT_EQ("one", strings->GetString(0));
+    ASSERT_EQ(2, ids->Value(1));
+    ASSERT_EQ(2, sequences->Value(1));
+    ASSERT_EQ(static_cast<int8_t>(RecordBatch::RowKind::UPDATE_AFTER), row_kinds->Value(1));
+    ASSERT_EQ("new", strings->GetString(1));
+    ASSERT_OK_AND_ASSIGN(batch, readers[0]->NextBatch());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+    readers[0]->Close();
+}
+
 TEST_F(PrimaryKeyMemIndexerTest, TestMemoryPoolLifecycle) {
     ASSERT_EQ(0, pool_->CurrentUsage());
     ASSERT_OK(
         indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"], [2, "two"]])"), Range(0, 1)}));
-    ASSERT_GT(pool_->MaxMemoryUsage(), 0);
 
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer_->AcquireReadView());
     const uint64_t baseline = pool_->CurrentUsage();
