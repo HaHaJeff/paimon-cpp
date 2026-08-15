@@ -47,7 +47,7 @@ class RealtimeContext::Impl {
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool) {
         return GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
-                                     memory_pool, factory_);
+                                     memory_pool, std::make_shared<ArrowMemIndexerFactory>());
     }
 
     Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
@@ -92,11 +92,13 @@ class RealtimeContext::Impl {
             }
             return RealtimeMemIndexerState{iter->second, initial_offset};
         }
-        if (!factory) {
+        const std::shared_ptr<MemIndexerFactory>& effective_factory = factory_ ? factory_ : factory;
+        if (!effective_factory) {
             return Status::Invalid("mem indexer factory is null");
         }
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer,
-                               factory->Create(std::move(write_schema), options, memory_pool));
+        PAIMON_ASSIGN_OR_RAISE(
+            std::shared_ptr<MemIndexer> indexer,
+            effective_factory->Create(std::move(write_schema), options, memory_pool));
         if (!indexer) {
             return Status::Invalid("mem indexer factory returned null");
         }
@@ -188,7 +190,7 @@ class RealtimeContext::Impl {
 };
 
 Result<std::shared_ptr<RealtimeContext>> RealtimeContext::Create() {
-    return Create(std::make_shared<ArrowMemIndexerFactory>());
+    return std::shared_ptr<RealtimeContext>(new RealtimeContext(std::make_unique<Impl>(nullptr)));
 }
 
 Result<std::shared_ptr<RealtimeContext>> RealtimeContext::Create(

@@ -35,7 +35,6 @@
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
-#include "paimon/core/realtime/primary_key_mem_indexer.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/reader/batch_reader.h"
@@ -61,7 +60,12 @@ class TestingReadView : public MemReadView {
 
 class TestingMemIndexer : public MemIndexer {
  public:
-    Status Write(RealtimeWriteBatch&&) override {
+    Status Write(RealtimeWriteBatch&& batch) override {
+        if (!offset_range) {
+            offset_range = batch.offset_range;
+        } else {
+            offset_range = Range(offset_range->from, batch.offset_range.to);
+        }
         return Status::OK();
     }
 
@@ -150,8 +154,7 @@ std::unique_ptr<RecordBatch> MakeWriteBatch(const std::string& json) {
 }
 
 Result<std::vector<int64_t>> ReadPrimaryKeyQuerySequences(
-    const std::shared_ptr<PrimaryKeyMemIndexer>& indexer,
-    const std::shared_ptr<MemReadView>& view) {
+    const std::shared_ptr<MemIndexer>& indexer, const std::shared_ptr<MemReadView>& view) {
     auto read_schema = std::make_unique<ArrowSchema>();
     std::shared_ptr<arrow::Schema> requested_schema =
         arrow::schema({DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber()),
@@ -296,22 +299,29 @@ TEST(RealtimeContextTest, TestRejectsNullCreatedIndexer) {
     ASSERT_EQ(state.indexer, views[0].indexer);
 }
 
-TEST(RealtimeContextTest, TestPrimaryKeyWriterRejectsCustomIndexer) {
+TEST(RealtimeContextTest, TestPrimaryKeyWriterUsesAndReusesCustomIndexer) {
     auto factory = std::make_shared<TestingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
                          RealtimeContext::Create(factory));
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
-    ASSERT_OK(
-        context->GetOrCreateMemIndexer(partition, 3, MakeWriteSchema(), {}, GetDefaultPool()));
-
-    Result<std::shared_ptr<RealtimePrimaryKeyWriter>> result = RealtimePrimaryKeyWriter::Create(
-        partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
-        /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
-        /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
-        /*restore_max_seq_number=*/-1);
-    ASSERT_TRUE(result.status().IsNotImplemented());
-    ASSERT_NOK_WITH_MSG(result, "PK realtime v1 supports only the built-in PrimaryKeyMemIndexer");
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<RealtimePrimaryKeyWriter> first_writer,
+        RealtimePrimaryKeyWriter::Create(
+            partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
+            /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
+            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
+            /*restore_max_seq_number=*/-1));
+    ASSERT_OK(first_writer->Write(MakeWriteBatch("[[1]]")));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<RealtimePrimaryKeyWriter> second_writer,
+        RealtimePrimaryKeyWriter::Create(
+            partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
+            /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
+            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
+            /*restore_max_seq_number=*/17));
     ASSERT_EQ(1, factory->create_count);
+    ASSERT_OK(second_writer->Write(MakeWriteBatch("[[2]]")));
+    ASSERT_EQ(std::optional<Range>(Range(0, 1)), factory->indexers[0]->offset_range);
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {
@@ -328,9 +338,7 @@ TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyWriterUsesBuiltInIndexerAndRestoresSequence) {
-    auto factory = std::make_shared<TestingMemIndexerFactory>();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
-                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
     std::unique_ptr<UniqueTestDirectory> temp_directory = UniqueTestDirectory::Create();
     ASSERT_OK_AND_ASSIGN(
         std::shared_ptr<RealtimePrimaryKeyWriter> writer,
@@ -344,12 +352,8 @@ TEST(RealtimeContextTest, TestPrimaryKeyWriterUsesBuiltInIndexerAndRestoresSeque
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
                          context->AcquireReadViews());
     ASSERT_EQ(1, views.size());
-    ASSERT_EQ(0, factory->create_count);
-    std::shared_ptr<PrimaryKeyMemIndexer> indexer =
-        std::dynamic_pointer_cast<PrimaryKeyMemIndexer>(views[0].indexer);
-    ASSERT_TRUE(indexer);
     ASSERT_OK_AND_ASSIGN(std::vector<int64_t> sequences,
-                         ReadPrimaryKeyQuerySequences(indexer, views[0].read_view));
+                         ReadPrimaryKeyQuerySequences(views[0].indexer, views[0].read_view));
     ASSERT_EQ(std::vector<int64_t>({8}), sequences);
     ASSERT_EQ(std::optional<Range>(Range(0, 0)), views[0].read_view->GetOffsetRange());
 }

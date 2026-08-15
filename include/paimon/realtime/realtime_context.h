@@ -93,7 +93,10 @@ struct PAIMON_EXPORT RealtimePartitionBucketView {
 /// process-local reads.
 class PAIMON_EXPORT RealtimeContext {
  public:
-    /// Creates a context backed by Paimon's default Arrow `MemIndexer`.
+    /// Creates a context with no application-provided indexer factory.
+    ///
+    /// Append-only writers use Paimon's default Arrow indexer, while primary-key writers supply
+    /// their primary-key indexer as the fallback.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 
     /// Creates a context backed by an application-provided indexer factory.

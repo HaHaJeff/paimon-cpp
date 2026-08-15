@@ -113,7 +113,8 @@ class PAIMON_EXPORT MemIndexer {
     ///
     /// Concatenating the returned readers must produce every sealed row exactly once and in write
     /// order. Each output batch contains `_VALUE_KIND` followed by all fields from the factory's
-    /// `write_schema`.
+    /// `write_schema`. A primary-key indexer must expose the raw mutation stream here, including
+    /// every update and delete; merge-on-read reduction belongs only to query readers.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -128,7 +129,10 @@ class PAIMON_EXPORT MemIndexer {
     ///
     /// Each output batch contains `_VALUE_KIND` first, followed by the fields requested by
     /// `context.read_schema` except a duplicate `_VALUE_KIND`. Concatenating all returned readers
-    /// must produce every matching row once.
+    /// must produce every matching row once. Primary-key readers must be sorted by primary key,
+    /// preserve `_VALUE_KIND` mutation metadata, include `_SEQUENCE_NUMBER` when requested, and
+    /// merge mutations within each memory segment so disk-memory merge-on-read can resolve the
+    /// latest update or delete correctly.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
         const MemQueryContext& context) = 0;
@@ -152,6 +156,9 @@ class PAIMON_EXPORT MemIndexerFactory {
     virtual ~MemIndexerFactory() = default;
 
     /// Creates an indexer configured with the supplied schema, options, and memory pool.
+    ///
+    /// For primary-key tables, an application factory is responsible for configuring the primary
+    /// keys, merge semantics, and the sequence number restored from committed files.
     /// @param write_schema Complete table write schema whose ownership is transferred to the
     /// factory. The factory may consume it or retain it in the created indexer.
     /// @param options Effective table options available to the indexer.

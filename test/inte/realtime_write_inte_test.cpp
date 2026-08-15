@@ -48,6 +48,7 @@
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
+#include "paimon/core/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
 #include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/defs.h"
@@ -67,6 +68,74 @@
 #include "paimon/write_context.h"
 
 namespace paimon::test {
+
+class DelegatingMemIndexer : public MemIndexer {
+ public:
+    explicit DelegatingMemIndexer(std::shared_ptr<MemIndexer> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    Status Write(RealtimeWriteBatch&& batch) override {
+        return delegate_->Write(std::move(batch));
+    }
+
+    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
+        return delegate_->SealForCommit();
+    }
+
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
+        const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
+        return delegate_->CreateCommitReaders(segment);
+    }
+
+    Result<std::shared_ptr<MemReadView>> AcquireReadView() override {
+        return delegate_->AcquireReadView();
+    }
+
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
+        const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
+        const MemQueryContext& context) override {
+        return delegate_->CreateQueryReaders(view, offset_lower_exclusive, context);
+    }
+
+    Status AdvanceCommittedOffset(int64_t committed_offset) override {
+        return delegate_->AdvanceCommittedOffset(committed_offset);
+    }
+
+    uint64_t GetMemoryUsage() const override {
+        return delegate_->GetMemoryUsage();
+    }
+
+ private:
+    std::shared_ptr<MemIndexer> delegate_;
+};
+
+class DelegatingPrimaryKeyMemIndexerFactory : public MemIndexerFactory {
+ public:
+    DelegatingPrimaryKeyMemIndexerFactory(std::vector<std::string> trimmed_primary_keys,
+                                          int64_t restore_max_seq_number,
+                                          const std::shared_ptr<FileSystem>& file_system,
+                                          std::string temp_directory,
+                                          bool enable_multi_thread_spill)
+        : delegate_(std::make_shared<PrimaryKeyMemIndexerFactory>(
+              std::move(trimmed_primary_keys), restore_max_seq_number, file_system,
+              std::move(temp_directory), enable_multi_thread_spill)) {}
+
+    Result<std::shared_ptr<MemIndexer>> Create(
+        std::unique_ptr<ArrowSchema> write_schema,
+        const std::map<std::string, std::string>& options,
+        const std::shared_ptr<MemoryPool>& memory_pool) override {
+        ++create_count;
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> delegate,
+                               delegate_->Create(std::move(write_schema), options, memory_pool));
+        return std::shared_ptr<MemIndexer>(
+            std::make_shared<DelegatingMemIndexer>(std::move(delegate)));
+    }
+
+    int32_t create_count = 0;
+
+ private:
+    std::shared_ptr<PrimaryKeyMemIndexerFactory> delegate_;
+};
 
 class ConcurrentTestState {
  public:
@@ -1516,8 +1585,12 @@ TEST_F(RealtimeWriteInteTest, TestPkPartitionedWrites) {
 TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
+    auto factory = std::make_shared<DelegatingPrimaryKeyMemIndexerFactory>(
+        std::vector<std::string>{"id"}, /*restore_max_seq_number=*/-1, dir_->GetFileSystem(),
+        PathUtil::JoinPath(dir_->Str(), "spill"),
+        /*enable_multi_thread_spill=*/false);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
+                         RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
 
@@ -1545,6 +1618,12 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
                          MakeBatch({Row{4, "latest", "p0"}}, /*partitioned=*/false,
                                    /*bucket=*/0, {RecordBatch::RowKind::UPDATE_AFTER}));
     ASSERT_OK(writer->Write(std::move(second_batch)));
+
+    ASSERT_EQ(1, factory->create_count);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
+                         realtime_context->AcquireReadViews());
+    ASSERT_EQ(1, views.size());
+    ASSERT_TRUE(std::dynamic_pointer_cast<DelegatingMemIndexer>(views[0].indexer));
 
     std::vector<Row> expected = {{1, "new", "p0"}, {2, "keep", "p0"}, {4, "latest", "p0"}};
     for (const char* sort_engine : {"loser-tree", "min-heap"}) {
