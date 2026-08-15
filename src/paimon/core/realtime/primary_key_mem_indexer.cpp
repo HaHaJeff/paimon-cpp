@@ -228,6 +228,9 @@ class ReadView : public MemReadView {
 }  // namespace
 
 class PrimaryKeyMemIndexer::Impl {
+ private:
+    enum class ReaderMode { COMMIT, QUERY };
+
  public:
     Impl(const std::shared_ptr<arrow::Schema>& write_schema,
          std::vector<std::string> trimmed_primary_keys,
@@ -404,7 +407,8 @@ class PrimaryKeyMemIndexer::Impl {
         for (int32_t i = 0; i < write_schema_->num_fields(); ++i) {
             projection.push_back(i);
         }
-        return CreateReaders(typed->segments_, arrow::schema(fields), projection);
+        return CreateReaders(typed->segments_, arrow::schema(fields), projection,
+                             ReaderMode::COMMIT);
     }
 
     Result<std::shared_ptr<MemReadView>> AcquireReadView() {
@@ -463,17 +467,18 @@ class PrimaryKeyMemIndexer::Impl {
         output_fields.insert(output_fields.end(), requested_fields.begin(), requested_fields.end());
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<Segment>> selected,
                                SelectSegments(view, lower));
-        return CreateReaders(selected, arrow::schema(output_fields), projection);
+        return CreateReaders(selected, arrow::schema(output_fields), projection, ReaderMode::QUERY);
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateReaders(
         const std::vector<std::shared_ptr<Segment>>& segments,
-        const std::shared_ptr<arrow::Schema>& schema, const std::vector<int32_t>& projection) {
+        const std::shared_ptr<arrow::Schema>& schema, const std::vector<int32_t>& projection,
+        ReaderMode mode) {
         std::vector<std::unique_ptr<BatchReader>> result;
         result.reserve(segments.size());
         for (const std::shared_ptr<Segment>& segment : segments) {
             std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
-            if (schema->GetFieldIndex(SpecialFields::SequenceNumber().Name()) < 0) {
+            if (mode == ReaderMode::COMMIT) {
                 PAIMON_ASSIGN_OR_RAISE(
                     std::unique_ptr<SpillReader> commit_reader,
                     SpillReader::Create(options_.GetFileSystem(), key_schema_, write_schema_,

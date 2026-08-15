@@ -68,13 +68,16 @@ class PrimaryKeyMemIndexerTest : public testing::Test {
                                          /*enable_multi_thread_spill=*/false, pool_));
     }
 
-    std::unique_ptr<RecordBatch> MakeBatch(const std::string& json) const {
+    std::unique_ptr<RecordBatch> MakeBatch(
+        const std::string& json, const std::vector<RecordBatch::RowKind>& row_kinds = {}) const {
         std::shared_ptr<arrow::Array> array =
             arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema_->fields()), json)
                 .ValueOrDie();
         ArrowArray c_array;
         EXPECT_TRUE(arrow::ExportArray(*array, &c_array).ok());
-        return RecordBatchBuilder(&c_array).Finish().value();
+        RecordBatchBuilder builder(&c_array);
+        builder.SetRowKinds(row_kinds);
+        return builder.Finish().value();
     }
 
     std::unique_ptr<ArrowSchema> MakeReadSchema() const {
@@ -120,17 +123,52 @@ TEST_F(PrimaryKeyMemIndexerTest, TestMemoryPoolLifecycle) {
         std::shared_ptr<arrow::StructArray> values =
             std::dynamic_pointer_cast<arrow::StructArray>(imported);
         ASSERT_TRUE(values);
-        std::shared_ptr<arrow::StructType> struct_type =
-            std::static_pointer_cast<arrow::StructType>(values->type());
-        ASSERT_EQ(3, values->num_fields());
-        ASSERT_EQ(SpecialFields::ValueKind().Name(), struct_type->field(0)->name());
-        ASSERT_EQ("id", struct_type->field(1)->name());
-        ASSERT_EQ("value", struct_type->field(2)->name());
     }
     readers[0]->Close();
     readers.clear();
     imported.reset();
     ASSERT_EQ(baseline, pool_->CurrentUsage());
+}
+
+TEST_F(PrimaryKeyMemIndexerTest, TestQueryReaderWithoutSequence) {
+    ASSERT_OK(indexer_->Write(RealtimeWriteBatch{
+        MakeBatch(R"([[1, "old"], [1, "new"], [2, "two"]])",
+                  {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::UPDATE_AFTER,
+                   RecordBatch::RowKind::INSERT}),
+        Range(0, 2)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer_->AcquireReadView());
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema();
+    MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                            /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::unique_ptr<BatchReader>> readers,
+        indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context));
+    ASSERT_EQ(1, readers.size());
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+    arrow::Result<std::shared_ptr<arrow::Array>> imported_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(imported_result.ok()) << imported_result.status();
+    std::shared_ptr<arrow::Array> imported = std::move(imported_result).ValueOrDie();
+    std::shared_ptr<arrow::StructArray> values =
+        std::dynamic_pointer_cast<arrow::StructArray>(imported);
+    ASSERT_TRUE(values);
+    ASSERT_EQ(2, values->length());
+    ASSERT_EQ(3, values->num_fields());
+    ASSERT_EQ(SpecialFields::ValueKind().Name(), values->type()->field(0)->name());
+    ASSERT_EQ("id", values->type()->field(1)->name());
+    ASSERT_EQ("value", values->type()->field(2)->name());
+    std::shared_ptr<arrow::Int64Array> ids =
+        std::dynamic_pointer_cast<arrow::Int64Array>(values->field(1));
+    std::shared_ptr<arrow::StringArray> payloads =
+        std::dynamic_pointer_cast<arrow::StringArray>(values->field(2));
+    ASSERT_TRUE(ids);
+    ASSERT_TRUE(payloads);
+    ASSERT_EQ(1, ids->Value(0));
+    ASSERT_EQ("new", payloads->GetString(0));
+    ASSERT_EQ(2, ids->Value(1));
+    ASSERT_EQ("two", payloads->GetString(1));
+    readers[0]->Close();
 }
 
 TEST_F(PrimaryKeyMemIndexerTest, TestConcurrentReaderReleaseAndWrite) {
