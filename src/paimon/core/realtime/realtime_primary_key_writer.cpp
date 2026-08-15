@@ -54,6 +54,7 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
     ScopeGuard schema_guard([schema = write_schema.get()]() { ArrowSchemaRelease(schema); });
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> value_schema,
                                       arrow::ImportSchema(write_schema.get()));
+    // ImportSchema consumes the C schema; re-export it for MemIndexerCreateRequest.
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*value_schema, write_schema.get()));
     arrow::FieldVector key_fields;
     key_fields.reserve(trimmed_primary_keys.size());

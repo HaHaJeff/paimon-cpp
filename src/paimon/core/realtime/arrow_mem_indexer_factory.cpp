@@ -74,6 +74,8 @@ Result<std::shared_ptr<MemIndexer>> ArrowMemIndexerFactory::Create(
     }
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FieldsComparator> key_comparator,
                            FieldsComparator::Create(key_fields, /*is_ascending_order=*/true));
+    // Segment-level pre-merge is valid for the currently supported deduplicate engine; revisit
+    // this before supporting non-deduplicate or aggregation engines.
     auto merge_function_wrapper_factory = []() {
         auto merge_function = std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
         return std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function));
