@@ -36,19 +36,18 @@
 
 namespace paimon {
 
-PrimaryKeyMemIndexerFactory::PrimaryKeyMemIndexerFactory(
-    std::vector<std::string> trimmed_primary_keys, int64_t restore_max_seq_number,
-    const std::shared_ptr<FileSystem>& file_system, std::string temp_directory,
-    bool enable_multi_thread_spill)
+ArrowPrimaryKeyMemIndexerFactory::ArrowPrimaryKeyMemIndexerFactory(
+    std::vector<std::string> trimmed_primary_keys, const std::shared_ptr<FileSystem>& file_system,
+    std::string temp_directory, bool enable_multi_thread_spill)
     : trimmed_primary_keys_(std::move(trimmed_primary_keys)),
-      restore_max_seq_number_(restore_max_seq_number),
       file_system_(file_system),
       temp_directory_(std::move(temp_directory)),
       enable_multi_thread_spill_(enable_multi_thread_spill) {}
 
-Result<std::shared_ptr<MemIndexer>> PrimaryKeyMemIndexerFactory::Create(
+Result<std::shared_ptr<MemIndexer>> ArrowPrimaryKeyMemIndexerFactory::Create(
     std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
+    const std::shared_ptr<MemoryPool>& memory_pool,
+    const PrimaryKeyMemIndexerCreationContext& context) {
     if (!write_schema || !write_schema->release) {
         return Status::Invalid("mem indexer write schema is null");
     }
@@ -75,11 +74,11 @@ Result<std::shared_ptr<MemIndexer>> PrimaryKeyMemIndexerFactory::Create(
     auto merge_function = std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
     auto merge_wrapper = std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function));
     auto io_manager = std::make_shared<IOManager>(temp_directory_, file_system_);
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<PrimaryKeyMemIndexer> indexer,
-        PrimaryKeyMemIndexer::Create(imported_schema, trimmed_primary_keys_, key_comparator,
-                                     merge_wrapper, restore_max_seq_number_, core_options,
-                                     io_manager, enable_multi_thread_spill_, memory_pool));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<PrimaryKeyMemIndexer> indexer,
+                           PrimaryKeyMemIndexer::Create(
+                               imported_schema, trimmed_primary_keys_, key_comparator,
+                               merge_wrapper, context.restore_max_sequence_number, core_options,
+                               io_manager, enable_multi_thread_spill_, memory_pool));
     return std::shared_ptr<MemIndexer>(std::move(indexer));
 }
 

@@ -81,10 +81,6 @@ struct PAIMON_EXPORT MemQueryContext {
     /// Predicate using field indexes from `read_schema`.
     std::shared_ptr<Predicate> predicate;
     /// Whether the plugin may use `predicate` to prune candidate rows.
-    ///
-    /// Keep this disabled for primary-key merge-on-read. Pruning memory before PK merge may remove
-    /// the newest row and incorrectly expose an older disk row. Exact predicate filtering, when
-    /// requested, is applied by the Paimon read framework after plugin reader creation.
     bool enable_predicate_pushdown;
 };
 
@@ -111,10 +107,9 @@ class PAIMON_EXPORT MemIndexer {
 
     /// Creates readers that expose all rows in a sealed segment for Paimon file writing.
     ///
-    /// Concatenating the returned readers must produce every sealed row exactly once and in write
-    /// order. Each output batch contains `_VALUE_KIND` followed by all fields from the factory's
-    /// `write_schema`. A primary-key indexer must expose the raw mutation stream here, including
-    /// every update and delete; merge-on-read reduction belongs only to query readers.
+    /// Concatenating the returned readers must reproduce the raw input stream for the sealed
+    /// segment exactly once and in write order, without combining or discarding rows. Each output
+    /// batch contains `_VALUE_KIND` followed by all fields from the factory's `write_schema`.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -129,10 +124,7 @@ class PAIMON_EXPORT MemIndexer {
     ///
     /// Each output batch contains `_VALUE_KIND` first, followed by the fields requested by
     /// `context.read_schema` except a duplicate `_VALUE_KIND`. Concatenating all returned readers
-    /// must produce every matching row once. Primary-key readers must be sorted by primary key,
-    /// preserve `_VALUE_KIND` mutation metadata, include `_SEQUENCE_NUMBER` when requested, and
-    /// merge mutations within each memory segment so disk-memory merge-on-read can resolve the
-    /// latest update or delete correctly.
+    /// must produce every matching row once.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
         const MemQueryContext& context) = 0;
@@ -157,11 +149,9 @@ class PAIMON_EXPORT MemIndexerFactory {
 
     /// Creates an indexer configured with the supplied schema, options, and memory pool.
     ///
-    /// For primary-key tables, an application factory is responsible for configuring the primary
-    /// keys, merge semantics, and the sequence number restored from committed files.
-    /// @param write_schema Complete table write schema whose ownership is transferred to the
-    /// factory. The factory may consume it or retain it in the created indexer.
-    /// @param options Effective table options available to the indexer.
+    /// @param write_schema Complete write schema whose ownership is transferred to the factory.
+    /// The factory may consume it or retain it in the created indexer.
+    /// @param options Effective options available to the indexer.
     /// @param memory_pool Memory pool provided by the write context.
     virtual Result<std::shared_ptr<MemIndexer>> Create(
         std::unique_ptr<::ArrowSchema> write_schema,

@@ -50,13 +50,12 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
     if (!realtime_context) {
         return Status::Invalid("PK real-time context is null");
     }
-    auto factory = std::make_shared<PrimaryKeyMemIndexerFactory>(
-        trimmed_primary_keys, restore_max_seq_number, file_system, temp_directory,
-        enable_multi_thread_spill);
-    PAIMON_ASSIGN_OR_RAISE(
-        RealtimeMemIndexerState indexer_state,
-        realtime_context->GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
-                                                memory_pool, factory));
+    auto factory = std::make_shared<ArrowPrimaryKeyMemIndexerFactory>(
+        trimmed_primary_keys, file_system, temp_directory, enable_multi_thread_spill);
+    PAIMON_ASSIGN_OR_RAISE(RealtimeMemIndexerState indexer_state,
+                           realtime_context->GetOrCreatePrimaryKeyMemIndexer(
+                               partition, bucket, std::move(write_schema), options, memory_pool,
+                               factory, restore_max_seq_number));
     return std::shared_ptr<RealtimePrimaryKeyWriter>(new RealtimePrimaryKeyWriter(
         indexer_state.indexer, merge_tree_writer, indexer_state.initial_offset));
 }

@@ -44,6 +44,24 @@
 
 namespace paimon::test {
 
+namespace {
+
+class ForeignSegment : public RealtimeSegmentHandle {
+ public:
+    Range GetOffsetRange() const override {
+        return Range(0, 0);
+    }
+};
+
+class ForeignReadView : public MemReadView {
+ public:
+    std::optional<Range> GetOffsetRange() const override {
+        return Range(0, 0);
+    }
+};
+
+}  // namespace
+
 class PrimaryKeyMemIndexerTest : public testing::Test {
  public:
     void SetUp() override {
@@ -95,6 +113,62 @@ class PrimaryKeyMemIndexerTest : public testing::Test {
     std::shared_ptr<IOManager> io_manager_;
     std::shared_ptr<PrimaryKeyMemIndexer> indexer_;
 };
+
+TEST_F(PrimaryKeyMemIndexerTest, TestWriteAndSeal) {
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> empty_segment,
+                         indexer_->SealForCommit());
+    ASSERT_FALSE(empty_segment.has_value());
+
+    ASSERT_NOK_WITH_MSG(indexer_->Write(RealtimeWriteBatch{nullptr, Range(0, 0)}),
+                        "write batch is null");
+    ASSERT_NOK_WITH_MSG(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[0, "a"], [1, "b"]])"), Range(0, 0)}),
+        "offset range does not match batch row count");
+
+    ASSERT_OK(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[0, "a"], [1, "b"]])"), Range(0, 1)}));
+    ASSERT_NOK_WITH_MSG(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[3, "d"], [4, "e"]])"), Range(3, 4)}),
+        "offset ranges must be contiguous");
+    ASSERT_OK(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[2, "c"], [3, "d"]])"), Range(2, 3)}));
+
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
+                         indexer_->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_EQ(Range(0, 3), segment.value()->GetOffsetRange());
+    ASSERT_OK_AND_ASSIGN(empty_segment, indexer_->SealForCommit());
+    ASSERT_FALSE(empty_segment.has_value());
+
+    ASSERT_GT(indexer_->GetMemoryUsage(), 0);
+}
+
+TEST_F(PrimaryKeyMemIndexerTest, TestForeignHandles) {
+    ASSERT_OK(
+        indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"], [2, "two"]])"), Range(0, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
+                         indexer_->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> commit_readers,
+                         indexer_->CreateCommitReaders(segment.value()));
+    ASSERT_EQ(1, commit_readers.size());
+    commit_readers[0]->Close();
+
+    ASSERT_NOK_WITH_MSG(indexer_->CreateCommitReaders(std::make_shared<ForeignSegment>()),
+                        "segment was not created by the PK mem indexer");
+
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema();
+    MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                            /*enable_predicate_pushdown=*/false};
+    ASSERT_NOK_WITH_MSG(indexer_->CreateQueryReaders(std::make_shared<ForeignReadView>(),
+                                                     /*offset_lower_exclusive=*/-1, context),
+                        "read view was not created by the PK mem indexer");
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer_->AcquireReadView());
+    context.read_schema = nullptr;
+    ASSERT_NOK_WITH_MSG(indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context),
+                        "PK mem query read schema is null");
+}
 
 TEST_F(PrimaryKeyMemIndexerTest, TestMemoryPoolLifecycle) {
     ASSERT_EQ(0, pool_->CurrentUsage());

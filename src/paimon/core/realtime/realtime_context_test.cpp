@@ -39,6 +39,7 @@
 #include "paimon/memory/memory_pool.h"
 #include "paimon/reader/batch_reader.h"
 #include "paimon/realtime/mem_indexer.h"
+#include "paimon/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/record_batch.h"
 #include "paimon/testing/utils/testharness.h"
 
@@ -133,6 +134,23 @@ class TestingMemIndexerFactory : public MemIndexerFactory {
     int32_t create_count = 0;
     std::optional<Status> create_error;
     bool return_null = false;
+    std::vector<std::shared_ptr<TestingMemIndexer>> indexers;
+};
+
+class TestingPrimaryKeyMemIndexerFactory : public PrimaryKeyMemIndexerFactory {
+ public:
+    Result<std::shared_ptr<MemIndexer>> Create(
+        std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>&,
+        const std::shared_ptr<MemoryPool>&,
+        const PrimaryKeyMemIndexerCreationContext& context) override {
+        ArrowSchemaRelease(write_schema.get());
+        contexts.push_back(context);
+        auto indexer = std::make_shared<TestingMemIndexer>();
+        indexers.push_back(indexer);
+        return indexer;
+    }
+
+    std::vector<PrimaryKeyMemIndexerCreationContext> contexts;
     std::vector<std::shared_ptr<TestingMemIndexer>> indexers;
 };
 
@@ -300,9 +318,9 @@ TEST(RealtimeContextTest, TestRejectsNullCreatedIndexer) {
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyWriterUsesAndReusesCustomIndexer) {
-    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    auto factory = std::make_shared<TestingPrimaryKeyMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
-                         RealtimeContext::Create(factory));
+                         RealtimeContext::CreatePrimaryKey(factory));
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
     ASSERT_OK_AND_ASSIGN(
         std::shared_ptr<RealtimePrimaryKeyWriter> first_writer,
@@ -319,9 +337,26 @@ TEST(RealtimeContextTest, TestPrimaryKeyWriterUsesAndReusesCustomIndexer) {
             /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
             /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
             /*restore_max_seq_number=*/17));
-    ASSERT_EQ(1, factory->create_count);
+    ASSERT_EQ(1, factory->contexts.size());
+    ASSERT_EQ(partition, factory->contexts[0].partition);
+    ASSERT_EQ(3, factory->contexts[0].bucket);
+    ASSERT_EQ(-1, factory->contexts[0].restore_max_sequence_number);
     ASSERT_OK(second_writer->Write(MakeWriteBatch("[[2]]")));
     ASSERT_EQ(std::optional<Range>(Range(0, 1)), factory->indexers[0]->offset_range);
+}
+
+TEST(RealtimeContextTest, TestGenericFactoryCannotCreatePrimaryKeyIndexer) {
+    auto factory = std::make_shared<TestingMemIndexerFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
+                         RealtimeContext::Create(factory));
+    ASSERT_NOK_WITH_MSG(
+        RealtimePrimaryKeyWriter::Create(
+            /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"},
+            context, /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
+            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
+            /*restore_max_seq_number=*/-1),
+        "generic mem indexer factory cannot create primary-key indexers");
+    ASSERT_EQ(0, factory->create_count);
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {
@@ -437,8 +472,10 @@ TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
 }
 
 TEST(RealtimeContextTest, TestRejectsNullFactory) {
-    ASSERT_NOK_WITH_MSG(RealtimeContext::Create(/*factory=*/nullptr),
-                        "mem indexer factory is null");
+    ASSERT_NOK_WITH_MSG(RealtimeContext::Create(nullptr), "mem indexer factory is null");
+    ASSERT_NOK_WITH_MSG(RealtimeContext::CreatePrimaryKey(
+                            std::shared_ptr<PrimaryKeyMemIndexerFactory>(/*factory=*/nullptr)),
+                        "primary-key mem indexer factory is null");
 }
 
 }  // namespace

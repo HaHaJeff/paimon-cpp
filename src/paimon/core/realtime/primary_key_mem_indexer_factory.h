@@ -19,32 +19,30 @@
 
 #pragma once
 
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "paimon/realtime/mem_indexer.h"
+#include "paimon/realtime/primary_key_mem_indexer_factory.h"
 
 namespace paimon {
 
 class FileSystem;
 
-class PrimaryKeyMemIndexerFactory final : public MemIndexerFactory {
+class ArrowPrimaryKeyMemIndexerFactory final : public PrimaryKeyMemIndexerFactory {
  public:
-    PrimaryKeyMemIndexerFactory(std::vector<std::string> trimmed_primary_keys,
-                                int64_t restore_max_seq_number,
-                                const std::shared_ptr<FileSystem>& file_system,
-                                std::string temp_directory, bool enable_multi_thread_spill);
+    ArrowPrimaryKeyMemIndexerFactory(std::vector<std::string> trimmed_primary_keys,
+                                     const std::shared_ptr<FileSystem>& file_system,
+                                     std::string temp_directory, bool enable_multi_thread_spill);
 
     Result<std::shared_ptr<MemIndexer>> Create(
         std::unique_ptr<::ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool) override;
+        const std::shared_ptr<MemoryPool>& memory_pool,
+        const PrimaryKeyMemIndexerCreationContext& context) override;
 
  private:
     const std::vector<std::string> trimmed_primary_keys_;
-    const int64_t restore_max_seq_number_;
     const std::shared_ptr<FileSystem> file_system_;
     const std::string temp_directory_;
     const bool enable_multi_thread_spill_;

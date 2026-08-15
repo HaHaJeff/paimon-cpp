@@ -37,6 +37,7 @@ class MemIndexer;
 class MemIndexerFactory;
 class MemReadView;
 class MemoryPool;
+class PrimaryKeyMemIndexerFactory;
 class RealtimePrimaryKeyWriter;
 
 /// Identifies one partition-bucket by its logical partition values.
@@ -99,11 +100,18 @@ class PAIMON_EXPORT RealtimeContext {
     /// their primary-key indexer as the fallback.
     static Result<std::shared_ptr<RealtimeContext>> Create();
 
-    /// Creates a context backed by an application-provided indexer factory.
+    /// Creates a context backed by an application-provided append indexer factory.
     ///
     /// @param factory Non-null factory used to create indexers on demand.
     static Result<std::shared_ptr<RealtimeContext>> Create(
         const std::shared_ptr<MemIndexerFactory>& factory);
+
+    /// Creates a context backed by an application-provided primary-key indexer factory.
+    ///
+    /// The factory receives the partition, bucket, and restored sequence number for every
+    /// indexer it creates.
+    static Result<std::shared_ptr<RealtimeContext>> CreatePrimaryKey(
+        const std::shared_ptr<PrimaryKeyMemIndexerFactory>& factory);
 
     /// Returns the stable indexer and next writable offset associated with a partition-bucket.
     ///
@@ -137,15 +145,18 @@ class PAIMON_EXPORT RealtimeContext {
     friend class RealtimePrimaryKeyWriter;
 
     class Impl;
+    template <typename Factory>
+    class FactoryImpl;
 
     explicit RealtimeContext(std::unique_ptr<Impl>&& impl);
 
-    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
+    Result<RealtimeMemIndexerState> GetOrCreatePrimaryKeyMemIndexer(
         const std::map<std::string, std::string>& partition, int32_t bucket,
         std::unique_ptr<::ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<MemoryPool>& memory_pool,
-        const std::shared_ptr<MemIndexerFactory>& factory);
+        const std::shared_ptr<PrimaryKeyMemIndexerFactory>& factory,
+        int64_t restore_max_sequence_number);
 
     std::unique_ptr<Impl> impl_;
 };

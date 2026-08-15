@@ -58,6 +58,7 @@
 #include "paimon/predicate/predicate_builder.h"
 #include "paimon/read_context.h"
 #include "paimon/realtime/mem_indexer.h"
+#include "paimon/realtime/primary_key_mem_indexer_factory.h"
 #include "paimon/realtime/realtime_context.h"
 #include "paimon/record_batch.h"
 #include "paimon/scan_context.h"
@@ -109,32 +110,35 @@ class DelegatingMemIndexer : public MemIndexer {
     std::shared_ptr<MemIndexer> delegate_;
 };
 
-class DelegatingPrimaryKeyMemIndexerFactory : public MemIndexerFactory {
+class DelegatingPrimaryKeyMemIndexerFactory : public PrimaryKeyMemIndexerFactory {
  public:
     DelegatingPrimaryKeyMemIndexerFactory(std::vector<std::string> trimmed_primary_keys,
-                                          int64_t restore_max_seq_number,
                                           const std::shared_ptr<FileSystem>& file_system,
                                           std::string temp_directory,
                                           bool enable_multi_thread_spill)
-        : delegate_(std::make_shared<PrimaryKeyMemIndexerFactory>(
-              std::move(trimmed_primary_keys), restore_max_seq_number, file_system,
-              std::move(temp_directory), enable_multi_thread_spill)) {}
+        : delegate_(std::make_shared<ArrowPrimaryKeyMemIndexerFactory>(
+              std::move(trimmed_primary_keys), file_system, std::move(temp_directory),
+              enable_multi_thread_spill)) {}
 
     Result<std::shared_ptr<MemIndexer>> Create(
         std::unique_ptr<ArrowSchema> write_schema,
         const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool) override {
+        const std::shared_ptr<MemoryPool>& memory_pool,
+        const PrimaryKeyMemIndexerCreationContext& context) override {
         ++create_count;
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> delegate,
-                               delegate_->Create(std::move(write_schema), options, memory_pool));
+        contexts.push_back(context);
+        PAIMON_ASSIGN_OR_RAISE(
+            std::shared_ptr<MemIndexer> delegate,
+            delegate_->Create(std::move(write_schema), options, memory_pool, context));
         return std::shared_ptr<MemIndexer>(
             std::make_shared<DelegatingMemIndexer>(std::move(delegate)));
     }
 
     int32_t create_count = 0;
+    std::vector<PrimaryKeyMemIndexerCreationContext> contexts;
 
  private:
-    std::shared_ptr<PrimaryKeyMemIndexerFactory> delegate_;
+    std::shared_ptr<ArrowPrimaryKeyMemIndexerFactory> delegate_;
 };
 
 class ConcurrentTestState {
@@ -1471,6 +1475,68 @@ TEST_F(RealtimeWriteInteTest, TestPkRecoversLatestSnapshot) {
     ASSERT_EQ(2, second_offsets.at(partition_bucket));
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkCustomFactoryRecoversBuckets) {
+    options_[Options::BUCKET] = "2";
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer, CreateRealtimeWriter());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> bucket0_batch,
+                         MakeBatch({Row{1, "old-1", "p0"}, Row{2, "old-2", "p0"}},
+                                   /*partitioned=*/false, /*bucket=*/0));
+    ASSERT_OK(first_writer->Write(std::move(bucket0_batch)));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> bucket1_batch,
+        MakeBatch({Row{10, "old-10", "p0"}, Row{11, "old-11", "p0"}, Row{12, "old-12", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/1));
+    ASSERT_OK(first_writer->Write(std::move(bucket1_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
+                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
+    ASSERT_OK(first_writer->Close());
+
+    auto factory = std::make_shared<DelegatingPrimaryKeyMemIndexerFactory>(
+        std::vector<std::string>{"id"}, dir_->GetFileSystem(),
+        PathUtil::JoinPath(dir_->Str(), "custom-spill"),
+        /*enable_multi_thread_spill=*/false);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> second_context,
+                         RealtimeContext::CreatePrimaryKey(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
+                         CreateRealtimeWriter(second_context));
+    ASSERT_OK_AND_ASSIGN(bucket0_batch,
+                         MakeBatch({Row{1, "new-1", "p0"}}, /*partitioned=*/false, /*bucket=*/0,
+                                   {RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(second_writer->Write(std::move(bucket0_batch)));
+    ASSERT_OK_AND_ASSIGN(bucket1_batch,
+                         MakeBatch({Row{10, "new-10", "p0"}}, /*partitioned=*/false, /*bucket=*/1,
+                                   {RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(second_writer->Write(std::move(bucket1_batch)));
+
+    ASSERT_EQ(2, factory->create_count);
+    std::map<int32_t, int64_t> restored_sequences;
+    for (const PrimaryKeyMemIndexerCreationContext& context : factory->contexts) {
+        ASSERT_TRUE(context.partition.empty());
+        restored_sequences.emplace(context.bucket, context.restore_max_sequence_number);
+    }
+    ASSERT_EQ(1, restored_sequences.at(0));
+    ASSERT_EQ(2, restored_sequences.at(1));
+
+    std::vector<Row> expected = {{1, "new-1", "p0"},
+                                 {2, "old-2", "p0"},
+                                 {10, "new-10", "p0"},
+                                 {11, "old-11", "p0"},
+                                 {12, "old-12", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> realtime_rows, ReadRows(second_context));
+    ASSERT_EQ(expected, realtime_rows);
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
+                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_OK(Commit(second_progress, /*commit_identifier=*/1));
+    ASSERT_OK(second_writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_rows, ReadRows());
+    ASSERT_EQ(expected, disk_rows);
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkMultipleBuckets) {
     options_[Options::BUCKET] = "2";
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
@@ -1586,11 +1652,11 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
     auto factory = std::make_shared<DelegatingPrimaryKeyMemIndexerFactory>(
-        std::vector<std::string>{"id"}, /*restore_max_seq_number=*/-1, dir_->GetFileSystem(),
+        std::vector<std::string>{"id"}, dir_->GetFileSystem(),
         PathUtil::JoinPath(dir_->Str(), "spill"),
         /*enable_multi_thread_spill=*/false);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create(factory));
+                         RealtimeContext::CreatePrimaryKey(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
 
