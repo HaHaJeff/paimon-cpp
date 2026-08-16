@@ -36,7 +36,7 @@ namespace paimon {
 class CoreOptions;
 class FieldsComparator;
 class IOManager;
-class KeyValue;
+struct KeyValue;
 class MemoryPool;
 template <typename T>
 class MergeFunctionWrapper;
