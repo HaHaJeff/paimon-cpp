@@ -119,6 +119,10 @@ struct PAIMON_EXPORT MemQueryContext {
     /// Predicate using field indexes from `read_schema`.
     std::shared_ptr<Predicate> predicate;
     /// Whether the plugin may use `predicate` to prune candidate rows.
+    ///
+    /// Keep this disabled for primary-key merge-on-read. Pruning memory before PK merge may remove
+    /// the newest row and incorrectly expose an older disk row. Exact predicate filtering, when
+    /// requested, is applied by the Paimon read framework after plugin reader creation.
     bool enable_predicate_pushdown;
 };
 

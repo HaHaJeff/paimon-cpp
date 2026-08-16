@@ -18,14 +18,9 @@
 
 #include "paimon/core/mergetree/spill_channel_manager.h"
 
-#include <atomic>
 #include <memory>
-#include <thread>
-#include <vector>
 
 #include "gtest/gtest.h"
-#include "paimon/common/factories/io_hook.h"
-#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/disk/io_manager.h"
 #include "paimon/testing/utils/testharness.h"
 
@@ -63,47 +58,10 @@ TEST_F(SpillChannelManagerTest, AddAndGetChannels) {
     manager.AddChannel(channel1);
     manager.AddChannel(channel2);
 
-    const auto channels = manager.GetChannels();
+    const auto& channels = manager.GetChannels();
     ASSERT_EQ(channels.size(), 2);
     ASSERT_GT(channels.count(channel1), 0);
     ASSERT_GT(channels.count(channel2), 0);
-}
-
-TEST_F(SpillChannelManagerTest, ConcurrentAddAndDelete) {
-    SpillChannelManager manager(file_system_, 128);
-    std::vector<FileIOChannel::ID> deleted_channels;
-    std::vector<FileIOChannel::ID> added_channels;
-    for (int32_t i = 0; i < 64; ++i) {
-        deleted_channels.push_back(CreateTempFile());
-        added_channels.push_back(CreateTempFile());
-        manager.AddChannel(deleted_channels.back());
-    }
-
-    std::atomic<bool> start = false;
-    std::thread deleting([&]() {
-        while (!start.load()) {
-        }
-        for (const FileIOChannel::ID& channel : deleted_channels) {
-            EXPECT_OK(manager.DeleteChannel(channel));
-        }
-    });
-    std::thread adding([&]() {
-        while (!start.load()) {
-        }
-        for (const FileIOChannel::ID& channel : added_channels) {
-            manager.AddChannel(channel);
-        }
-    });
-    start.store(true);
-    deleting.join();
-    adding.join();
-
-    const auto channels = manager.GetChannels();
-    ASSERT_EQ(added_channels.size(), channels.size());
-    for (const FileIOChannel::ID& channel : added_channels) {
-        ASSERT_EQ(1, channels.count(channel));
-    }
-    manager.Reset();
 }
 
 TEST_F(SpillChannelManagerTest, DeleteChannelRemovesFileAndEntry) {
@@ -147,26 +105,6 @@ TEST_F(SpillChannelManagerTest, ResetDeletesAllFiles) {
     ASSERT_FALSE(a1);
     ASSERT_FALSE(a2);
     ASSERT_FALSE(a3);
-}
-
-TEST_F(SpillChannelManagerTest, DestructorRetriesFailedDeleteAfterLastOwner) {
-    auto manager = std::make_shared<SpillChannelManager>(file_system_, 1);
-    FileIOChannel::ID channel = CreateTempFile();
-    manager->AddChannel(channel);
-    std::shared_ptr<SpillChannelManager> segment_owner = manager;
-
-    IOHook* io_hook = IOHook::GetInstance();
-    ScopeGuard hook_guard([io_hook]() { io_hook->Clear(); });
-    io_hook->Reset(/*pos=*/0, IOHook::Mode::RETURN_ERROR);
-    ASSERT_NOK(manager->DeleteChannel(channel));
-    io_hook->Clear();
-
-    manager.reset();
-    ASSERT_OK_AND_ASSIGN(bool exists_while_owned, file_system_->Exists(channel.GetPath()));
-    ASSERT_TRUE(exists_while_owned);
-    segment_owner.reset();
-    ASSERT_OK_AND_ASSIGN(bool exists_after_finalize, file_system_->Exists(channel.GetPath()));
-    ASSERT_FALSE(exists_after_finalize);
 }
 
 }  // namespace paimon::test

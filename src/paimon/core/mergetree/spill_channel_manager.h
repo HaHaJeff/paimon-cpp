@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include <mutex>
 #include <unordered_set>
 
 #include "paimon/core/disk/file_io_channel.h"
@@ -33,41 +32,28 @@ class SpillChannelManager {
         channels_.reserve(initial_capacity);
     }
 
-    ~SpillChannelManager() {
-        Reset();
-    }
-
     void AddChannel(const FileIOChannel::ID& channel_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
         channels_.emplace(channel_id);
     }
 
     Status DeleteChannel(const FileIOChannel::ID& channel_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
         PAIMON_RETURN_NOT_OK(fs_->Delete(channel_id.GetPath()));
         channels_.erase(channel_id);
         return Status::OK();
     }
 
     void Reset() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto iter = channels_.begin(); iter != channels_.end();) {
-            Status status = fs_->Delete(iter->GetPath());
-            if (status.ok()) {
-                iter = channels_.erase(iter);
-            } else {
-                ++iter;
-            }
+        for (const auto& channel : channels_) {
+            [[maybe_unused]] auto status = fs_->Delete(channel.GetPath());
         }
+        channels_.clear();
     }
 
-    std::unordered_set<FileIOChannel::ID, FileIOChannel::ID::Hash> GetChannels() const {
-        std::lock_guard<std::mutex> lock(mutex_);
+    const std::unordered_set<FileIOChannel::ID, FileIOChannel::ID::Hash>& GetChannels() const {
         return channels_;
     }
 
  private:
-    mutable std::mutex mutex_;
     std::unordered_set<FileIOChannel::ID, FileIOChannel::ID::Hash> channels_;
     std::shared_ptr<FileSystem> fs_;
 };

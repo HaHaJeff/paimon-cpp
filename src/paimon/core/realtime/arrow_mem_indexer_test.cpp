@@ -27,6 +27,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/ipc/json_simple.h"
+#include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/core/core_options.h"
 #include "paimon/memory/memory_pool.h"
@@ -244,6 +245,7 @@ TEST_F(ArrowMemIndexerTest, TestFactoryCreatesAppendAndPrimaryKeyIndexers) {
                          append_indexer->CreateCommitReaders(append_segment.value()));
     ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch append_batch, append_readers[0]->NextBatch());
     ASSERT_EQ(3, append_batch.second->n_children);
+    ReaderUtils::ReleaseReadBatch(std::move(append_batch));
     append_readers[0]->Close();
 
     std::unique_ptr<UniqueTestDirectory> temp_directory = UniqueTestDirectory::Create();
@@ -272,6 +274,7 @@ TEST_F(ArrowMemIndexerTest, TestFactoryCreatesAppendAndPrimaryKeyIndexers) {
                          primary_key_readers[0]->NextBatch());
     ASSERT_EQ(4, primary_key_batch.second->n_children);
     ASSERT_STREQ("_SEQUENCE_NUMBER", primary_key_batch.second->children[0]->name);
+    ReaderUtils::ReleaseReadBatch(std::move(primary_key_batch));
     primary_key_readers[0]->Close();
 }
 

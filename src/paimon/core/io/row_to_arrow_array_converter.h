@@ -64,14 +64,6 @@ class RowToArrowArrayConverter {
     Status Reserve(arrow::ArrayBuilder* array_builder, int32_t* idx);
 
  private:
-    struct ExportedArrayPrivateData {
-        void (*release)(ArrowArray*);
-        void* private_data;
-        std::shared_ptr<arrow::MemoryPool> arrow_pool;
-    };
-
-    static void ReleaseExportedArray(ArrowArray* array);
-
     template <typename BuilderType>
     static Result<BuilderType*> CastToTypedBuilder(arrow::ArrayBuilder* array_builder);
 
@@ -80,7 +72,7 @@ class RowToArrowArrayConverter {
 
  protected:
     std::vector<int32_t> reserved_sizes_;
-    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
+    std::unique_ptr<arrow::MemoryPool> arrow_pool_;
     std::vector<AppendValueFunc> appenders_;
     std::unique_ptr<arrow::StructBuilder> array_builder_;
 };
@@ -101,15 +93,6 @@ RowToArrowArrayConverter<T, R>::RowToArrowArrayConverter(
       array_builder_(std::move(array_builder)) {}
 
 template <typename T, typename R>
-void RowToArrowArrayConverter<T, R>::ReleaseExportedArray(ArrowArray* array) {
-    std::unique_ptr<ExportedArrayPrivateData> private_data(
-        static_cast<ExportedArrayPrivateData*>(array->private_data));
-    array->release = private_data->release;
-    array->private_data = private_data->private_data;
-    array->release(array);
-}
-
-template <typename T, typename R>
 Status RowToArrowArrayConverter<T, R>::ResetAndReserve() {
     array_builder_->Reset();
     int32_t reserve_idx = 0;
@@ -127,12 +110,6 @@ Result<BatchReader::ReadBatch> RowToArrowArrayConverter<T, R>::FinishAndAccumula
     std::unique_ptr<ArrowArray> c_array = std::make_unique<ArrowArray>();
     std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*array, c_array.get(), c_schema.get()));
-    auto private_data = std::make_unique<ExportedArrayPrivateData>();
-    private_data->release = c_array->release;
-    private_data->private_data = c_array->private_data;
-    private_data->arrow_pool = arrow_pool_;
-    c_array->release = ReleaseExportedArray;
-    c_array->private_data = private_data.release();
     return make_pair(std::move(c_array), std::move(c_schema));
 }
 
