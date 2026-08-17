@@ -228,7 +228,7 @@ TEST_F(ArrowMemIndexerTest, TestRejectsHandlesFromAnotherIndexerImplementation) 
                         "mem query read schema is null");
 }
 
-TEST_F(ArrowMemIndexerTest, TestFactoryCreatesAppendAndPrimaryKeyIndexers) {
+TEST_F(ArrowMemIndexerTest, TestFactoryRouting) {
     ArrowMemIndexerFactory factory;
     std::unique_ptr<ArrowSchema> append_schema = MakeReadSchema(schema_);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemIndexer> append_indexer,
@@ -274,7 +274,19 @@ TEST_F(ArrowMemIndexerTest, TestFactoryCreatesAppendAndPrimaryKeyIndexers) {
                          primary_key_readers[0]->NextBatch());
     ASSERT_EQ(4, primary_key_batch.second->n_children);
     ASSERT_STREQ("_SEQUENCE_NUMBER", primary_key_batch.second->children[0]->name);
-    ReaderUtils::ReleaseReadBatch(std::move(primary_key_batch));
+    arrow::Result<std::shared_ptr<arrow::Array>> primary_key_import_result =
+        arrow::ImportArray(primary_key_batch.first.get(), primary_key_batch.second.get());
+    ASSERT_TRUE(primary_key_import_result.ok()) << primary_key_import_result.status().ToString();
+    std::shared_ptr<arrow::Array> primary_key_array =
+        std::move(primary_key_import_result).ValueOrDie();
+    std::shared_ptr<arrow::StructArray> primary_key_values =
+        std::dynamic_pointer_cast<arrow::StructArray>(primary_key_array);
+    ASSERT_TRUE(primary_key_values);
+    std::shared_ptr<arrow::Int64Array> sequence_numbers =
+        std::dynamic_pointer_cast<arrow::Int64Array>(primary_key_values->field(0));
+    ASSERT_TRUE(sequence_numbers);
+    ASSERT_EQ(1, sequence_numbers->length());
+    ASSERT_EQ(8, sequence_numbers->Value(0));
     primary_key_readers[0]->Close();
 }
 

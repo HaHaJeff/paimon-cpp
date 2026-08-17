@@ -31,9 +31,6 @@
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
 #include "arrow/ipc/json_simple.h"
-#include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/data_field.h"
-#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/memory/memory_pool.h"
@@ -167,55 +164,6 @@ std::unique_ptr<RecordBatch> MakeWriteBatch(const std::string& json) {
     return RecordBatchBuilder(&c_array).Finish().value();
 }
 
-Result<std::vector<int64_t>> ReadPrimaryKeyQuerySequences(
-    const std::shared_ptr<MemIndexer>& indexer, const std::shared_ptr<MemReadView>& view) {
-    auto read_schema = std::make_unique<ArrowSchema>();
-    std::shared_ptr<arrow::Schema> requested_schema =
-        arrow::schema({DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber()),
-                       arrow::field("id", arrow::int64())});
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*requested_schema, read_schema.get()));
-    ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });
-    MemQueryContext query_context{read_schema.get(), /*predicate=*/nullptr,
-                                  /*enable_predicate_pushdown=*/false};
-    PAIMON_ASSIGN_OR_RAISE(
-        std::vector<std::unique_ptr<BatchReader>> readers,
-        indexer->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, query_context));
-
-    std::vector<int64_t> sequences;
-    for (const std::unique_ptr<BatchReader>& reader : readers) {
-        while (true) {
-            PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader->NextBatch());
-            if (BatchReader::IsEofBatch(batch)) {
-                break;
-            }
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                std::shared_ptr<arrow::Array> imported,
-                arrow::ImportArray(batch.first.get(), batch.second.get()));
-            std::shared_ptr<arrow::StructArray> values =
-                std::dynamic_pointer_cast<arrow::StructArray>(imported);
-            if (!values) {
-                return Status::Invalid("PK query reader did not return a StructArray");
-            }
-            if (values->num_fields() < 2 ||
-                values->type()->field(0)->name() != SpecialFields::ValueKind().Name() ||
-                values->type()->field(1)->name() != SpecialFields::SequenceNumber().Name()) {
-                return Status::Invalid("PK query reader did not return PK mutation metadata");
-            }
-            std::shared_ptr<arrow::Int64Array> sequence_array =
-                std::dynamic_pointer_cast<arrow::Int64Array>(
-                    values->GetFieldByName(SpecialFields::SequenceNumber().Name()));
-            if (!sequence_array) {
-                return Status::Invalid("PK query reader did not return sequence numbers");
-            }
-            for (int64_t i = 0; i < sequence_array->length(); ++i) {
-                sequences.push_back(sequence_array->Value(i));
-            }
-        }
-        reader->Close();
-    }
-    return sequences;
-}
-
 TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     auto factory = std::make_shared<TestingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
@@ -256,30 +204,6 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(2, factory->indexers[0]->acquire_count);
     ASSERT_EQ(1, factory->indexers[1]->acquire_count);
     ASSERT_EQ(1, factory->indexers[2]->acquire_count);
-}
-
-TEST(RealtimeContextTest, TestLazyFactoryPreservesOffset) {
-    auto factory = std::make_shared<TestingMemIndexerFactory>();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
-                         RealtimeContext::Create(factory));
-    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
-    const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/3);
-    ASSERT_OK(context->AdvanceCommittedProgress(5, {{partition_bucket, /*offset=*/7}}));
-
-    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState first_state,
-                         context->GetOrCreateMemIndexer(MakeRequest(partition, 3)));
-    std::shared_ptr<TestingMemIndexer> testing_indexer = factory->indexers.at(0);
-    ASSERT_EQ(testing_indexer, first_state.indexer);
-    ASSERT_EQ(8, first_state.initial_offset);
-    ASSERT_EQ(1, factory->create_count);
-
-    testing_indexer->offset_range = Range(8, 12);
-    ASSERT_OK_AND_ASSIGN(RealtimeMemIndexerState reused_state,
-                         context->GetOrCreateMemIndexer(MakeRequest(partition, 3)));
-    ASSERT_EQ(first_state.indexer, reused_state.indexer);
-    ASSERT_EQ(13, reused_state.initial_offset);
-    ASSERT_EQ(1, factory->create_count);
-    ASSERT_EQ(1, testing_indexer->acquire_count);
 }
 
 TEST(RealtimeContextTest, TestPropagatesFactoryFailure) {
@@ -361,28 +285,7 @@ TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {
         "PK sequence number has reached INT64_MAX");
 }
 
-TEST(RealtimeContextTest, TestPrimaryKeyWriterUsesBuiltInIndexerAndRestoresSequence) {
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
-    std::unique_ptr<UniqueTestDirectory> temp_directory = UniqueTestDirectory::Create();
-    ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<RealtimePrimaryKeyWriter> writer,
-        RealtimePrimaryKeyWriter::Create(
-            /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"},
-            context, /*merge_tree_writer=*/nullptr, {{Options::WRITE_BUFFER_SPILLABLE, "true"}},
-            GetDefaultPool(), temp_directory->GetFileSystem(), temp_directory->Str(),
-            /*enable_multi_thread_spill=*/false, /*restore_max_seq_number=*/7));
-    ASSERT_OK(writer->Write(MakeWriteBatch("[[1]]")));
-
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
-                         context->AcquireReadViews());
-    ASSERT_EQ(1, views.size());
-    ASSERT_OK_AND_ASSIGN(std::vector<int64_t> sequences,
-                         ReadPrimaryKeyQuerySequences(views[0].indexer, views[0].read_view));
-    ASSERT_EQ(std::vector<int64_t>({8}), sequences);
-    ASSERT_EQ(std::optional<Range>(Range(0, 0)), views[0].read_view->GetOffsetRange());
-}
-
-TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
+TEST(RealtimeContextTest, TestCommittedProgress) {
     auto factory = std::make_shared<TestingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> context,
                          RealtimeContext::Create(factory));

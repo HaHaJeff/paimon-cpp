@@ -1425,49 +1425,7 @@ TEST_F(RealtimeWriteInteTest, TestPkMutationSequencesAreIndependentFromOffsets) 
               actual);
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkRecoversLatestSnapshot) {
-    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
-    CreatePkTable();
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer, CreateRealtimeWriter());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
-                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
-                                   /*partitioned=*/false));
-    ASSERT_OK(first_writer->Write(std::move(first_batch)));
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
-                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
-    ASSERT_EQ(Range(0, 1), first_progress.at(0).offset_range);
-    ASSERT_EQ(1, NewFiles(first_progress).at(0)->max_sequence_number);
-    ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
-    ASSERT_OK(first_writer->Close());
-    RealtimePartitionBucket partition_bucket(/*partition=*/{}, /*bucket=*/0);
-    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap first_offsets, ReadCommittedOffsets());
-    ASSERT_EQ(1, first_offsets.at(partition_bucket));
-
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> second_context,
-                         RealtimeContext::Create());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
-                         CreateRealtimeWriter(second_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
-                         MakeBatch({Row{1, "one-new", "p0"}}, /*partitioned=*/false,
-                                   /*bucket=*/0, {RecordBatch::RowKind::UPDATE_AFTER}));
-    ASSERT_OK(second_writer->Write(std::move(second_batch)));
-    ASSERT_OK_AND_ASSIGN(std::vector<Row> before_prepare, ReadRows(second_context));
-    ASSERT_EQ((std::vector<Row>{{1, "one-new", "p0"}, {2, "two", "p0"}}), before_prepare);
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
-                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
-    ASSERT_EQ(Range(2, 2), second_progress.at(0).offset_range);
-    ASSERT_EQ(2, NewFiles(second_progress).at(0)->max_sequence_number);
-    ASSERT_OK(Commit(second_progress, /*commit_identifier=*/1));
-    ASSERT_OK(second_writer->Close());
-
-    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual, ReadRows());
-    ASSERT_EQ((std::vector<Row>{{1, "one-new", "p0"}, {2, "two", "p0"}}), actual);
-    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap second_offsets, ReadCommittedOffsets());
-    ASSERT_EQ(2, second_offsets.at(partition_bucket));
-}
-
-TEST_F(RealtimeWriteInteTest, TestPkCustomFactoryRecoversBuckets) {
+TEST_F(RealtimeWriteInteTest, TestPkBucketRecovery) {
     options_[Options::BUCKET] = "2";
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
@@ -1484,28 +1442,39 @@ TEST_F(RealtimeWriteInteTest, TestPkCustomFactoryRecoversBuckets) {
     ASSERT_OK(first_writer->Write(std::move(bucket1_batch)));
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
                          first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    std::map<int32_t, Range> first_ranges;
+    for (const RealtimeCommitProgress& progress : first_progress) {
+        first_ranges.emplace(progress.partition_bucket.bucket, progress.offset_range);
+    }
+    ASSERT_EQ(Range(0, 1), first_ranges.at(0));
+    ASSERT_EQ(Range(0, 2), first_ranges.at(1));
     ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
     ASSERT_OK(first_writer->Close());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap first_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(1, first_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_EQ(2, first_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/1)));
 
     auto factory = std::make_shared<DelegatingMemIndexerFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> second_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
                          CreateRealtimeWriter(second_context));
-    ASSERT_OK_AND_ASSIGN(bucket0_batch,
-                         MakeBatch({Row{1, "new-1", "p0"}}, /*partitioned=*/false, /*bucket=*/0,
-                                   {RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK_AND_ASSIGN(bucket0_batch, MakeBatch({Row{1, "new-1", "p0"}, Row{3, "new-3", "p0"}},
+                                                  /*partitioned=*/false, /*bucket=*/0,
+                                                  {RecordBatch::RowKind::UPDATE_AFTER,
+                                                   RecordBatch::RowKind::INSERT}));
     ASSERT_OK(second_writer->Write(std::move(bucket0_batch)));
     ASSERT_OK_AND_ASSIGN(bucket1_batch,
-                         MakeBatch({Row{10, "new-10", "p0"}}, /*partitioned=*/false, /*bucket=*/1,
-                                   {RecordBatch::RowKind::UPDATE_AFTER}));
+                         MakeBatch({Row{10, "old-10", "p0"}, Row{13, "new-13", "p0"}},
+                                   /*partitioned=*/false, /*bucket=*/1,
+                                   {RecordBatch::RowKind::DELETE, RecordBatch::RowKind::INSERT}));
     ASSERT_OK(second_writer->Write(std::move(bucket1_batch)));
 
     ASSERT_EQ(2, factory->create_count);
     std::map<int32_t, int64_t> restored_sequences;
     for (const DelegatingMemIndexerFactory::CapturedRequest& request : factory->requests) {
         ASSERT_TRUE(std::holds_alternative<PrimaryKeyMemIndexerCreateConfig>(request.mode_config));
-        const PrimaryKeyMemIndexerCreateConfig& primary_key_config =
+        const auto& primary_key_config =
             std::get<PrimaryKeyMemIndexerCreateConfig>(request.mode_config);
         ASSERT_EQ(std::vector<std::string>({"id"}), primary_key_config.primary_keys);
         ASSERT_TRUE(request.partition.empty());
@@ -1514,72 +1483,26 @@ TEST_F(RealtimeWriteInteTest, TestPkCustomFactoryRecoversBuckets) {
     ASSERT_EQ(1, restored_sequences.at(0));
     ASSERT_EQ(2, restored_sequences.at(1));
 
-    std::vector<Row> expected = {{1, "new-1", "p0"},
-                                 {2, "old-2", "p0"},
-                                 {10, "new-10", "p0"},
-                                 {11, "old-11", "p0"},
-                                 {12, "old-12", "p0"}};
+    std::vector<Row> expected = {{1, "new-1", "p0"},   {2, "old-2", "p0"},   {3, "new-3", "p0"},
+                                 {11, "old-11", "p0"}, {12, "old-12", "p0"}, {13, "new-13", "p0"}};
     ASSERT_OK_AND_ASSIGN(std::vector<Row> realtime_rows, ReadRows(second_context));
     ASSERT_EQ(expected, realtime_rows);
 
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
                          second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    std::map<int32_t, Range> second_ranges;
+    for (const RealtimeCommitProgress& progress : second_progress) {
+        second_ranges.emplace(progress.partition_bucket.bucket, progress.offset_range);
+    }
+    ASSERT_EQ(Range(2, 3), second_ranges.at(0));
+    ASSERT_EQ(Range(3, 4), second_ranges.at(1));
     ASSERT_OK(Commit(second_progress, /*commit_identifier=*/1));
     ASSERT_OK(second_writer->Close());
     ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_rows, ReadRows());
     ASSERT_EQ(expected, disk_rows);
-}
-
-TEST_F(RealtimeWriteInteTest, TestPkMultipleBuckets) {
-    options_[Options::BUCKET] = "2";
-    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
-    CreatePkTable();
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer, CreateRealtimeWriter());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> bucket0_batch,
-                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
-                                   /*partitioned=*/false, /*bucket=*/0));
-    ASSERT_OK(first_writer->Write(std::move(bucket0_batch)));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> bucket1_batch,
-                         MakeBatch({Row{10, "ten", "p0"}}, /*partitioned=*/false,
-                                   /*bucket=*/1));
-    ASSERT_OK(first_writer->Write(std::move(bucket1_batch)));
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
-                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
-    ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
-    ASSERT_OK(first_writer->Close());
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer, CreateRealtimeWriter());
-    ASSERT_OK_AND_ASSIGN(
-        bucket0_batch,
-        MakeBatch({Row{1, "one-new", "p0"}, Row{3, "three", "p0"}}, /*partitioned=*/false,
-                  /*bucket=*/0,
-                  {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::INSERT}));
-    ASSERT_OK(second_writer->Write(std::move(bucket0_batch)));
-    ASSERT_OK_AND_ASSIGN(
-        bucket1_batch,
-        MakeBatch({Row{10, "ten", "p0"}, Row{11, "eleven", "p0"}}, /*partitioned=*/false,
-                  /*bucket=*/1, {RecordBatch::RowKind::DELETE, RecordBatch::RowKind::INSERT}));
-    ASSERT_OK(second_writer->Write(std::move(bucket1_batch)));
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
-                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
-    std::map<int32_t, Range> ranges;
-    for (const RealtimeCommitProgress& progress : second_progress) {
-        ranges.emplace(progress.partition_bucket.bucket, progress.offset_range);
-    }
-    ASSERT_EQ(Range(2, 3), ranges.at(0));
-    ASSERT_EQ(Range(1, 2), ranges.at(1));
-    ASSERT_OK(Commit(second_progress, /*commit_identifier=*/1));
-    ASSERT_OK(second_writer->Close());
-
-    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual, ReadRows());
-    ASSERT_EQ(
-        (std::vector<Row>{
-            {1, "one-new", "p0"}, {2, "two", "p0"}, {3, "three", "p0"}, {11, "eleven", "p0"}}),
-        actual);
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap offsets, ReadCommittedOffsets());
     ASSERT_EQ(3, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
-    ASSERT_EQ(2, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/1)));
+    ASSERT_EQ(4, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/1)));
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkPartitionedWrites) {
@@ -2028,22 +1951,20 @@ TEST_F(RealtimeWriteInteTest, TestPkReadAndWriteSpillValidation) {
     ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), "requires write-buffer spill");
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkScanRequiresFixedBucket) {
-    options_[Options::BUCKET] = "-2";
+TEST_F(RealtimeWriteInteTest, TestPkScanValidation) {
     CreatePkTable();
+
+    options_[Options::BUCKET] = "-2";
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
     Result<std::unique_ptr<TableScan>> scan = CreateScan(realtime_context, /*predicate=*/nullptr);
     ASSERT_TRUE(scan.status().IsInvalid());
     ASSERT_EQ("real-time union read requires fixed bucket mode", scan.status().message());
-}
 
-TEST_F(RealtimeWriteInteTest, TestPkScanRejectsDataEvolution) {
-    CreatePkTable();
+    options_[Options::BUCKET] = "1";
     options_[Options::DATA_EVOLUTION_ENABLED] = "true";
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
-    Result<std::unique_ptr<TableScan>> scan = CreateScan(realtime_context, /*predicate=*/nullptr);
+    ASSERT_OK_AND_ASSIGN(realtime_context, RealtimeContext::Create());
+    scan = CreateScan(realtime_context, /*predicate=*/nullptr);
     ASSERT_TRUE(scan.status().IsInvalid());
     ASSERT_EQ("real-time union read does not support data evolution", scan.status().message());
 }

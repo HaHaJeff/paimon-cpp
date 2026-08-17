@@ -331,6 +331,20 @@ class MergeFileSplitReadTest : public ::testing::Test,
     Result<std::unique_ptr<BatchReader>> CreateReader(
         const std::shared_ptr<InternalReadContext>& internal_context,
         const std::vector<std::shared_ptr<DataSplit>>& data_splits) {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<MergeFileSplitRead> split_read,
+                               CreateSplitRead(internal_context));
+        std::vector<std::unique_ptr<BatchReader>> batch_readers;
+        batch_readers.reserve(data_splits.size());
+        for (const auto& split : data_splits) {
+            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
+                                   split_read->CreateReader(split));
+            batch_readers.emplace_back(std::move(reader));
+        }
+        return std::make_unique<ConcatBatchReader>(std::move(batch_readers), pool_);
+    }
+
+    Result<std::unique_ptr<MergeFileSplitRead>> CreateSplitRead(
+        const std::shared_ptr<InternalReadContext>& internal_context) {
         const auto& core_options = internal_context->GetCoreOptions();
         const auto& table_schema = internal_context->GetTableSchema();
         auto arrow_schema = DataField::ConvertDataFieldsToArrowSchema(table_schema->Fields());
@@ -347,17 +361,7 @@ class MergeFileSplitReadTest : public ::testing::Test,
                 core_options.DataFilePrefix(), core_options.LegacyPartitionNameEnabled(),
                 external_paths, global_index_external_path, core_options.IndexFileInDataFileDir(),
                 pool_));
-        PAIMON_ASSIGN_OR_RAISE(auto split_read,
-                               MergeFileSplitRead::Create(path_factory, std::move(internal_context),
-                                                          pool_, executor_));
-        std::vector<std::unique_ptr<BatchReader>> batch_readers;
-        batch_readers.reserve(data_splits.size());
-        for (const auto& split : data_splits) {
-            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
-                                   split_read->CreateReader(split));
-            batch_readers.emplace_back(std::move(reader));
-        }
-        return std::make_unique<ConcatBatchReader>(std::move(batch_readers), pool_);
+        return MergeFileSplitRead::Create(path_factory, internal_context, pool_, executor_);
     }
 
  private:
@@ -1145,7 +1149,45 @@ TEST_P(MergeFileSplitReadTest, TestEmptyPlan) {
     ASSERT_FALSE(read_result);
 }
 
-TEST_P(MergeFileSplitReadTest, TestEmptyGeneric) {
+TEST_P(MergeFileSplitReadTest, TestGenericDiskReader) {
+    std::string path =
+        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
+    ReadContextBuilder context_builder(path);
+    std::vector<DataField> raw_read_fields = {DataField(1, arrow::field("k1", arrow::int32())),
+                                              DataField(3, arrow::field("p1", arrow::int32())),
+                                              DataField(5, arrow::field("s1", arrow::utf8())),
+                                              DataField(6, arrow::field("v0", arrow::float64())),
+                                              DataField(7, arrow::field("v1", arrow::boolean()))};
+    std::shared_ptr<arrow::Schema> read_schema =
+        DataField::ConvertDataFieldsToArrowSchema(raw_read_fields);
+    ASSERT_TRUE(read_schema);
+    context_builder.SetReadFieldNames({"k1", "p1", "s1", "v0", "v1"});
+    context_builder.SetOptions({{Options::SEQUENCE_FIELD, "s0,s1"},
+                                {Options::MERGE_ENGINE, "deduplicate"},
+                                {Options::IGNORE_DELETE, "true"}});
+    AddOptions(&context_builder);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
+    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
+                         CreateSplitRead(internal_context));
+    std::vector<std::shared_ptr<DataSplit>> data_splits = {PrepareDataSplit().front()};
+    std::vector<std::shared_ptr<Split>> disk_splits(data_splits.begin(), data_splits.end());
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
+                         split_read->CreateReader(disk_splits,
+                                                  /*additional_readers=*/{}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result,
+                         ReadResultCollector::CollectResult(batch_reader.get()));
+
+    std::shared_ptr<InternalReadContext> expected_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> expected_reader,
+                         CreateReader(expected_context, data_splits));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> expected,
+                         ReadResultCollector::CollectResult(expected_reader.get()));
+    CheckResult(result, expected, read_schema);
+}
+
+TEST_P(MergeFileSplitReadTest, TestGenericRejectsMisalignedDeletionFiles) {
     std::string path =
         paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
     ReadContextBuilder context_builder(path);
@@ -1156,15 +1198,27 @@ TEST_P(MergeFileSplitReadTest, TestEmptyGeneric) {
     AddOptions(&context_builder);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
     std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<MergeFileSplitRead> split_read,
-        MergeFileSplitRead::Create(/*path_factory=*/nullptr, internal_context, pool_, executor_));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
+                         CreateSplitRead(internal_context));
 
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
-                         split_read->CreateReader(/*disk_splits=*/{},
-                                                  /*additional_readers=*/{}));
-    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, batch_reader->NextBatch());
-    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+    std::shared_ptr<DataSplitImpl> source =
+        std::dynamic_pointer_cast<DataSplitImpl>(PrepareDataSplit().front());
+    ASSERT_NE(nullptr, source);
+    std::vector<std::shared_ptr<DataFileMeta>> data_files = source->DataFiles();
+    ASSERT_GT(data_files.size(), 1);
+    DataSplitImpl::Builder builder(source->Partition(), source->Bucket(), source->BucketPath(),
+                                   std::move(data_files));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<DataSplitImpl> misaligned,
+                         builder.WithSnapshot(source->SnapshotId())
+                             .WithDataDeletionFiles({std::nullopt})
+                             .IsStreaming(false)
+                             .RawConvertible(false)
+                             .Build());
+    Result<std::unique_ptr<BatchReader>> result =
+        split_read->CreateReader({misaligned}, /*additional_readers=*/{});
+    ASSERT_TRUE(result.status().IsInvalid());
+    ASSERT_EQ("merge input disk split deletion files must be empty or match data files",
+              result.status().message());
 }
 
 TEST_P(MergeFileSplitReadTest, TestIOException) {

@@ -100,6 +100,7 @@ Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
     if (row_count == 0) {
         return Status::OK();
     }
+    std::lock_guard<std::mutex> lock(mem_indexer_mutex_);
     // INT64_MAX is reserved as the exhausted next-offset sentinel.
     if (row_count > std::numeric_limits<int64_t>::max() - next_offset_) {
         return Status::Invalid("real-time offset range exceeds INT64_MAX");
@@ -111,8 +112,14 @@ Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
 }
 
 Result<CommitIncrement> RealtimePrimaryKeyWriter::PrepareCommit(bool wait_compaction) {
-    PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
-                           mem_indexer_->SealForCommit());
+    std::lock_guard<std::mutex> lock(prepare_mutex_);
+    std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment;
+    {
+        std::lock_guard<std::mutex> mem_indexer_lock(mem_indexer_mutex_);
+        PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<RealtimeSegmentHandle>> sealed_segment,
+                               mem_indexer_->SealForCommit());
+        segment = std::move(sealed_segment);
+    }
     if (segment) {
         PAIMON_RETURN_NOT_OK(FlushSegment(segment.value()));
     }

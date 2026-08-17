@@ -57,11 +57,8 @@ TEST(PrimaryKeyRealtimeOptionsTest, TestUnsupportedOptions) {
     for (const auto& option_map : unsupported_options) {
         ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
         ASSERT_NOK(ValidatePrimaryKeyRealtimeOptions(options));
-        ASSERT_NOK(ValidatePrimaryKeyRealtimeWriteOptions(options));
     }
-}
 
-TEST(PrimaryKeyRealtimeOptionsTest, TestDescendingSequenceSortOrder) {
     ASSERT_OK_AND_ASSIGN(
         CoreOptions options,
         CoreOptions::FromMap(

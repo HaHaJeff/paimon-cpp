@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,8 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
     std::shared_ptr<arrow::Schema> value_schema_;
     std::shared_ptr<MemoryPool> memory_pool_;
     int64_t next_offset_;
+    std::mutex mem_indexer_mutex_;
+    std::mutex prepare_mutex_;
 };
 
 }  // namespace paimon

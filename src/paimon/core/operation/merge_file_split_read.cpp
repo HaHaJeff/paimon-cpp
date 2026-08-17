@@ -220,12 +220,18 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
             return Status::Invalid("additional merge input requires fixed-bucket batch splits");
         }
         const std::vector<std::shared_ptr<DataFileMeta>>& split_files = data_split->DataFiles();
+        const std::vector<std::optional<DeletionFile>>& split_deletion_files =
+            data_split->DeletionFiles();
+        if (!split_deletion_files.empty() && split_deletion_files.size() != split_files.size()) {
+            return Status::Invalid(
+                "merge input disk split deletion files must be empty or match data files");
+        }
         data_files.insert(data_files.end(), split_files.begin(), split_files.end());
-        if (data_split->DeletionFiles().empty()) {
+        if (split_deletion_files.empty()) {
             deletion_files.insert(deletion_files.end(), split_files.size(), std::nullopt);
         } else {
-            deletion_files.insert(deletion_files.end(), data_split->DeletionFiles().begin(),
-                                  data_split->DeletionFiles().end());
+            deletion_files.insert(deletion_files.end(), split_deletion_files.begin(),
+                                  split_deletion_files.end());
         }
     }
 
