@@ -32,6 +32,7 @@
 #include "arrow/ipc/json_simple.h"
 #include "gtest/gtest.h"
 #include "paimon/common/data/binary_row.h"
+#include "paimon/common/data/internal_row.h"
 #include "paimon/common/factories/io_hook.h"
 #include "paimon/common/reader/concat_batch_reader.h"
 #include "paimon/common/table/special_fields.h"
@@ -40,6 +41,8 @@
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/io/data_file_meta.h"
+#include "paimon/core/io/key_value_record_reader.h"
+#include "paimon/core/key_value.h"
 #include "paimon/core/manifest/file_source.h"
 #include "paimon/core/operation/internal_read_context.h"
 #include "paimon/core/schema/schema_manager.h"
@@ -66,6 +69,53 @@ class FileSystem;
 }  // namespace paimon
 
 namespace paimon::test {
+namespace {
+
+class TestKeyValueRecordReader : public KeyValueRecordReader {
+ public:
+    explicit TestKeyValueRecordReader(std::vector<KeyValue>&& values)
+        : values_(std::move(values)) {}
+
+    class Iterator : public KeyValueRecordReader::Iterator {
+     public:
+        explicit Iterator(TestKeyValueRecordReader* reader) : reader_(reader) {}
+
+        Result<bool> HasNext() const override {
+            return reader_->offset_ < reader_->values_.size();
+        }
+
+        Result<KeyValue> Next() override {
+            return std::move(reader_->values_[reader_->offset_++]);
+        }
+
+     private:
+        TestKeyValueRecordReader* reader_;
+    };
+
+    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
+        if (visited_) {
+            return std::unique_ptr<KeyValueRecordReader::Iterator>();
+        }
+        visited_ = true;
+        return std::make_unique<Iterator>(this);
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return nullptr;
+    }
+
+    void Close() override {
+        visited_ = true;
+    }
+
+ private:
+    std::vector<KeyValue> values_;
+    size_t offset_ = 0;
+    bool visited_ = false;
+};
+
+}  // namespace
+
 // Parameter: min_heap/loser_tree; enable/disable IO prefetch; enable/disable multi thread row to
 // batch
 class MergeFileSplitReadTest : public ::testing::Test,
@@ -1149,18 +1199,10 @@ TEST_P(MergeFileSplitReadTest, TestEmptyPlan) {
     ASSERT_FALSE(read_result);
 }
 
-TEST_P(MergeFileSplitReadTest, TestGenericDiskReader) {
+TEST_P(MergeFileSplitReadTest, TestEmptyGenericReader) {
     std::string path =
         paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
     ReadContextBuilder context_builder(path);
-    std::vector<DataField> raw_read_fields = {DataField(1, arrow::field("k1", arrow::int32())),
-                                              DataField(3, arrow::field("p1", arrow::int32())),
-                                              DataField(5, arrow::field("s1", arrow::utf8())),
-                                              DataField(6, arrow::field("v0", arrow::float64())),
-                                              DataField(7, arrow::field("v1", arrow::boolean()))};
-    std::shared_ptr<arrow::Schema> read_schema =
-        DataField::ConvertDataFieldsToArrowSchema(raw_read_fields);
-    ASSERT_TRUE(read_schema);
     context_builder.SetReadFieldNames({"k1", "p1", "s1", "v0", "v1"});
     context_builder.SetOptions({{Options::SEQUENCE_FIELD, "s0,s1"},
                                 {Options::MERGE_ENGINE, "deduplicate"},
@@ -1170,20 +1212,79 @@ TEST_P(MergeFileSplitReadTest, TestGenericDiskReader) {
     std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
                          CreateSplitRead(internal_context));
-    std::vector<std::shared_ptr<DataSplit>> data_splits = {PrepareDataSplit().front()};
-    std::vector<std::shared_ptr<Split>> disk_splits(data_splits.begin(), data_splits.end());
 
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
-                         split_read->CreateReader(disk_splits,
+                         split_read->CreateReader(/*disk_splits=*/{},
                                                   /*additional_readers=*/{}));
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, batch_reader->NextBatch());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+}
+
+TEST_P(MergeFileSplitReadTest, TestGenericDiskAndMemoryReader) {
+    std::string path =
+        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
+    ReadContextBuilder context_builder(path);
+    std::vector<DataField> raw_read_fields = {DataField(0, arrow::field("k0", arrow::int32())),
+                                              DataField(1, arrow::field("k1", arrow::int32())),
+                                              DataField(3, arrow::field("p1", arrow::int32())),
+                                              DataField(5, arrow::field("s1", arrow::utf8())),
+                                              DataField(6, arrow::field("v0", arrow::float64())),
+                                              DataField(7, arrow::field("v1", arrow::boolean()))};
+    std::shared_ptr<arrow::Schema> read_schema =
+        DataField::ConvertDataFieldsToArrowSchema(raw_read_fields);
+    ASSERT_TRUE(read_schema);
+    context_builder.SetReadFieldNames({"k0", "k1", "p1", "s1", "v0", "v1"});
+    context_builder.SetOptions(
+        {{Options::SEQUENCE_FIELD, "s0,s1"}, {Options::MERGE_ENGINE, "deduplicate"}});
+    AddOptions(&context_builder);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
+    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
+                         CreateSplitRead(internal_context));
+    std::vector<std::shared_ptr<DataSplit>> data_splits = {PrepareDataSplit().front()};
+    std::vector<std::shared_ptr<Split>> disk_splits(data_splits.begin(), data_splits.end());
+    std::vector<KeyValue> memory_values;
+    memory_values.emplace_back(
+        RowKind::UpdateAfter(), /*sequence_number=*/9, KeyValue::UNKNOWN_LEVEL,
+        BinaryRowGenerator::GenerateRowPtr({0, 0}, pool_.get()),
+        BinaryRowGenerator::GenerateRowPtr(
+            {0, 0, 0, std::string("latest"), 999.0, true, std::string("zzz")}, pool_.get()));
+    memory_values.emplace_back(
+        RowKind::Delete(), /*sequence_number=*/10, KeyValue::UNKNOWN_LEVEL,
+        BinaryRowGenerator::GenerateRowPtr({1, 0}, pool_.get()),
+        BinaryRowGenerator::GenerateRowPtr(
+            {1, 0, 0, std::string("deleted"), 0.0, false, std::string("zzz")}, pool_.get()));
+    memory_values.emplace_back(
+        RowKind::Insert(), /*sequence_number=*/11, KeyValue::UNKNOWN_LEVEL,
+        BinaryRowGenerator::GenerateRowPtr({2, 0}, pool_.get()),
+        BinaryRowGenerator::GenerateRowPtr(
+            {2, 0, 0, std::string("memory"), 200.0, true, std::string("zzz")}, pool_.get()));
+    std::vector<std::unique_ptr<KeyValueRecordReader>> additional_readers;
+    additional_readers.push_back(
+        std::make_unique<TestKeyValueRecordReader>(std::move(memory_values)));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
+                         split_read->CreateReader(disk_splits, std::move(additional_readers)));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result,
                          ReadResultCollector::CollectResult(batch_reader.get()));
 
-    std::shared_ptr<InternalReadContext> expected_context = CreateInternalReadContext(read_context);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> expected_reader,
-                         CreateReader(expected_context, data_splits));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> expected,
-                         ReadResultCollector::CollectResult(expected_reader.get()));
+    std::shared_ptr<arrow::DataType> result_type = arrow::struct_(
+        {arrow::field("_VALUE_KIND", arrow::int8()), arrow::field("k0", arrow::int32()),
+         arrow::field("k1", arrow::int32()), arrow::field("p1", arrow::int32()),
+         arrow::field("s1", arrow::utf8()), arrow::field("v0", arrow::float64()),
+         arrow::field("v1", arrow::boolean())});
+    std::shared_ptr<arrow::Array> expected_array =
+        arrow::ipc::internal::json::ArrayFromJSON(result_type, R"([
+            [0, 0, 0, 0, "latest", 999.0, true],
+            [0, 0, 1, 0, "you", 11.1, false],
+            [0, 1, 1, 0, "!", 13.3, false],
+            [0, 1, 2, 0, "!", 13.3, false],
+            [0, 2, 0, 0, "memory", 200.0, true],
+            [0, 100, 200, 0, "number", 140.4, false]
+        ])")
+            .ValueOrDie();
+    std::shared_ptr<arrow::ChunkedArray> expected =
+        std::make_shared<arrow::ChunkedArray>(expected_array);
     CheckResult(result, expected, read_schema);
 }
 

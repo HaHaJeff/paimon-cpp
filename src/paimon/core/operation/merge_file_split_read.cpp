@@ -47,6 +47,7 @@
 #include "paimon/core/io/key_value_data_file_record_reader.h"
 #include "paimon/core/io/key_value_projection_consumer.h"
 #include "paimon/core/io/key_value_projection_reader.h"
+#include "paimon/core/key_value.h"
 #include "paimon/core/mergetree/compact/interval_partition.h"
 #include "paimon/core/mergetree/compact/lookup_merge_function.h"
 #include "paimon/core/mergetree/compact/merge_function.h"
@@ -78,6 +79,53 @@ class Executor;
 struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
+
+namespace {
+
+class SortMergeRecordReader : public KeyValueRecordReader {
+ public:
+    explicit SortMergeRecordReader(std::unique_ptr<SortMergeReader>&& reader)
+        : reader_(std::move(reader)) {}
+
+    class Iterator : public KeyValueRecordReader::Iterator {
+     public:
+        explicit Iterator(std::unique_ptr<SortMergeReader::Iterator>&& iterator)
+            : iterator_(std::move(iterator)) {}
+
+        Result<bool> HasNext() const override {
+            return iterator_->HasNext();
+        }
+
+        Result<KeyValue> Next() override {
+            return std::move(iterator_->Next());
+        }
+
+     private:
+        std::unique_ptr<SortMergeReader::Iterator> iterator_;
+    };
+
+    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader::Iterator> iterator,
+                               reader_->NextBatch());
+        if (!iterator) {
+            return std::unique_ptr<KeyValueRecordReader::Iterator>();
+        }
+        return std::make_unique<Iterator>(std::move(iterator));
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return reader_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        reader_->Close();
+    }
+
+ private:
+    std::unique_ptr<SortMergeReader> reader_;
+};
+
+}  // namespace
 
 Result<std::unique_ptr<MergeFileSplitRead>> MergeFileSplitRead::Create(
     const std::shared_ptr<FileStorePathFactory>& path_factory,
@@ -239,14 +287,22 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
         options_.GetFileSystem(), DeletionVector::CreateDeletionFileMap(data_files, deletion_files),
         pool_);
     std::vector<std::unique_ptr<KeyValueRecordReader>> record_readers;
+    std::vector<std::unique_ptr<KeyValueRecordReader>> disk_section_readers;
     for (const std::vector<SortedRun>& section :
          IntervalPartition(data_files, key_comparator_).Partition()) {
-        for (const SortedRun& run : section) {
-            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> disk_reader,
-                                   CreateReaderForRun(partition, run, dv_factory,
-                                                      predicate_for_keys_, data_file_path_factory));
-            record_readers.push_back(std::move(disk_reader));
-        }
+        std::shared_ptr<Predicate> predicate =
+            section.size() > 1 ? predicate_for_keys_ : context_->GetPredicate();
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<SortMergeReader> section_reader,
+            CreateSortMergeReaderForSection(section, partition, dv_factory, predicate,
+                                            data_file_path_factory,
+                                            /*drop_delete=*/!force_keep_delete_));
+        disk_section_readers.push_back(
+            std::make_unique<SortMergeRecordReader>(std::move(section_reader)));
+    }
+    if (!disk_section_readers.empty()) {
+        record_readers.push_back(
+            std::make_unique<ConcatKeyValueRecordReader>(std::move(disk_section_readers)));
     }
 
     record_readers.insert(record_readers.end(), std::make_move_iterator(additional_readers.begin()),
