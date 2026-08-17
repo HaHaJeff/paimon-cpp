@@ -17,15 +17,12 @@
  */
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
-#include <future>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -633,171 +630,6 @@ TEST_P(WriteAndReadInteTest, TestPkRealtimePrepareRecovery) {
                   0);
         ASSERT_OK(ReplayPkRealtimeInput(helper.get(), root_path, fields, options, durable_input));
     }
-}
-
-TEST_P(WriteAndReadInteTest, TestPkRealtimeConcurrency) {
-    auto [file_format, file_system] = GetParam();
-    if (file_format != "parquet" || file_system != "local") {
-        return;
-    }
-
-    arrow::FieldVector fields = {arrow::field("id", arrow::int64()),
-                                 arrow::field("payload", arrow::utf8())};
-    std::shared_ptr<arrow::Schema> schema = arrow::schema(fields);
-    std::map<std::string, std::string> options = {
-        {Options::MANIFEST_FORMAT, "avro"},
-        {Options::FILE_FORMAT, file_format},
-        {Options::BUCKET, "1"},
-        {Options::BUCKET_KEY, "id"},
-        {Options::FILE_SYSTEM, file_system},
-        {Options::WRITE_BUFFER_SPILLABLE, "true"},
-    };
-    const std::string temp_directory = PathUtil::JoinPath(test_dir_, "spill");
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<TestHelper> helper,
-        TestHelper::Create(test_dir_, schema, /*partition_keys=*/{}, /*primary_keys=*/{"id"},
-                           options, /*is_streaming_mode=*/false, /*ignore_if_exists=*/false,
-                           temp_directory));
-    ASSERT_OK(helper->write_->Close());
-    helper->write_.reset();
-
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
-    const std::string table_path = PathUtil::JoinPath(test_dir_, "foo.db/bar");
-    WriteContextBuilder builder(table_path, helper->CommitUser());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> write_context,
-                         builder.SetOptions(options)
-                             .WithStreamingMode(true)
-                             .WithRealtimeContext(realtime_context)
-                             .WithTempDirectory(temp_directory)
-                             .Finish());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         FileStoreWrite::Create(std::move(write_context)));
-
-    constexpr int32_t kPrepareThreadCount = 2;
-    constexpr int32_t kWorkerCount = kPrepareThreadCount + 1;
-    constexpr int64_t kBatchCount = 24;
-    std::promise<void> start_signal;
-    std::shared_future<void> start_future = start_signal.get_future().share();
-    std::atomic<int32_t> ready_workers{0};
-    std::atomic<bool> writer_done{false};
-    std::atomic<int64_t> next_prepare_identifier{0};
-    Status write_status = Status::OK();
-    std::vector<Status> prepare_statuses(kPrepareThreadCount, Status::OK());
-    std::vector<int32_t> prepare_call_counts(kPrepareThreadCount, 0);
-    std::vector<std::vector<std::vector<RealtimeCommitProgress>>> thread_commits(
-        kPrepareThreadCount);
-
-    std::thread write_thread([&]() {
-        ready_workers.fetch_add(1, std::memory_order_release);
-        start_future.wait();
-        for (int64_t i = 0; i < kBatchCount; ++i) {
-            Result<std::unique_ptr<RecordBatch>> batch = TestHelper::MakeRecordBatch(
-                arrow::struct_(fields), fmt::format(R"([[{}, "v{}"]])", i, i),
-                /*partition_map=*/{}, /*bucket=*/0, {});
-            if (!batch.ok()) {
-                write_status = batch.status();
-                break;
-            }
-            write_status = writer->Write(std::move(batch).value());
-            if (!write_status.ok()) {
-                break;
-            }
-            std::this_thread::yield();
-        }
-        writer_done.store(true, std::memory_order_release);
-    });
-
-    std::vector<std::thread> prepare_threads;
-    prepare_threads.reserve(kPrepareThreadCount);
-    for (int32_t thread_index = 0; thread_index < kPrepareThreadCount; ++thread_index) {
-        prepare_threads.emplace_back([&, thread_index]() {
-            ready_workers.fetch_add(1, std::memory_order_release);
-            start_future.wait();
-            do {
-                Result<std::vector<RealtimeCommitProgress>> progress =
-                    writer->PrepareCommitWithProgress(
-                        next_prepare_identifier.fetch_add(1, std::memory_order_relaxed));
-                ++prepare_call_counts[thread_index];
-                if (!progress.ok()) {
-                    prepare_statuses[thread_index] = progress.status();
-                    break;
-                }
-                if (!progress.value().empty()) {
-                    thread_commits[thread_index].push_back(std::move(progress).value());
-                }
-                std::this_thread::yield();
-            } while (!writer_done.load(std::memory_order_acquire));
-        });
-    }
-
-    while (ready_workers.load(std::memory_order_acquire) < kWorkerCount) {
-        std::this_thread::yield();
-    }
-    start_signal.set_value();
-
-    write_thread.join();
-    for (std::thread& prepare_thread : prepare_threads) {
-        prepare_thread.join();
-    }
-    ASSERT_OK(write_status);
-    for (int32_t thread_index = 0; thread_index < kPrepareThreadCount; ++thread_index) {
-        SCOPED_TRACE(fmt::format("prepare thread {}", thread_index));
-        ASSERT_OK(prepare_statuses[thread_index]);
-        ASSERT_GT(prepare_call_counts[thread_index], 0);
-    }
-
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> final_progress,
-                         writer->PrepareCommitWithProgress(
-                             next_prepare_identifier.fetch_add(1, std::memory_order_relaxed)));
-    std::vector<RealtimeCommitProgress> prepared_commits;
-    for (auto& commits_by_thread : thread_commits) {
-        for (auto& progress : commits_by_thread) {
-            prepared_commits.insert(prepared_commits.end(),
-                                    std::make_move_iterator(progress.begin()),
-                                    std::make_move_iterator(progress.end()));
-        }
-    }
-    if (!final_progress.empty()) {
-        prepared_commits.insert(prepared_commits.end(),
-                                std::make_move_iterator(final_progress.begin()),
-                                std::make_move_iterator(final_progress.end()));
-    }
-    ASSERT_FALSE(prepared_commits.empty());
-    std::sort(prepared_commits.begin(), prepared_commits.end(),
-              [](const RealtimeCommitProgress& lhs, const RealtimeCommitProgress& rhs) {
-                  return lhs.offset_range.from < rhs.offset_range.from;
-              });
-    ASSERT_EQ(0, prepared_commits.front().offset_range.from);
-    for (int32_t i = 1; i < static_cast<int32_t>(prepared_commits.size()); ++i) {
-        ASSERT_EQ(prepared_commits[i - 1].offset_range.to + 1,
-                  prepared_commits[i].offset_range.from);
-    }
-    ASSERT_EQ(kBatchCount - 1, prepared_commits.back().offset_range.to);
-
-    int64_t commit_identifier = 0;
-    for (const RealtimeCommitProgress& progress : prepared_commits) {
-        ASSERT_OK(helper->commit_->CommitWithProgress({progress}, commit_identifier++,
-                                                      /*watermark=*/std::nullopt));
-    }
-    ASSERT_OK(writer->Close());
-
-    std::string expected = "[";
-    for (int64_t i = 0; i < kBatchCount; ++i) {
-        if (i > 0) {
-            expected += ", ";
-        }
-        expected += fmt::format(R"([0, {}, "v{}"])", i, i);
-    }
-    expected += "]";
-    arrow::FieldVector expected_fields = fields;
-    expected_fields.insert(expected_fields.begin(), arrow::field("_VALUE_KIND", arrow::int8()));
-    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> splits,
-                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt,
-                                         /*is_streaming=*/false));
-    ASSERT_OK_AND_ASSIGN(bool success, helper->ReadAndCheckResult(arrow::struct_(expected_fields),
-                                                                  splits, expected));
-    ASSERT_TRUE(success);
 }
 
 TEST_P(WriteAndReadInteTest, TestNestedType) {
