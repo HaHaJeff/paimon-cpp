@@ -88,14 +88,17 @@ RealtimePrimaryKeyWriter::RealtimePrimaryKeyWriter(
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<MemoryPool>& memory_pool, int64_t next_offset)
-    : mem_indexer_(mem_indexer),
+    : memory_pool_(memory_pool),
+      mem_indexer_(mem_indexer),
       merge_tree_writer_(merge_tree_writer),
       key_schema_(key_schema),
       value_schema_(value_schema),
-      memory_pool_(memory_pool),
       next_offset_(next_offset) {}
 
 Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
+    if (!batch || !batch->GetData()) {
+        return Status::Invalid("PK real-time write batch is null");
+    }
     const int64_t row_count = batch->GetData()->length;
     if (row_count == 0) {
         return Status::OK();

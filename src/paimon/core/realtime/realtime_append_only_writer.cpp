@@ -74,6 +74,9 @@ RealtimeAppendOnlyWriter::RealtimeAppendOnlyWriter(
       next_offset_(next_offset) {}
 
 Status RealtimeAppendOnlyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
+    if (!batch || !batch->GetData()) {
+        return Status::Invalid("real-time write batch is null");
+    }
     for (RecordBatch::RowKind row_kind : batch->GetRowKind()) {
         if (row_kind != RecordBatch::RowKind::INSERT) {
             PAIMON_ASSIGN_OR_RAISE(const RowKind* kind,

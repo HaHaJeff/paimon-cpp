@@ -74,11 +74,11 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
 
     Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment);
 
+    std::shared_ptr<MemoryPool> memory_pool_;
     std::shared_ptr<MemIndexer> mem_indexer_;
     std::shared_ptr<MergeTreeWriter> merge_tree_writer_;
     std::shared_ptr<arrow::Schema> key_schema_;
     std::shared_ptr<arrow::Schema> value_schema_;
-    std::shared_ptr<MemoryPool> memory_pool_;
     int64_t next_offset_;
     std::mutex mem_indexer_mutex_;
     std::mutex prepare_mutex_;
