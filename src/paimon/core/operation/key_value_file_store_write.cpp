@@ -23,6 +23,7 @@
 
 #include "arrow/c/bridge.h"
 #include "paimon/common/data/binary_row.h"
+#include "paimon/core/compact/noop_compact_manager.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/manifest/manifest_file.h"
@@ -134,11 +135,15 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     PAIMON_ASSIGN_OR_RAISE(
         std::shared_ptr<Levels> levels,
         Levels::Create(key_comparator_, restore_data_files, options_.GetNumLevels()));
-    auto compact_strategy = compact_manager_factory_->CreateCompactStrategy();
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<CompactManager> compact_manager,
-        compact_manager_factory_->CreateCompactManager(partition, bucket, compact_strategy,
-                                                       compact_executor_, levels, dv_maintainer));
+    std::shared_ptr<CompactManager> compact_manager;
+    if (realtime_context_) {
+        compact_manager = std::make_shared<NoopCompactManager>();
+    } else {
+        auto compact_strategy = compact_manager_factory_->CreateCompactStrategy();
+        PAIMON_ASSIGN_OR_RAISE(compact_manager, compact_manager_factory_->CreateCompactManager(
+                                                    partition, bucket, compact_strategy,
+                                                    compact_executor_, levels, dv_maintainer));
+    }
 
     PAIMON_ASSIGN_OR_RAISE(
         std::shared_ptr<MergeTreeWriter> writer,

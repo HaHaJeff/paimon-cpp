@@ -341,13 +341,14 @@ class RealtimeWriteInteTest : public ::testing::Test {
                                           /*watermark=*/std::nullopt);
     }
 
-    Status Commit(const std::vector<std::shared_ptr<CommitMessage>>& commit_messages) const {
+    Status Commit(const std::vector<std::shared_ptr<CommitMessage>>& commit_messages,
+                  int64_t commit_identifier = BATCH_WRITE_COMMIT_IDENTIFIER) const {
         CommitContextBuilder builder(table_path_, commit_user_);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<CommitContext> context,
                                builder.SetOptions(options_).Finish());
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreCommit> commit,
                                FileStoreCommit::Create(std::move(context)));
-        return commit->Commit(commit_messages);
+        return commit->Commit(commit_messages, commit_identifier);
     }
 
     static std::vector<std::shared_ptr<DataFileMeta>> NewFiles(
@@ -1440,23 +1441,94 @@ TEST_F(RealtimeWriteInteTest, TestRestoreOffsetFromCommittedSnapshot) {
 
 TEST_F(RealtimeWriteInteTest, TestPkRealtimeConcurrency) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
-    // Keep compaction outside this test so every non-empty prepare result has an offset range.
-    options_[Options::NUM_SORTED_RUNS_COMPACTION_TRIGGER] = "100";
+    options_[Options::NUM_SORTED_RUNS_COMPACTION_TRIGGER] = "1";
+    options_[Options::COMMIT_FORCE_COMPACT] = "true";
     CreatePkTable();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
 
+    int64_t next_row_id = 0;
+    int64_t next_commit_identifier = 0;
+    for (int32_t i = 0; i < 2; ++i) {
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                             MakeBatch(MakeRows(next_row_id++, /*count=*/1, /*partition=*/"p0"),
+                                       /*partitioned=*/false));
+        ASSERT_OK(writer->Write(std::move(batch)));
+        ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                             writer->PrepareCommitWithProgress(next_commit_identifier));
+        ASSERT_EQ(1, progress.size());
+        std::shared_ptr<CommitMessageImpl> message =
+            std::dynamic_pointer_cast<CommitMessageImpl>(progress[0].commit_message);
+        ASSERT_NE(nullptr, message);
+        ASSERT_TRUE(message->GetCompactIncrement().IsEmpty());
+        ASSERT_OK_AND_ASSIGN(int64_t snapshot_id, Commit(progress, next_commit_identifier++));
+        ASSERT_OK(writer->RefreshCommittedSnapshot(snapshot_id));
+    }
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> memory_batch,
+                         MakeBatch(MakeRows(next_row_id++, /*count=*/1, /*partition=*/"p0"),
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(memory_batch)));
+
+    WriteContextBuilder compact_builder(table_path_, commit_user_);
+    compact_builder.SetOptions(options_).WithStreamingMode(true).WithTempDirectory(
+        PathUtil::JoinPath(dir_->Str(), "compact-spill"));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> compact_context, compact_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> compact_writer,
+                         FileStoreWrite::Create(std::move(compact_context)));
+    ASSERT_OK(compact_writer->Compact(/*partition=*/{}, /*bucket=*/0,
+                                      /*full_compaction=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::shared_ptr<CommitMessage>> compact_messages,
+        compact_writer->PrepareCommit(/*wait_compaction=*/true, next_commit_identifier));
+    ASSERT_EQ(1, compact_messages.size());
+    std::shared_ptr<CommitMessageImpl> compact_message =
+        std::dynamic_pointer_cast<CommitMessageImpl>(compact_messages[0]);
+    ASSERT_NE(nullptr, compact_message);
+    ASSERT_TRUE(compact_message->GetNewFilesIncrement().IsEmpty());
+    ASSERT_EQ(2, compact_message->GetCompactIncrement().CompactBefore().size());
+    ASSERT_FALSE(compact_message->GetCompactIncrement().CompactAfter().empty());
+    ASSERT_OK(compact_writer->Close());
+    ASSERT_OK(Commit(compact_messages, next_commit_identifier++));
+
+    ASSERT_OK_AND_ASSIGN(CoreOptions core_options, CoreOptions::FromMap(options_));
+    SnapshotManager snapshot_manager(core_options.GetFileSystem(), table_path_);
+    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> compact_snapshot,
+                         snapshot_manager.LatestSnapshot());
+    ASSERT_TRUE(compact_snapshot);
+    ASSERT_EQ(Snapshot::CommitKind::Compact(), compact_snapshot->GetCommitKind());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap compact_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(1, compact_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(compact_snapshot->Id()));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> rows_after_compaction, ReadRows(realtime_context));
+    ASSERT_OK(ValidateReadPrefix(rows_after_compaction, next_row_id));
+    ASSERT_EQ(next_row_id, static_cast<int64_t>(rows_after_compaction.size()));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> memory_progress,
+                         writer->PrepareCommitWithProgress(next_commit_identifier));
+    ASSERT_EQ(1, memory_progress.size());
+    ASSERT_EQ(Range(2, 2), memory_progress[0].offset_range);
+    std::shared_ptr<CommitMessageImpl> memory_message =
+        std::dynamic_pointer_cast<CommitMessageImpl>(memory_progress[0].commit_message);
+    ASSERT_NE(nullptr, memory_message);
+    ASSERT_TRUE(memory_message->GetCompactIncrement().IsEmpty());
+    ASSERT_OK_AND_ASSIGN(int64_t memory_snapshot,
+                         Commit(memory_progress, next_commit_identifier++));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(memory_snapshot));
+
     constexpr int32_t kPrepareThreadCount = 1;
     constexpr int32_t kReadThreadCount = 1;
     constexpr int64_t kBatchCount = 24;
+    const int64_t concurrent_first_id = next_row_id;
+    const int64_t total_row_count = concurrent_first_id + kBatchCount;
 
     std::atomic<bool> writer_done{false};
     std::atomic<bool> prepare_done{false};
     std::atomic<bool> commit_done{false};
     std::atomic<bool> refresh_done{false};
-    std::atomic<int64_t> next_prepare_identifier{0};
+    std::atomic<int64_t> next_prepare_identifier{next_commit_identifier};
     std::atomic<int32_t> commit_count{0};
     std::atomic<int32_t> refresh_count{0};
     ConcurrentTestState state;
@@ -1488,7 +1560,8 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeConcurrency) {
         for (int64_t batch_index = 0; batch_index < kBatchCount && !state.ShouldStop();
              ++batch_index) {
             Result<std::unique_ptr<RecordBatch>> batch =
-                MakeBatch(MakeRows(batch_index, /*count=*/1, /*partition=*/"p0"),
+                MakeBatch(MakeRows(concurrent_first_id + batch_index, /*count=*/1,
+                                   /*partition=*/"p0"),
                           /*partitioned=*/false);
             if (state.RecordErrorIfNotOk(batch) ||
                 state.RecordErrorIfNotOk(writer->Write(std::move(batch).value()))) {
@@ -1531,8 +1604,8 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeConcurrency) {
 
     std::thread commit_thread([&]() {
         state.WaitForStart();
-        int64_t next_offset = 0;
-        int64_t commit_identifier = 0;
+        int64_t next_offset = concurrent_first_id;
+        int64_t commit_identifier = next_commit_identifier;
         while (!state.ShouldStop()) {
             std::optional<RealtimeCommitProgress> next_commit;
             {
@@ -1617,7 +1690,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeConcurrency) {
                 Result<std::vector<Row>> rows = ReadRows(realtime_context);
                 ++read_call_counts[thread_index];
                 if (state.RecordErrorIfNotOk(rows) ||
-                    state.RecordErrorIfNotOk(ValidateReadPrefix(rows.value(), kBatchCount))) {
+                    state.RecordErrorIfNotOk(ValidateReadPrefix(rows.value(), total_row_count))) {
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1659,15 +1732,16 @@ TEST_F(RealtimeWriteInteTest, TestPkRealtimeConcurrency) {
     ASSERT_GE(commit_count.load(), 2);
     ASSERT_GE(refresh_count.load(), 2);
     ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows(realtime_context));
-    ASSERT_OK(ValidateReadPrefix(final_rows, kBatchCount));
-    ASSERT_EQ(kBatchCount, static_cast<int64_t>(final_rows.size()));
+    ASSERT_OK(ValidateReadPrefix(final_rows, total_row_count));
+    ASSERT_EQ(total_row_count, static_cast<int64_t>(final_rows.size()));
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
-    ASSERT_EQ(kBatchCount - 1,
+    ASSERT_EQ(total_row_count - 1,
               committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
     ASSERT_OK_AND_ASSIGN(uint64_t memory_usage, GetRealtimeMemoryUsage(realtime_context));
     ASSERT_EQ(0, memory_usage);
     ASSERT_OK(writer->Close());
 }
+
 TEST_F(RealtimeWriteInteTest, TestPkMutationSequencesAreIndependentFromOffsets) {
     options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
     CreatePkTable();
