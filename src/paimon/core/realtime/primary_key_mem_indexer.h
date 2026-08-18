@@ -33,6 +33,7 @@ class Schema;
 
 namespace paimon {
 
+class InternalRow;
 class CoreOptions;
 class FieldsComparator;
 class IOManager;
@@ -40,6 +41,13 @@ struct KeyValue;
 class MemoryPool;
 template <typename T>
 class MergeFunctionWrapper;
+
+class PrimaryKeyRangeProvider {
+ public:
+    virtual ~PrimaryKeyRangeProvider() = default;
+    virtual std::shared_ptr<InternalRow> GetMinKey() const = 0;
+    virtual std::shared_ptr<InternalRow> GetMaxKey() const = 0;
+};
 
 /// Built-in memory indexer selected explicitly for primary-key tables.
 ///

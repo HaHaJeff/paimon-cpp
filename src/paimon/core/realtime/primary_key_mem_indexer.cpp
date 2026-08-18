@@ -26,10 +26,13 @@
 
 #include "arrow/c/bridge.h"
 #include "arrow/type.h"
+#include "paimon/common/data/binary_row_writer.h"
+#include "paimon/common/data/columnar/columnar_row.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
+#include "paimon/common/utils/fields_comparator.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/disk/io_manager.h"
@@ -45,13 +48,14 @@ namespace {
 
 class Segment;
 
-class SegmentBatchReader : public BatchReader {
+class SegmentBatchReader : public BatchReader, public PrimaryKeyRangeProvider {
  public:
     static Result<std::unique_ptr<SegmentBatchReader>> Create(
         const std::shared_ptr<Segment>& segment,
         std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers,
         const std::shared_ptr<arrow::Schema>& output_schema, const std::vector<int32_t>& projection,
-        int32_t batch_size, const std::shared_ptr<MemoryPool>& pool);
+        int32_t batch_size, const std::shared_ptr<MemoryPool>& pool,
+        const std::shared_ptr<InternalRow>& min_key, const std::shared_ptr<InternalRow>& max_key);
 
     Result<ReadBatch> NextBatch() override;
 
@@ -60,17 +64,26 @@ class SegmentBatchReader : public BatchReader {
     }
 
     void Close() override;
+    std::shared_ptr<InternalRow> GetMinKey() const override {
+        return min_key_;
+    }
+    std::shared_ptr<InternalRow> GetMaxKey() const override {
+        return max_key_;
+    }
 
  private:
     SegmentBatchReader(const std::shared_ptr<Segment>& segment,
                        std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers,
                        std::unique_ptr<RowToArrowArrayConverter<KeyValue, ReadBatch>>&& converter,
-                       int32_t batch_size)
+                       int32_t batch_size, const std::shared_ptr<InternalRow>& min_key,
+                       const std::shared_ptr<InternalRow>& max_key)
         : segment_(segment),
           readers_(std::move(readers)),
           converter_(std::move(converter)),
           batch_size_(batch_size),
-          metrics_(std::make_shared<MetricsImpl>()) {}
+          metrics_(std::make_shared<MetricsImpl>()),
+          min_key_(min_key),
+          max_key_(max_key) {}
 
     std::shared_ptr<Segment> segment_;
     std::vector<std::unique_ptr<KeyValueRecordReader>> readers_;
@@ -80,12 +93,19 @@ class SegmentBatchReader : public BatchReader {
     KeyValueRecordReader* current_reader_ = nullptr;
     int32_t batch_size_;
     std::shared_ptr<Metrics> metrics_;
+    std::shared_ptr<InternalRow> min_key_;
+    std::shared_ptr<InternalRow> max_key_;
 };
 
 class Segment {
  public:
-    Segment(const Range& offset_range, std::unique_ptr<WriteBuffer>&& buffer)
-        : offset_range_(offset_range), buffer_(std::move(buffer)) {}
+    Segment(const Range& offset_range, std::unique_ptr<WriteBuffer>&& buffer,
+            const std::shared_ptr<InternalRow>& min_key,
+            const std::shared_ptr<InternalRow>& max_key)
+        : offset_range_(offset_range),
+          min_key_(min_key),
+          max_key_(max_key),
+          buffer_(std::move(buffer)) {}
 
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders(
         const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
@@ -101,6 +121,8 @@ class Segment {
 
     Range offset_range_;
     bool prepared_ = false;
+    std::shared_ptr<InternalRow> min_key_;
+    std::shared_ptr<InternalRow> max_key_;
 
  private:
     std::unique_ptr<WriteBuffer> buffer_;
@@ -111,11 +133,12 @@ Result<std::unique_ptr<SegmentBatchReader>> SegmentBatchReader::Create(
     const std::shared_ptr<Segment>& segment,
     std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers,
     const std::shared_ptr<arrow::Schema>& output_schema, const std::vector<int32_t>& projection,
-    int32_t batch_size, const std::shared_ptr<MemoryPool>& pool) {
+    int32_t batch_size, const std::shared_ptr<MemoryPool>& pool,
+    const std::shared_ptr<InternalRow>& min_key, const std::shared_ptr<InternalRow>& max_key) {
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueProjectionConsumer> converter,
                            KeyValueProjectionConsumer::Create(output_schema, projection, pool));
-    return std::unique_ptr<SegmentBatchReader>(
-        new SegmentBatchReader(segment, std::move(readers), std::move(converter), batch_size));
+    return std::unique_ptr<SegmentBatchReader>(new SegmentBatchReader(
+        segment, std::move(readers), std::move(converter), batch_size, min_key, max_key));
 }
 
 Result<BatchReader::ReadBatch> SegmentBatchReader::NextBatch() {
@@ -181,11 +204,25 @@ class SegmentHandle : public RealtimeSegmentHandle {
 
 class ReadView : public MemReadView {
  public:
-    explicit ReadView(std::vector<std::shared_ptr<Segment>> segments)
-        : segments_(std::move(segments)) {
+    ReadView(std::vector<std::shared_ptr<Segment>> segments,
+             std::vector<std::unique_ptr<KeyValueRecordReader>>&& building_readers,
+             const std::optional<Range>& building_offset_range,
+             const std::shared_ptr<InternalRow>& building_min_key,
+             const std::shared_ptr<InternalRow>& building_max_key)
+        : segments_(std::move(segments)),
+          building_readers_(std::move(building_readers)),
+          building_offset_range_(building_offset_range),
+          building_min_key_(building_min_key),
+          building_max_key_(building_max_key) {
         if (!segments_.empty()) {
             offset_range_ =
                 Range(segments_.front()->offset_range_.from, segments_.back()->offset_range_.to);
+        }
+        if (building_offset_range_) {
+            offset_range_ =
+                offset_range_
+                    ? std::optional<Range>(Range(offset_range_->from, building_offset_range_->to))
+                    : building_offset_range_;
         }
     }
 
@@ -194,9 +231,38 @@ class ReadView : public MemReadView {
     }
 
     std::vector<std::shared_ptr<Segment>> segments_;
+    std::shared_ptr<InternalRow> BuildingMinKey() const {
+        return building_min_key_;
+    }
+    std::shared_ptr<InternalRow> BuildingMaxKey() const {
+        return building_max_key_;
+    }
+
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> TakeBuildingReaders(int64_t lower) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (consumed_) {
+            return Status::Invalid("PK memory read view has already been consumed");
+        }
+        if (building_offset_range_ && lower >= building_offset_range_->from &&
+            lower < building_offset_range_->to) {
+            return Status::Invalid("committed offset splits a PK memory segment");
+        }
+        consumed_ = true;
+        if (!building_offset_range_ || lower >= building_offset_range_->to) {
+            building_readers_.clear();
+            return std::vector<std::unique_ptr<KeyValueRecordReader>>();
+        }
+        return std::move(building_readers_);
+    }
 
  private:
+    std::vector<std::unique_ptr<KeyValueRecordReader>> building_readers_;
+    std::optional<Range> building_offset_range_;
+    std::shared_ptr<InternalRow> building_min_key_;
+    std::shared_ptr<InternalRow> building_max_key_;
     std::optional<Range> offset_range_;
+    std::mutex mutex_;
+    bool consumed_ = false;
 };
 
 }  // namespace
@@ -245,11 +311,74 @@ class PrimaryKeyMemIndexer::Impl {
             return Status::OK();
         }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteBuffer> replacement, CreateBuffer());
-        segments_.push_back(
-            std::make_shared<Segment>(building_offset_range_.value(), std::move(building_)));
+        segments_.push_back(std::make_shared<Segment>(building_offset_range_.value(),
+                                                      std::move(building_), building_min_key_,
+                                                      building_max_key_));
         building_ = std::move(replacement);
         building_offset_range_.reset();
+        building_min_key_.reset();
+        building_max_key_.reset();
         return Status::OK();
+    }
+
+    Result<std::pair<std::shared_ptr<InternalRow>, std::shared_ptr<InternalRow>>> GetBatchKeyRange(
+        const std::shared_ptr<arrow::StructArray>& values) const {
+        arrow::ArrayVector key_arrays;
+        key_arrays.reserve(trimmed_primary_keys_.size());
+        for (const std::string& key : trimmed_primary_keys_) {
+            std::shared_ptr<arrow::Array> key_array = values->GetFieldByName(key);
+            if (!key_array) {
+                return Status::Invalid("primary key is missing from PK write batch: ", key);
+            }
+            key_arrays.push_back(std::move(key_array));
+        }
+        int64_t min_row_id = 0;
+        int64_t max_row_id = 0;
+        ColumnarRow min_key(values, key_arrays, memory_pool_, min_row_id);
+        ColumnarRow max_key(values, key_arrays, memory_pool_, max_row_id);
+        for (int64_t row_id = 1; row_id < values->length(); ++row_id) {
+            ColumnarRow key(values, key_arrays, memory_pool_, row_id);
+            if (key_comparator_->CompareTo(key, min_key) < 0) {
+                min_row_id = row_id;
+                min_key = ColumnarRow(values, key_arrays, memory_pool_, min_row_id);
+            }
+            if (key_comparator_->CompareTo(key, max_key) > 0) {
+                max_row_id = row_id;
+                max_key = ColumnarRow(values, key_arrays, memory_pool_, max_row_id);
+            }
+        }
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<InternalRow> copied_min, CopyKey(min_key));
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<InternalRow> copied_max, CopyKey(max_key));
+        return std::make_pair(std::move(copied_min), std::move(copied_max));
+    }
+
+    Result<std::shared_ptr<InternalRow>> CopyKey(const InternalRow& key) const {
+        auto result =
+            std::make_shared<BinaryRow>(static_cast<int32_t>(trimmed_primary_keys_.size()));
+        BinaryRowWriter writer(result.get(), /*initial_size=*/128, memory_pool_.get());
+        writer.Reset();
+        for (int32_t index = 0; index < static_cast<int32_t>(trimmed_primary_keys_.size());
+             ++index) {
+            std::shared_ptr<arrow::DataType> type =
+                write_schema_->GetFieldByName(trimmed_primary_keys_[index])->type();
+            PAIMON_ASSIGN_OR_RAISE(InternalRow::FieldGetterFunc getter,
+                                   InternalRow::CreateFieldGetter(index, type, /*use_view=*/true));
+            PAIMON_ASSIGN_OR_RAISE(BinaryRowWriter::FieldSetterFunc setter,
+                                   BinaryRowWriter::CreateFieldSetter(index, type));
+            setter(getter(key), &writer);
+        }
+        writer.Complete();
+        return std::static_pointer_cast<InternalRow>(result);
+    }
+
+    void UpdateBuildingKeyRange(const std::shared_ptr<InternalRow>& min_key,
+                                const std::shared_ptr<InternalRow>& max_key) {
+        if (!building_min_key_ || key_comparator_->CompareTo(*min_key, *building_min_key_) < 0) {
+            building_min_key_ = min_key;
+        }
+        if (!building_max_key_ || key_comparator_->CompareTo(*max_key, *building_max_key_) > 0) {
+            building_max_key_ = max_key;
+        }
     }
 
     Status Write(RealtimeWriteBatch&& write_batch) {
@@ -288,7 +417,10 @@ class PrimaryKeyMemIndexer::Impl {
         RecordBatchBuilder batch_builder(c_array.get());
         batch_builder.SetRowKinds(row_kinds);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<RecordBatch> buffer_batch, batch_builder.Finish());
+        using KeyRange = std::pair<std::shared_ptr<InternalRow>, std::shared_ptr<InternalRow>>;
+        PAIMON_ASSIGN_OR_RAISE(KeyRange batch_key_range, GetBatchKeyRange(values));
         PAIMON_ASSIGN_OR_RAISE(bool can_accept_more, building_->Write(std::move(buffer_batch)));
+        UpdateBuildingKeyRange(batch_key_range.first, batch_key_range.second);
         if (!building_offset_range_) {
             building_offset_range_ = write_batch.offset_range;
         } else {
@@ -340,8 +472,14 @@ class PrimaryKeyMemIndexer::Impl {
 
     Result<std::shared_ptr<MemReadView>> AcquireReadView() {
         std::lock_guard<std::mutex> lock(mutex_);
-        PAIMON_RETURN_NOT_OK(RotateBuilding());
-        return std::shared_ptr<MemReadView>(new ReadView(segments_));
+        std::vector<std::unique_ptr<KeyValueRecordReader>> building_readers;
+        if (building_ && !building_->IsEmpty()) {
+            PAIMON_ASSIGN_OR_RAISE(building_readers, building_->CreateOneShotReadView(
+                                                         merge_function_wrapper_factory_));
+        }
+        return std::shared_ptr<MemReadView>(new ReadView(segments_, std::move(building_readers),
+                                                         building_offset_range_, building_min_key_,
+                                                         building_max_key_));
     }
 
     Result<std::vector<std::shared_ptr<Segment>>> SelectSegments(
@@ -392,9 +530,28 @@ class PrimaryKeyMemIndexer::Impl {
         arrow::FieldVector output_fields = {
             DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())};
         output_fields.insert(output_fields.end(), requested_fields.begin(), requested_fields.end());
+        std::shared_ptr<ReadView> typed = std::dynamic_pointer_cast<ReadView>(view);
+        if (!typed) {
+            return Status::Invalid("read view was not created by the PK mem indexer");
+        }
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<Segment>> selected,
                                SelectSegments(view, lower));
-        return CreateReaders(selected, arrow::schema(output_fields), projection);
+        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
+                               CreateReaders(selected, arrow::schema(output_fields), projection));
+        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> building_readers,
+                               typed->TakeBuildingReaders(lower));
+        for (std::unique_ptr<KeyValueRecordReader>& building_reader : building_readers) {
+            std::vector<std::unique_ptr<KeyValueRecordReader>> single_reader;
+            single_reader.push_back(std::move(building_reader));
+            PAIMON_ASSIGN_OR_RAISE(
+                std::unique_ptr<SegmentBatchReader> reader,
+                SegmentBatchReader::Create(/*segment=*/nullptr, std::move(single_reader),
+                                           arrow::schema(output_fields), projection,
+                                           options_.GetReadBatchSize(), memory_pool_,
+                                           typed->BuildingMinKey(), typed->BuildingMaxKey()));
+            readers.push_back(std::move(reader));
+        }
+        return readers;
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateReaders(
@@ -413,10 +570,11 @@ class PrimaryKeyMemIndexer::Impl {
             for (std::unique_ptr<KeyValueRecordReader>& key_value_reader : readers) {
                 std::vector<std::unique_ptr<KeyValueRecordReader>> single_reader;
                 single_reader.push_back(std::move(key_value_reader));
-                PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SegmentBatchReader> reader,
-                                       SegmentBatchReader::Create(
-                                           segment, std::move(single_reader), schema, projection,
-                                           options_.GetReadBatchSize(), memory_pool_));
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::unique_ptr<SegmentBatchReader> reader,
+                    SegmentBatchReader::Create(segment, std::move(single_reader), schema,
+                                               projection, options_.GetReadBatchSize(),
+                                               memory_pool_, segment->min_key_, segment->max_key_));
                 result.push_back(std::move(reader));
             }
         }
@@ -455,6 +613,8 @@ class PrimaryKeyMemIndexer::Impl {
     mutable std::mutex mutex_;
     std::unique_ptr<WriteBuffer> building_;
     std::optional<Range> building_offset_range_;
+    std::shared_ptr<InternalRow> building_min_key_;
+    std::shared_ptr<InternalRow> building_max_key_;
     std::vector<std::shared_ptr<Segment>> segments_;
     std::optional<int64_t> last_offset_;
     int64_t next_sequence_number_;

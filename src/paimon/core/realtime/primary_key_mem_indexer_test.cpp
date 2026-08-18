@@ -298,6 +298,134 @@ TEST_F(PrimaryKeyMemIndexerTest, TestQueryReaderWithoutSequence) {
     readers[0]->Close();
 }
 
+TEST_F(PrimaryKeyMemIndexerTest, TestAcquireReadViewDoesNotRotateBuilding) {
+    int32_t factory_calls = 0;
+    auto factory = [&factory_calls]() {
+        ++factory_calls;
+        auto merge_function = std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
+        return std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function));
+    };
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap({{Options::WRITE_BUFFER_SPILLABLE, "true"}},
+                                              test_dir_->GetFileSystem()));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<PrimaryKeyMemIndexer> indexer,
+        PrimaryKeyMemIndexer::Create(schema_, {"id"}, key_comparator_, factory,
+                                     /*restore_max_seq_number=*/-1, options, io_manager_,
+                                     /*enable_multi_thread_spill=*/false, pool_));
+    ASSERT_OK(indexer->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"]])"), Range(0, 0)}));
+    ASSERT_EQ(1, factory_calls);
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer->AcquireReadView());
+    ASSERT_EQ(2, factory_calls);
+    ASSERT_EQ(std::optional<Range>(Range(0, 0)), view->GetOffsetRange());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> second_view, indexer->AcquireReadView());
+    ASSERT_EQ(3, factory_calls);
+    ASSERT_EQ(std::optional<Range>(Range(0, 0)), second_view->GetOffsetRange());
+}
+
+TEST_F(PrimaryKeyMemIndexerTest, TestReadViewIsConsumedOnce) {
+    ASSERT_OK(indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"]])"), Range(0, 0)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer_->AcquireReadView());
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema();
+    MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                            /*enable_predicate_pushdown=*/false};
+
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::unique_ptr<BatchReader>> readers,
+        indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context));
+    ASSERT_EQ(1, readers.size());
+    read_schema = MakeReadSchema();
+    context.read_schema = read_schema.get();
+    ASSERT_NOK_WITH_MSG(indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context),
+                        "PK memory read view has already been consumed");
+    readers[0]->Close();
+}
+
+TEST_F(PrimaryKeyMemIndexerTest, TestSpillReadViewSurvivesLaterWrites) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap({{Options::WRITE_BUFFER_SPILLABLE, "true"},
+                                               {Options::WRITE_BUFFER_SIZE, "1"},
+                                               {Options::LOCAL_SORT_MAX_NUM_FILE_HANDLES, "2"}},
+                                              test_dir_->GetFileSystem()));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyMemIndexer> indexer,
+                         PrimaryKeyMemIndexer::Create(
+                             schema_, {"id"}, key_comparator_, merge_function_wrapper_factory_,
+                             /*restore_max_seq_number=*/-1, options, io_manager_,
+                             /*enable_multi_thread_spill=*/false, pool_));
+    ASSERT_OK(indexer->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"]])"), Range(0, 0)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer->AcquireReadView());
+
+    ASSERT_OK(indexer->Write(RealtimeWriteBatch{MakeBatch(R"([[2, "two"]])"), Range(1, 1)}));
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema();
+    MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                            /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         indexer->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context));
+    ASSERT_EQ(1, readers.size());
+
+    indexer.reset();
+    io_manager_.reset();
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+    std::shared_ptr<arrow::Array> values =
+        arrow::ImportArray(batch.first.get(), batch.second.get()).ValueOrDie();
+    ASSERT_EQ(1, values->length());
+    readers[0]->Close();
+}
+
+TEST_F(PrimaryKeyMemIndexerTest, TestBuildingReadViewIsStableAndClipped) {
+    ASSERT_OK(indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"]])"), Range(0, 0)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> first_view, indexer_->AcquireReadView());
+    ASSERT_OK(indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[2, "two"]])"), Range(1, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> second_view, indexer_->AcquireReadView());
+
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema();
+    MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                            /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::unique_ptr<BatchReader>> first_readers,
+        indexer_->CreateQueryReaders(first_view, /*offset_lower_exclusive=*/-1, context));
+    ASSERT_EQ(1, first_readers.size());
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch first_batch, first_readers[0]->NextBatch());
+    std::shared_ptr<arrow::Array> first_values =
+        arrow::ImportArray(first_batch.first.get(), first_batch.second.get()).ValueOrDie();
+    ASSERT_EQ(1, first_values->length());
+    first_readers[0]->Close();
+
+    read_schema = MakeReadSchema();
+    context.read_schema = read_schema.get();
+    ASSERT_NOK_WITH_MSG(
+        indexer_->CreateQueryReaders(second_view, /*offset_lower_exclusive=*/0, context),
+        "committed offset splits a PK memory segment");
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> covered_view, indexer_->AcquireReadView());
+    read_schema = MakeReadSchema();
+    context.read_schema = read_schema.get();
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::unique_ptr<BatchReader>> covered_readers,
+        indexer_->CreateQueryReaders(covered_view, /*offset_lower_exclusive=*/1, context));
+    ASSERT_TRUE(covered_readers.empty());
+}
+
+TEST_F(PrimaryKeyMemIndexerTest, TestQueryReadersExposeKeyRange) {
+    ASSERT_OK(indexer_->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[5, "five"], [1, "one"], [9, "nine"]])"), Range(0, 2)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MemReadView> view, indexer_->AcquireReadView());
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema();
+    MemQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                            /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::unique_ptr<BatchReader>> readers,
+        indexer_->CreateQueryReaders(view, /*offset_lower_exclusive=*/-1, context));
+    ASSERT_EQ(1, readers.size());
+    auto* range_provider = dynamic_cast<PrimaryKeyRangeProvider*>(readers[0].get());
+    ASSERT_NE(nullptr, range_provider);
+    ASSERT_EQ(1, range_provider->GetMinKey()->GetLong(0));
+    ASSERT_EQ(9, range_provider->GetMaxKey()->GetLong(0));
+    readers[0]->Close();
+}
+
 TEST_F(PrimaryKeyMemIndexerTest, TestConcurrentReaderReleaseAndWrite) {
     ASSERT_OK(
         indexer_->Write(RealtimeWriteBatch{MakeBatch(R"([[1, "one"], [2, "two"]])"), Range(0, 1)}));
