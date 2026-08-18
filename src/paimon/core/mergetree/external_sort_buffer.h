@@ -28,6 +28,7 @@
 #include "paimon/core/disk/file_io_channel.h"
 #include "paimon/core/mergetree/in_memory_sort_buffer.h"
 #include "paimon/core/mergetree/sort_buffer.h"
+#include "paimon/core/mergetree/spill_channel_manager.h"
 #include "paimon/core/mergetree/spill_file_merger.h"
 #include "paimon/record_batch.h"
 #include "paimon/result.h"
@@ -42,7 +43,6 @@ class FieldsComparator;
 class IOManager;
 class KeyValueRecordReader;
 class MemoryPool;
-class SpillChannelManager;
 
 /// Spillable SortBuffer. Buffers RecordBatches in an underlying in-memory sort buffer;
 /// when the in-memory budget is reached, sorted data is spilled to a new on-disk file.
@@ -63,6 +63,7 @@ class ExternalSortBuffer : public SortBuffer {
     Result<bool> FlushMemory() override;
     Result<bool> Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() override;
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateOneShotReadView() override;
     bool HasData() const override;
 
  private:
@@ -74,6 +75,9 @@ class ExternalSortBuffer : public SortBuffer {
     bool HasSpilledData() const;
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateSpillReaders(
         const std::vector<FileChannelInfo>& files) const;
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateSpillReaders(
+        const std::vector<FileChannelInfo>& files,
+        const std::shared_ptr<SpillChannelManager::Lease>& lease) const;
     Result<FileChannelInfo> SpillToDisk(
         std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers, int32_t write_batch_size);
     SpillFileMerger::MergeFn CreateSpillFileMergeFn();
@@ -85,7 +89,7 @@ class ExternalSortBuffer : public SortBuffer {
                        const std::shared_ptr<arrow::Schema>& value_schema,
                        const std::shared_ptr<FieldsComparator>& key_comparator,
                        const std::shared_ptr<FieldsComparator>& user_defined_seq_comparator,
-                       const CoreOptions& options,
+                       const CoreOptions& options, const std::shared_ptr<IOManager>& io_manager,
                        const std::shared_ptr<FileIOChannel::Enumerator>& spill_channel_enumerator,
                        bool enable_multi_thread_spill, const std::shared_ptr<MemoryPool>& pool);
 

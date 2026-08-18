@@ -79,6 +79,13 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WriteBuffer::CreateRe
         merge_function_wrapper_factory) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
                            sort_buffer_->CreateReaders());
+    return WrapReaders(std::move(readers), merge_function_wrapper_factory);
+}
+
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WriteBuffer::WrapReaders(
+    std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers,
+    const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+        merge_function_wrapper_factory) const {
     std::vector<std::unique_ptr<KeyValueRecordReader>> merged_readers;
     merged_readers.reserve(readers.size());
     for (auto& reader : readers) {
@@ -91,6 +98,14 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WriteBuffer::CreateRe
             std::move(reader), key_comparator_, merge_function_wrapper));
     }
     return merged_readers;
+}
+
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WriteBuffer::CreateOneShotReadView(
+    const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+        merge_function_wrapper_factory) {
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
+                           sort_buffer_->CreateOneShotReadView());
+    return WrapReaders(std::move(readers), merge_function_wrapper_factory);
 }
 
 Result<bool> WriteBuffer::FlushMemory() {

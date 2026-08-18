@@ -78,6 +78,11 @@ class WriteBuffer {
         const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
             merge_function_wrapper_factory);
 
+    /// Create one-shot readers for a real-time view without changing the spill layout.
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateOneShotReadView(
+        const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+            merge_function_wrapper_factory);
+
     /// Try to spill current buffered data. Return false when the call completed normally but the
     /// caller should fall back to FlushWriteBuffer before buffering more data.
     Result<bool> FlushMemory();
@@ -96,6 +101,11 @@ class WriteBuffer {
     void Clear();
 
  private:
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WrapReaders(
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers,
+        const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
+            merge_function_wrapper_factory) const;
+
     WriteBuffer(std::unique_ptr<SortBuffer>&& sort_buffer,
                 const std::shared_ptr<FieldsComparator>& key_comparator,
                 const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper);

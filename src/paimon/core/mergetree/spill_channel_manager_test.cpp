@@ -31,7 +31,7 @@ class SpillChannelManagerTest : public ::testing::Test {
     void SetUp() override {
         test_dir_ = UniqueTestDirectory::Create();
         file_system_ = test_dir_->GetFileSystem();
-        io_manager_ = std::make_unique<IOManager>(test_dir_->Str(), test_dir_->GetFileSystem());
+        io_manager_ = std::make_shared<IOManager>(test_dir_->Str(), test_dir_->GetFileSystem());
     }
 
     FileIOChannel::ID CreateTempFile() {
@@ -46,7 +46,7 @@ class SpillChannelManagerTest : public ::testing::Test {
  protected:
     std::shared_ptr<FileSystem> file_system_;
     std::unique_ptr<UniqueTestDirectory> test_dir_;
-    std::unique_ptr<IOManager> io_manager_;
+    std::shared_ptr<IOManager> io_manager_;
 };
 
 TEST_F(SpillChannelManagerTest, AddAndGetChannels) {
@@ -105,6 +105,25 @@ TEST_F(SpillChannelManagerTest, ResetDeletesAllFiles) {
     ASSERT_FALSE(a1);
     ASSERT_FALSE(a2);
     ASSERT_FALSE(a3);
+}
+
+TEST_F(SpillChannelManagerTest, LeaseKeepsSpillDirectoryAlive) {
+    auto manager = std::make_shared<SpillChannelManager>(file_system_, io_manager_, 128);
+    FileIOChannel::ID channel = CreateTempFile();
+    manager->AddChannel(channel);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<SpillChannelManager::Lease> lease,
+                         manager->PinChannels({channel}));
+
+    ASSERT_OK(manager->DeleteChannel(channel));
+    ASSERT_OK_AND_ASSIGN(bool exists_while_pinned, file_system_->Exists(channel.GetPath()));
+    ASSERT_TRUE(exists_while_pinned);
+    manager.reset();
+    io_manager_.reset();
+    ASSERT_OK_AND_ASSIGN(bool exists_while_leased, file_system_->Exists(channel.GetPath()));
+    ASSERT_TRUE(exists_while_leased);
+    lease.reset();
+    ASSERT_OK_AND_ASSIGN(bool exists_after_release, file_system_->Exists(channel.GetPath()));
+    ASSERT_FALSE(exists_after_release);
 }
 
 }  // namespace paimon::test

@@ -58,6 +58,11 @@ class SortBuffer {
     /// This does not clear the buffer; the caller should invoke Clear() afterwards.
     virtual Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() = 0;
 
+    /// Create one-shot readers for a real-time view without final merging or clearing the buffer.
+    virtual Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateOneShotReadView() {
+        return CreateReaders();
+    }
+
     /// Return true if there is any data to output (in-memory or on-disk).
     virtual bool HasData() const = 0;
 };

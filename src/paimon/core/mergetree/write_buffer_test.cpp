@@ -19,6 +19,7 @@
 #include "paimon/core/mergetree/write_buffer.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -351,6 +352,64 @@ TEST_F(WriteBufferTest, TestCreateReadersMergesSingleInMemoryReaderLocally) {
     ASSERT_EQ(reader_result.sequence_numbers, (std::vector<int64_t>{1}));
     ASSERT_EQ(reader_result.row_kind_values,
               (std::vector<int8_t>{RowKind::Insert()->ToByteValue()}));
+}
+
+TEST_F(WriteBufferTest, TestReadViewIsStable) {
+    for (bool spillable : {false, true}) {
+        std::map<std::string, std::string> option_map = {
+            {Options::WRITE_BUFFER_SPILLABLE, spillable ? "true" : "false"}};
+        if (spillable) {
+            option_map[Options::WRITE_BUFFER_SIZE] = "1";
+            option_map[Options::LOCAL_SORT_MAX_NUM_FILE_HANDLES] = "2";
+        }
+        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+        auto write_buffer = CreateWriteBuffer(/*last_sequence_number=*/-1, options);
+        std::shared_ptr<arrow::Array> first =
+            arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+            ["Alice", 10, 0, 13.1]
+        ])")
+                .ValueOrDie();
+        std::shared_ptr<arrow::Array> second =
+            arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+            ["Bob", 20, 1, 14.1]
+        ])")
+                .ValueOrDie();
+        ASSERT_OK(write_buffer->Write(CreateBatch(first, /*row_kinds=*/{})));
+        auto merge_factory = []() {
+            return std::make_shared<ReducerMergeFunctionWrapper>(
+                std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false));
+        };
+        ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> view_readers,
+                             write_buffer->CreateOneShotReadView(merge_factory));
+        ASSERT_OK(write_buffer->Write(CreateBatch(second, /*row_kinds=*/{})));
+
+        ASSERT_EQ(1, view_readers.size());
+        ASSERT_OK_AND_ASSIGN(ReaderResult view_result, ReadReaderResult(view_readers[0].get()));
+        ASSERT_EQ((std::vector<int64_t>{0}), view_result.sequence_numbers);
+        view_readers[0]->Close();
+
+        ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> all_readers,
+                             write_buffer->CreateReaders(merge_factory));
+        std::vector<int64_t> all_sequences;
+        for (const std::unique_ptr<KeyValueRecordReader>& reader : all_readers) {
+            ASSERT_OK_AND_ASSIGN(ReaderResult result, ReadReaderResult(reader.get()));
+            all_sequences.insert(all_sequences.end(), result.sequence_numbers.begin(),
+                                 result.sequence_numbers.end());
+        }
+        std::sort(all_sequences.begin(), all_sequences.end());
+        ASSERT_EQ((std::vector<int64_t>{0, 1}), all_sequences);
+
+        if (spillable) {
+            ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> lease_readers,
+                                 write_buffer->CreateOneShotReadView(merge_factory));
+            write_buffer->Clear();
+            ASSERT_GT(TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()),
+                      0U);
+            lease_readers.clear();
+            ASSERT_EQ(TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()),
+                      0U);
+        }
+    }
 }
 
 TEST_F(WriteBufferTest, TestCreateReadersReturnsBothSpillAndMemoryReaders) {
