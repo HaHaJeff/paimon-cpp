@@ -55,6 +55,7 @@ class FieldsComparator;
 class FileBatchReader;
 class FileStorePathFactory;
 class InternalReadContext;
+class InternalRow;
 class MemoryPool;
 class SchemaManager;
 class SortedRun;
@@ -64,6 +65,12 @@ struct DeletionFile;
 struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
+
+struct AdditionalKeyValueReader {
+    std::unique_ptr<KeyValueRecordReader> reader;
+    std::shared_ptr<InternalRow> min_key;
+    std::shared_ptr<InternalRow> max_key;
+};
 
 /// If the class name below is enclosed in parentheses, it might be present in the read path;
 /// otherwise, it must be present in the read path.
@@ -124,7 +131,7 @@ class MergeFileSplitRead : public AbstractSplitRead {
     /// Merges ordinary disk splits with generic additional sorted KeyValue readers.
     Result<std::unique_ptr<BatchReader>> CreateReader(
         const std::vector<std::shared_ptr<Split>>& disk_splits,
-        std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers);
+        std::vector<AdditionalKeyValueReader>&& additional_readers);
 
     void SetMergeFunctionWrapper(
         const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper);
@@ -132,6 +139,8 @@ class MergeFileSplitRead : public AbstractSplitRead {
  private:
     Result<std::unique_ptr<BatchReader>> CreateReader(
         std::vector<std::unique_ptr<KeyValueRecordReader>>&& record_readers);
+    Result<std::unique_ptr<BatchReader>> CreateReader(
+        std::unique_ptr<SortMergeReader>&& sort_merge_reader);
 
     Result<std::unique_ptr<BatchReader>> CreateMergeReader(
         const std::shared_ptr<DataSplitImpl>& data_split,

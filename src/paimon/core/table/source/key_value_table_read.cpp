@@ -32,6 +32,7 @@
 #include "paimon/core/io/key_value_record_reader.h"
 #include "paimon/core/operation/merge_file_split_read.h"
 #include "paimon/core/operation/raw_file_split_read.h"
+#include "paimon/core/realtime/primary_key_mem_indexer.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
 #include "paimon/core/table/source/realtime_split.h"
@@ -46,7 +47,7 @@ class MemoryPool;
 
 namespace {
 
-Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreatePrimaryKeyMemoryReaders(
+Result<std::vector<AdditionalKeyValueReader>> CreatePrimaryKeyMemoryReaders(
     const std::shared_ptr<RealtimeSplit>& split, const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<InternalReadContext>& context,
@@ -70,11 +71,18 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreatePrimaryKeyMemor
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> batch_readers,
                            split->Indexer()->CreateQueryReaders(
                                split->ReadView(), split->CommittedOffset(), query_context));
-    std::vector<std::unique_ptr<KeyValueRecordReader>> result;
+    std::vector<AdditionalKeyValueReader> result;
     result.reserve(batch_readers.size());
     for (std::unique_ptr<BatchReader>& reader : batch_readers) {
-        result.push_back(std::make_unique<KeyValueBatchRecordReader>(std::move(reader), key_schema,
-                                                                     memory_schema, memory_pool));
+        std::shared_ptr<InternalRow> min_key;
+        std::shared_ptr<InternalRow> max_key;
+        if (auto* range_provider = dynamic_cast<PrimaryKeyRangeProvider*>(reader.get())) {
+            min_key = range_provider->GetMinKey();
+            max_key = range_provider->GetMaxKey();
+        }
+        auto key_value_reader = std::make_unique<KeyValueBatchRecordReader>(
+            std::move(reader), key_schema, memory_schema, memory_pool);
+        result.push_back(AdditionalKeyValueReader{std::move(key_value_reader), min_key, max_key});
     }
     return result;
 }
@@ -123,7 +131,7 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
     std::shared_ptr<RealtimeSplit> realtime_split = std::dynamic_pointer_cast<RealtimeSplit>(split);
     if (realtime_split) {
         PAIMON_ASSIGN_OR_RAISE(
-            std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
+            std::vector<AdditionalKeyValueReader> memory_readers,
             CreatePrimaryKeyMemoryReaders(realtime_split, merge_file_split_read_->GetKeySchema(),
                                           merge_file_split_read_->GetValueSchema(), context_,
                                           GetMemoryPool()));

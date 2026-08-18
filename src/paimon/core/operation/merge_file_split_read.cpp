@@ -82,47 +82,37 @@ class MergeFunctionWrapper;
 
 namespace {
 
-class SortMergeRecordReader : public KeyValueRecordReader {
+class ConcatSortMergeReader : public SortMergeReader {
  public:
-    explicit SortMergeRecordReader(std::unique_ptr<SortMergeReader>&& reader)
-        : reader_(std::move(reader)) {}
+    explicit ConcatSortMergeReader(std::vector<std::unique_ptr<SortMergeReader>>&& readers)
+        : readers_(std::move(readers)) {}
 
-    class Iterator : public KeyValueRecordReader::Iterator {
-     public:
-        explicit Iterator(std::unique_ptr<SortMergeReader::Iterator>&& iterator)
-            : iterator_(std::move(iterator)) {}
-
-        Result<bool> HasNext() const override {
-            return iterator_->HasNext();
+    Result<std::unique_ptr<SortMergeReader::Iterator>> NextBatch() override {
+        while (current_ < readers_.size()) {
+            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader::Iterator> iterator,
+                                   readers_[current_]->NextBatch());
+            if (iterator) {
+                return iterator;
+            }
+            readers_[current_]->Close();
+            ++current_;
         }
-
-        Result<KeyValue> Next() override {
-            return std::move(iterator_->Next());
-        }
-
-     private:
-        std::unique_ptr<SortMergeReader::Iterator> iterator_;
-    };
-
-    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader::Iterator> iterator,
-                               reader_->NextBatch());
-        if (!iterator) {
-            return std::unique_ptr<KeyValueRecordReader::Iterator>();
-        }
-        return std::make_unique<Iterator>(std::move(iterator));
-    }
-
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return reader_->GetReaderMetrics();
+        return std::unique_ptr<SortMergeReader::Iterator>();
     }
 
     void Close() override {
-        reader_->Close();
+        while (current_ < readers_.size()) {
+            readers_[current_++]->Close();
+        }
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return MetricsImpl::CollectReadMetrics(readers_);
     }
 
  private:
-    std::unique_ptr<SortMergeReader> reader_;
+    std::vector<std::unique_ptr<SortMergeReader>> readers_;
+    size_t current_ = 0;
 };
 
 }  // namespace
@@ -215,6 +205,11 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
     }
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> sort_merge_reader,
                            CreateSortMergeReader(std::move(record_readers)));
+    return CreateReader(std::move(sort_merge_reader));
+}
+
+Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
+    std::unique_ptr<SortMergeReader>&& sort_merge_reader) {
     if (!force_keep_delete_) {
         sort_merge_reader = std::make_unique<DropDeleteReader>(std::move(sort_merge_reader));
     }
@@ -240,9 +235,14 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
 
 Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
     const std::vector<std::shared_ptr<Split>>& disk_splits,
-    std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers) {
+    std::vector<AdditionalKeyValueReader>&& additional_readers) {
     if (disk_splits.empty()) {
-        return CreateReader(std::move(additional_readers));
+        std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
+        readers.reserve(additional_readers.size());
+        for (AdditionalKeyValueReader& additional : additional_readers) {
+            readers.push_back(std::move(additional.reader));
+        }
+        return CreateReader(std::move(readers));
     }
     std::shared_ptr<DataSplitImpl> first =
         std::dynamic_pointer_cast<DataSplitImpl>(disk_splits.front());
@@ -286,28 +286,97 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
     DeletionVector::Factory dv_factory = DeletionVector::CreateFactory(
         options_.GetFileSystem(), DeletionVector::CreateDeletionFileMap(data_files, deletion_files),
         pool_);
-    std::vector<std::unique_ptr<KeyValueRecordReader>> record_readers;
-    std::vector<std::unique_ptr<KeyValueRecordReader>> disk_section_readers;
-    for (const std::vector<SortedRun>& section :
-         IntervalPartition(data_files, key_comparator_).Partition()) {
-        std::shared_ptr<Predicate> predicate =
-            section.size() > 1 ? predicate_for_keys_ : context_->GetPredicate();
-        PAIMON_ASSIGN_OR_RAISE(
-            std::unique_ptr<SortMergeReader> section_reader,
-            CreateSortMergeReaderForSection(section, partition, dv_factory, predicate,
-                                            data_file_path_factory,
-                                            /*drop_delete=*/!force_keep_delete_));
-        disk_section_readers.push_back(
-            std::make_unique<SortMergeRecordReader>(std::move(section_reader)));
+    struct RangeInput {
+        std::shared_ptr<InternalRow> min_key;
+        std::shared_ptr<InternalRow> max_key;
+        std::vector<SortedRun> disk_runs;
+        std::unique_ptr<KeyValueRecordReader> additional_reader;
+    };
+
+    std::vector<std::vector<SortedRun>> disk_sections =
+        IntervalPartition(data_files, key_comparator_).Partition();
+    bool has_unknown_range = std::any_of(
+        additional_readers.begin(), additional_readers.end(),
+        [](const AdditionalKeyValueReader& reader) { return !reader.min_key || !reader.max_key; });
+    std::vector<RangeInput> inputs;
+    inputs.reserve(disk_sections.size() + additional_readers.size());
+    for (std::vector<SortedRun>& section : disk_sections) {
+        std::shared_ptr<DataFileMeta> min_file = section.front().Files().front();
+        std::shared_ptr<DataFileMeta> max_file = min_file;
+        for (const SortedRun& run : section) {
+            for (const std::shared_ptr<DataFileMeta>& file : run.Files()) {
+                if (key_comparator_->CompareTo(file->min_key, min_file->min_key) < 0) {
+                    min_file = file;
+                }
+                if (key_comparator_->CompareTo(file->max_key, max_file->max_key) > 0) {
+                    max_file = file;
+                }
+            }
+        }
+        inputs.push_back(RangeInput{std::shared_ptr<InternalRow>(min_file, &min_file->min_key),
+                                    std::shared_ptr<InternalRow>(max_file, &max_file->max_key),
+                                    std::move(section), nullptr});
     }
-    if (!disk_section_readers.empty()) {
-        record_readers.push_back(
-            std::make_unique<ConcatKeyValueRecordReader>(std::move(disk_section_readers)));
+    for (AdditionalKeyValueReader& additional : additional_readers) {
+        inputs.push_back(RangeInput{additional.min_key, additional.max_key, /*disk_runs=*/{},
+                                    std::move(additional.reader)});
+    }
+    if (has_unknown_range) {
+        std::vector<SortedRun> all_disk_runs;
+        std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
+        for (RangeInput& input : inputs) {
+            all_disk_runs.insert(all_disk_runs.end(), input.disk_runs.begin(),
+                                 input.disk_runs.end());
+            if (input.additional_reader) {
+                readers.push_back(std::move(input.additional_reader));
+            }
+        }
+        for (const SortedRun& run : all_disk_runs) {
+            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> disk_reader,
+                                   CreateReaderForRun(partition, run, dv_factory,
+                                                      predicate_for_keys_, data_file_path_factory));
+            readers.push_back(std::move(disk_reader));
+        }
+        return CreateReader(std::move(readers));
     }
 
-    record_readers.insert(record_readers.end(), std::make_move_iterator(additional_readers.begin()),
-                          std::make_move_iterator(additional_readers.end()));
-    return CreateReader(std::move(record_readers));
+    std::sort(inputs.begin(), inputs.end(), [this](const RangeInput& lhs, const RangeInput& rhs) {
+        return key_comparator_->CompareTo(*lhs.min_key, *rhs.min_key) < 0;
+    });
+    std::vector<std::vector<RangeInput>> components;
+    std::shared_ptr<InternalRow> component_max_key;
+    for (RangeInput& input : inputs) {
+        if (components.empty() ||
+            key_comparator_->CompareTo(*input.min_key, *component_max_key) > 0) {
+            components.emplace_back();
+            component_max_key = input.max_key;
+        } else if (key_comparator_->CompareTo(*input.max_key, *component_max_key) > 0) {
+            component_max_key = input.max_key;
+        }
+        components.back().push_back(std::move(input));
+    }
+
+    std::vector<std::unique_ptr<SortMergeReader>> component_readers;
+    component_readers.reserve(components.size());
+    for (std::vector<RangeInput>& component : components) {
+        std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
+        for (RangeInput& input : component) {
+            for (const SortedRun& run : input.disk_runs) {
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::unique_ptr<KeyValueRecordReader> disk_reader,
+                    CreateReaderForRun(partition, run, dv_factory, predicate_for_keys_,
+                                       data_file_path_factory));
+                readers.push_back(std::move(disk_reader));
+            }
+            if (input.additional_reader) {
+                readers.push_back(std::move(input.additional_reader));
+            }
+        }
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> component_reader,
+                               CreateSortMergeReader(std::move(readers)));
+        component_readers.push_back(std::move(component_reader));
+    }
+    return CreateReader(std::make_unique<ConcatSortMergeReader>(std::move(component_readers)));
 }
 
 void MergeFileSplitRead::SetMergeFunctionWrapper(

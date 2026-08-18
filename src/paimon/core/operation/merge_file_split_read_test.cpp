@@ -1259,9 +1259,11 @@ TEST_P(MergeFileSplitReadTest, TestGenericDiskAndMemoryReader) {
         BinaryRowGenerator::GenerateRowPtr({2, 0}, pool_.get()),
         BinaryRowGenerator::GenerateRowPtr(
             {2, 0, 0, std::string("memory"), 200.0, true, std::string("zzz")}, pool_.get()));
-    std::vector<std::unique_ptr<KeyValueRecordReader>> additional_readers;
-    additional_readers.push_back(
-        std::make_unique<TestKeyValueRecordReader>(std::move(memory_values)));
+    std::vector<AdditionalKeyValueReader> additional_readers;
+    additional_readers.push_back(AdditionalKeyValueReader{
+        std::make_unique<TestKeyValueRecordReader>(std::move(memory_values)),
+        BinaryRowGenerator::GenerateRowPtr({0, 0}, pool_.get()),
+        BinaryRowGenerator::GenerateRowPtr({2, 0}, pool_.get())});
 
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
                          split_read->CreateReader(disk_splits, std::move(additional_readers)));
