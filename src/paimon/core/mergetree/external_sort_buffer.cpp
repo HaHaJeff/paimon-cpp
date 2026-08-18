@@ -210,9 +210,9 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> ExternalSortBuffer::C
 }
 
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
-ExternalSortBuffer::CreateOneShotReadView() {
+ExternalSortBuffer::CreateReadersWithoutFinalMerge() {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
-                           in_memory_buffer_->CreateOneShotReadView());
+                           in_memory_buffer_->CreateReaders());
     std::vector<FileChannelInfo> spill_files = spill_merger_->GetAllFiles();
     if (spill_files.empty()) {
         return memory_readers;

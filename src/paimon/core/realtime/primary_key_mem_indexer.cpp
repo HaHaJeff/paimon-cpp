@@ -474,8 +474,9 @@ class PrimaryKeyMemIndexer::Impl {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<std::unique_ptr<KeyValueRecordReader>> building_readers;
         if (building_ && !building_->IsEmpty()) {
-            PAIMON_ASSIGN_OR_RAISE(building_readers, building_->CreateOneShotReadView(
-                                                         merge_function_wrapper_factory_));
+            PAIMON_ASSIGN_OR_RAISE(
+                building_readers,
+                building_->CreateReadersWithoutFinalMerge(merge_function_wrapper_factory_));
         }
         return std::shared_ptr<MemReadView>(new ReadView(segments_, std::move(building_readers),
                                                          building_offset_range_, building_min_key_,

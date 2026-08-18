@@ -78,8 +78,8 @@ class WriteBuffer {
         const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
             merge_function_wrapper_factory);
 
-    /// Create one-shot readers for a real-time view without changing the spill layout.
-    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateOneShotReadView(
+    /// Create readers from current buffered data without running the final spill-file merge.
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReadersWithoutFinalMerge(
         const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
             merge_function_wrapper_factory);
 

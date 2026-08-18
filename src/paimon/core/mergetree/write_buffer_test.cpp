@@ -380,7 +380,7 @@ TEST_F(WriteBufferTest, TestReadViewIsStable) {
                 std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false));
         };
         ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> view_readers,
-                             write_buffer->CreateOneShotReadView(merge_factory));
+                             write_buffer->CreateReadersWithoutFinalMerge(merge_factory));
         ASSERT_OK(write_buffer->Write(CreateBatch(second, /*row_kinds=*/{})));
 
         ASSERT_EQ(1, view_readers.size());
@@ -401,7 +401,7 @@ TEST_F(WriteBufferTest, TestReadViewIsStable) {
 
         if (spillable) {
             ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> lease_readers,
-                                 write_buffer->CreateOneShotReadView(merge_factory));
+                                 write_buffer->CreateReadersWithoutFinalMerge(merge_factory));
             write_buffer->Clear();
             ASSERT_GT(TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()),
                       0U);

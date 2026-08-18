@@ -100,11 +100,12 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WriteBuffer::WrapRead
     return merged_readers;
 }
 
-Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> WriteBuffer::CreateOneShotReadView(
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
+WriteBuffer::CreateReadersWithoutFinalMerge(
     const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
         merge_function_wrapper_factory) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
-                           sort_buffer_->CreateOneShotReadView());
+                           sort_buffer_->CreateReadersWithoutFinalMerge());
     return WrapReaders(std::move(readers), merge_function_wrapper_factory);
 }
 

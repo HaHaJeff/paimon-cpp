@@ -63,7 +63,8 @@ class ExternalSortBuffer : public SortBuffer {
     Result<bool> FlushMemory() override;
     Result<bool> Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() override;
-    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateOneShotReadView() override;
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
+    CreateReadersWithoutFinalMerge() override;
     bool HasData() const override;
 
  private:
