@@ -1,0 +1,83 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.9.8" xml:lang="en-US">
+  <compounddef id="structpaimon_1_1_realtime_query_context" kind="struct" language="C++" prot="public">
+    <compoundname>paimon::RealtimeQueryContext</compoundname>
+    <includes refid="realtime__store_8h" local="no">/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h</includes>
+    <sectiondef kind="public-attrib">
+      <memberdef kind="variable" id="structpaimon_1_1_realtime_query_context_1a7e004aa6398d9a463999afc790134670" prot="public" static="no" mutable="no">
+        <type><ref refid="struct_arrow_schema" kindref="compound">::ArrowSchema</ref> *</type>
+        <definition>::ArrowSchema* paimon::RealtimeQueryContext::read_schema</definition>
+        <argsstring></argsstring>
+        <name>read_schema</name>
+        <qualifiedname>paimon::RealtimeQueryContext::read_schema</qualifiedname>
+        <briefdescription>
+<para>Requested output fields before the mandatory leading <computeroutput>_VALUE_KIND</computeroutput> field is added. </para>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" line="82" column="19" bodyfile="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" bodystart="82" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="structpaimon_1_1_realtime_query_context_1a09424e2a0f374a735aef838c8bbd2ad4" prot="public" static="no" mutable="no">
+        <type>std::shared_ptr&lt; <ref refid="classpaimon_1_1_predicate" kindref="compound">Predicate</ref> &gt;</type>
+        <definition>std::shared_ptr&lt;Predicate&gt; paimon::RealtimeQueryContext::predicate</definition>
+        <argsstring></argsstring>
+        <name>predicate</name>
+        <qualifiedname>paimon::RealtimeQueryContext::predicate</qualifiedname>
+        <briefdescription>
+<para><ref refid="classpaimon_1_1_predicate" kindref="compound">Predicate</ref> using field indexes from <computeroutput>read_schema</computeroutput>. </para>
+        </briefdescription>
+        <detaileddescription>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" line="84" column="21" bodyfile="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" bodystart="84" bodyend="-1"/>
+      </memberdef>
+      <memberdef kind="variable" id="structpaimon_1_1_realtime_query_context_1ae5fe7d6e3e7b30107fd574e403b145e1" prot="public" static="no" mutable="no">
+        <type><ref refid="memory__pool_8h_1a147ba4ba34a215b3a4f3a95c1ee11704" kindref="member">bool</ref></type>
+        <definition>bool paimon::RealtimeQueryContext::enable_predicate_pushdown</definition>
+        <argsstring></argsstring>
+        <name>enable_predicate_pushdown</name>
+        <qualifiedname>paimon::RealtimeQueryContext::enable_predicate_pushdown</qualifiedname>
+        <briefdescription>
+<para>Whether the plugin may use <computeroutput>predicate</computeroutput> to prune candidate rows. </para>
+        </briefdescription>
+        <detaileddescription>
+<para>Keep this disabled for primary-key merge-on-read. Pruning memory before PK merge may remove the newest row and incorrectly expose an older disk row. Exact predicate filtering, when requested, is applied by the Paimon read framework after plugin reader creation. </para>
+        </detaileddescription>
+        <inbodydescription>
+        </inbodydescription>
+        <location file="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" line="90" column="10" bodyfile="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" bodystart="90" bodyend="-1"/>
+      </memberdef>
+    </sectiondef>
+    <briefdescription>
+<para>Parameters used by a <computeroutput><ref refid="classpaimon_1_1_realtime_store" kindref="compound">RealtimeStore</ref></computeroutput> to create readers for a query. </para>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <collaborationgraph>
+      <node id="2">
+        <label>ArrowSchema</label>
+        <link refid="struct_arrow_schema"/>
+        <childnode refid="2" relation="usage">
+          <edgelabel>children</edgelabel>
+          <edgelabel>dictionary</edgelabel>
+        </childnode>
+      </node>
+      <node id="1">
+        <label>paimon::RealtimeQueryContext</label>
+        <link refid="structpaimon_1_1_realtime_query_context"/>
+        <childnode refid="2" relation="usage">
+          <edgelabel>read_schema</edgelabel>
+        </childnode>
+      </node>
+    </collaborationgraph>
+    <location file="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" line="80" column="1" bodyfile="/home/runner/work/paimon-cpp/paimon-cpp/include/paimon/realtime/realtime_store.h" bodystart="80" bodyend="91"/>
+    <listofallmembers>
+      <member refid="structpaimon_1_1_realtime_query_context_1ae5fe7d6e3e7b30107fd574e403b145e1" prot="public" virt="non-virtual"><scope>paimon::RealtimeQueryContext</scope><name>enable_predicate_pushdown</name></member>
+      <member refid="structpaimon_1_1_realtime_query_context_1a09424e2a0f374a735aef838c8bbd2ad4" prot="public" virt="non-virtual"><scope>paimon::RealtimeQueryContext</scope><name>predicate</name></member>
+      <member refid="structpaimon_1_1_realtime_query_context_1a7e004aa6398d9a463999afc790134670" prot="public" virt="non-virtual"><scope>paimon::RealtimeQueryContext</scope><name>read_schema</name></member>
+    </listofallmembers>
+  </compounddef>
+</doxygen>
