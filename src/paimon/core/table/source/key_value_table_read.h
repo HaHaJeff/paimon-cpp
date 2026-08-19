@@ -35,6 +35,7 @@ class Executor;
 class FileStorePathFactory;
 class InternalReadContext;
 class MemoryPool;
+class MergeFileSplitRead;
 
 class KeyValueTableRead : public TableRead {
  public:
@@ -50,14 +51,18 @@ class KeyValueTableRead : public TableRead {
 
     void ForceKeepDelete(bool force_keep_delete);
 
+    ~KeyValueTableRead() override;
+
  private:
     KeyValueTableRead(std::vector<std::unique_ptr<SplitRead>>&& split_reads,
+                      std::unique_ptr<MergeFileSplitRead>&& merge_file_split_read,
                       const std::shared_ptr<FileStorePathFactory>& path_factory,
                       const std::shared_ptr<InternalReadContext>& context,
                       const std::shared_ptr<MemoryPool>& memory_pool,
                       const std::shared_ptr<Executor>& executor);
 
     std::vector<std::unique_ptr<SplitRead>> split_reads_;
+    std::unique_ptr<MergeFileSplitRead> merge_file_split_read_;
     std::shared_ptr<FileStorePathFactory> path_factory_;
     std::shared_ptr<InternalReadContext> context_;
     std::shared_ptr<Executor> executor_;

@@ -42,6 +42,7 @@
 #include "paimon/core/io/compact_increment.h"
 #include "paimon/core/io/data_file_path_factory.h"
 #include "paimon/core/io/data_increment.h"
+#include "paimon/core/io/key_value_record_reader.h"
 #include "paimon/core/manifest/file_source.h"
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
@@ -293,6 +294,98 @@ TEST_P(MergeTreeWriterTest, TestSimple) {
     DataIncrement expected_data_increment({expected_data_file_meta}, /*deleted_files=*/{},
                                           /*changelog_files=*/{});
     ASSERT_EQ(expected_data_increment, commit_increment.GetNewFilesIncrement());
+}
+
+TEST_P(MergeTreeWriterTest, TestWriteSortedReaders) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap({{Options::FILE_FORMAT, "orc"},
+                                               {Options::TARGET_FILE_ROW_NUM, "2"},
+                                               {Options::WRITE_BATCH_SIZE, "2"}}));
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    auto path_factory = std::make_shared<DataFilePathFactory>();
+    ASSERT_OK(path_factory->Init(dir->Str(), "orc", options.DataFilePrefix(), nullptr));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<MergeTreeWriter> merge_writer,
+                         CreateMergeWriter(/*last_sequence_number=*/-1, dir->Str(), path_factory,
+                                           /*schema_id=*/7, options));
+
+    auto buffer_merge_function =
+        std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
+    auto buffer_merge_wrapper =
+        std::make_shared<ReducerMergeFunctionWrapper>(std::move(buffer_merge_function));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WriteBuffer> first_buffer,
+        WriteBuffer::Create(/*last_sequence_number=*/39, value_schema_, primary_keys_,
+                            /*user_defined_sequence_fields=*/{}, key_comparator_,
+                            /*user_defined_seq_comparator=*/nullptr, buffer_merge_wrapper, options,
+                            /*io_manager=*/nullptr, /*enable_multi_thread_spill=*/false, pool_));
+    std::shared_ptr<arrow::Array> first_array =
+        arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+      ["Paul", 10, 0, 10.0],
+      ["Alice", 20, 1, 20.0]
+    ])")
+            .ValueOrDie();
+    ASSERT_OK_AND_ASSIGN(bool first_can_accept, first_buffer->Write(CreateBatch(first_array, {})));
+    ASSERT_TRUE(first_can_accept);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WriteBuffer> second_buffer,
+        WriteBuffer::Create(/*last_sequence_number=*/41, value_schema_, primary_keys_,
+                            /*user_defined_sequence_fields=*/{}, key_comparator_,
+                            /*user_defined_seq_comparator=*/nullptr, buffer_merge_wrapper, options,
+                            /*io_manager=*/nullptr, /*enable_multi_thread_spill=*/false, pool_));
+    std::shared_ptr<arrow::Array> second_array =
+        arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+      ["Paul", 30, 2, 30.0],
+      ["Skye", 40, 3, 40.0]
+    ])")
+            .ValueOrDie();
+    ASSERT_OK_AND_ASSIGN(
+        bool second_can_accept,
+        second_buffer->Write(CreateBatch(
+            second_array, {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE})));
+    ASSERT_TRUE(second_can_accept);
+
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
+                         first_buffer->CreateReaders());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> second_readers,
+                         second_buffer->CreateReaders());
+    readers.insert(readers.end(), std::make_move_iterator(second_readers.begin()),
+                   std::make_move_iterator(second_readers.end()));
+    ASSERT_OK(merge_writer->WriteSortedReaders(std::move(readers)));
+    first_buffer->Clear();
+    second_buffer->Clear();
+
+    ASSERT_OK_AND_ASSIGN(CommitIncrement increment,
+                         merge_writer->PrepareCommit(/*wait_compaction=*/false));
+    const std::vector<std::shared_ptr<DataFileMeta>>& files =
+        increment.GetNewFilesIncrement().NewFiles();
+    ASSERT_EQ(2, files.size());
+    ASSERT_EQ(2, files[0]->row_count);
+    ASSERT_EQ(41, files[0]->min_sequence_number);
+    ASSERT_EQ(42, files[0]->max_sequence_number);
+    ASSERT_EQ(0, files[0]->delete_row_count.value());
+    ASSERT_EQ(1, files[1]->row_count);
+    ASSERT_EQ(43, files[1]->min_sequence_number);
+    ASSERT_EQ(43, files[1]->max_sequence_number);
+    ASSERT_EQ(1, files[1]->delete_row_count.value());
+
+    std::shared_ptr<arrow::ChunkedArray> first_expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(write_type_, {R"([
+      [41, 0, "Alice", 20, 1, 20.0],
+      [42, 2, "Paul", 30, 2, 30.0]
+    ])"},
+                                                                 &first_expected)
+                    .ok());
+    CheckFileContent(path_factory->ToPath(files[0]), first_expected);
+    std::shared_ptr<arrow::ChunkedArray> second_expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(write_type_, {R"([
+      [43, 3, "Skye", 40, 3, 40.0]
+    ])"},
+                                                                 &second_expected)
+                    .ok());
+    CheckFileContent(path_factory->ToPath(files[1]), second_expected);
+    ASSERT_OK(merge_writer->Close());
 }
 
 TEST_P(MergeTreeWriterTest, TestWriteMultiBatch) {

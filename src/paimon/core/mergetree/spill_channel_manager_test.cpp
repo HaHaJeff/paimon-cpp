@@ -21,6 +21,7 @@
 #include <memory>
 
 #include "gtest/gtest.h"
+#include "paimon/common/factories/io_hook.h"
 #include "paimon/core/disk/io_manager.h"
 #include "paimon/testing/utils/testharness.h"
 
@@ -31,7 +32,7 @@ class SpillChannelManagerTest : public ::testing::Test {
     void SetUp() override {
         test_dir_ = UniqueTestDirectory::Create();
         file_system_ = test_dir_->GetFileSystem();
-        io_manager_ = std::make_unique<IOManager>(test_dir_->Str(), test_dir_->GetFileSystem());
+        io_manager_ = std::make_shared<IOManager>(test_dir_->Str(), test_dir_->GetFileSystem());
     }
 
     FileIOChannel::ID CreateTempFile() {
@@ -46,7 +47,7 @@ class SpillChannelManagerTest : public ::testing::Test {
  protected:
     std::shared_ptr<FileSystem> file_system_;
     std::unique_ptr<UniqueTestDirectory> test_dir_;
-    std::unique_ptr<IOManager> io_manager_;
+    std::shared_ptr<IOManager> io_manager_;
 };
 
 TEST_F(SpillChannelManagerTest, AddAndGetChannels) {
@@ -105,6 +106,73 @@ TEST_F(SpillChannelManagerTest, ResetDeletesAllFiles) {
     ASSERT_FALSE(a1);
     ASSERT_FALSE(a2);
     ASSERT_FALSE(a3);
+}
+
+TEST_F(SpillChannelManagerTest, LeaseKeepsSpillDirectoryAlive) {
+    auto manager = std::make_shared<SpillChannelManager>(file_system_, io_manager_, 128);
+    FileIOChannel::ID channel = CreateTempFile();
+    manager->AddChannel(channel);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<SpillChannelManager::Lease> lease,
+                         manager->PinChannels({channel}));
+
+    ASSERT_OK(manager->DeleteChannel(channel));
+    ASSERT_OK_AND_ASSIGN(bool exists_while_pinned, file_system_->Exists(channel.GetPath()));
+    ASSERT_TRUE(exists_while_pinned);
+    manager.reset();
+    io_manager_.reset();
+    ASSERT_OK_AND_ASSIGN(bool exists_while_leased, file_system_->Exists(channel.GetPath()));
+    ASSERT_TRUE(exists_while_leased);
+    lease.reset();
+    ASSERT_OK_AND_ASSIGN(bool exists_after_release, file_system_->Exists(channel.GetPath()));
+    ASSERT_FALSE(exists_after_release);
+}
+
+TEST_F(SpillChannelManagerTest, PinnedChannelKeepsDiskBytes) {
+    auto manager = std::make_shared<SpillChannelManager>(file_system_, io_manager_, 128);
+    FileIOChannel::ID channel = CreateTempFile();
+    manager->AddChannel(channel);
+    ASSERT_OK(manager->SetChannelFileSize(channel, /*file_size=*/17));
+    ASSERT_EQ(17, manager->GetTotalSpillDiskBytes());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<SpillChannelManager::Lease> lease,
+                         manager->PinChannels({channel}));
+
+    ASSERT_OK(manager->DeleteChannel(channel));
+    ASSERT_EQ(17, manager->GetTotalSpillDiskBytes());
+    ASSERT_OK_AND_ASSIGN(bool exists_while_pinned, file_system_->Exists(channel.GetPath()));
+    ASSERT_TRUE(exists_while_pinned);
+
+    lease.reset();
+    ASSERT_EQ(0, manager->GetTotalSpillDiskBytes());
+    ASSERT_OK_AND_ASSIGN(bool exists_after_release, file_system_->Exists(channel.GetPath()));
+    ASSERT_FALSE(exists_after_release);
+}
+
+TEST_F(SpillChannelManagerTest, FailedDeleteKeepsUnregisteredBytes) {
+    IOHook* hook = IOHook::GetInstance();
+    bool tested_known_size = false;
+    for (int64_t position = 0; position < 8 && !tested_known_size; ++position) {
+        SpillChannelManager manager(file_system_, 128);
+        FileIOChannel::ID channel = CreateTempFile();
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> output,
+                             file_system_->Create(channel.GetPath(), /*overwrite=*/true));
+        const std::string contents(17, 'x');
+        ASSERT_OK(output->Write(contents.data(), contents.size()));
+        ASSERT_OK(output->Close());
+        manager.AddChannel(channel);
+
+        hook->Reset(position, IOHook::Mode::RETURN_ERROR);
+        Status status = manager.DeleteChannel(channel);
+        hook->Clear();
+        if (status.IsIOError()) {
+            ASSERT_TRUE(manager.GetChannels().empty());
+            ASSERT_NE(0, manager.GetTotalSpillDiskBytes());
+            tested_known_size = manager.GetTotalSpillDiskBytes() == 17;
+        }
+        if (!tested_known_size) {
+            [[maybe_unused]] Status cleanup = file_system_->Delete(channel.GetPath());
+        }
+    }
+    ASSERT_TRUE(tested_known_size);
 }
 
 }  // namespace paimon::test

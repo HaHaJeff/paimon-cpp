@@ -135,6 +135,69 @@ TEST_F(CompleteRowKindBatchReaderTest, TestInnerReaderContainsRowKind) {
     reader->Close();
 }
 
+TEST_F(CompleteRowKindBatchReaderTest, TestBatchOutlivesReader) {
+    arrow::FieldVector fields = {arrow::field("value", arrow::int32())};
+    std::shared_ptr<arrow::Array> source =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([[1], [2]])")
+            .ValueOrDie();
+    for (bool filter_rows : {false, true}) {
+        std::unique_ptr<MockFileBatchReader> inner_reader;
+        if (filter_rows) {
+            RoaringBitmap32 bitmap;
+            bitmap.Add(0);
+            inner_reader = std::make_unique<MockFileBatchReader>(source, source->type(), bitmap,
+                                                                 /*read_batch_size=*/2);
+        } else {
+            inner_reader = std::make_unique<MockFileBatchReader>(source, source->type(),
+                                                                 /*read_batch_size=*/2);
+        }
+        inner_reader->EnableRandomizeBatchSize(/*enabled=*/false);
+        auto reader = std::make_unique<CompleteRowKindBatchReader>(std::move(inner_reader), pool_);
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+        ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+        reader->Close();
+        reader.reset();
+
+        arrow::Result<std::shared_ptr<arrow::Array>> imported =
+            arrow::ImportArray(batch.first.get(), batch.second.get());
+        ASSERT_TRUE(imported.ok()) << imported.status();
+        std::shared_ptr<arrow::Array> result = std::move(imported).ValueOrDie();
+        ASSERT_EQ(filter_rows ? 1 : 2, result->length());
+        result.reset();
+    }
+}
+
+TEST_F(CompleteRowKindBatchReaderTest, TestOrcBatchOutlivesReader) {
+    const std::string file_name =
+        paimon::test::GetDataDir() +
+        "/orc/pk_table_scan_and_read_mor.db/pk_table_scan_and_read_mor/f1=20/"
+        "bucket-0/data-1bd5fd24-4e7d-4ea2-9436-86df0a54b14a-0.orc";
+    for (bool include_row_kind : {false, true}) {
+        std::vector<DataField> read_fields = {DataField(0, arrow::field("f0", arrow::utf8())),
+                                              DataField(1, arrow::field("f1", arrow::int32())),
+                                              DataField(2, arrow::field("f2", arrow::int32())),
+                                              DataField(3, arrow::field("f3", arrow::float64()))};
+        if (include_row_kind) {
+            read_fields.insert(read_fields.begin(), SpecialFields::ValueKind());
+        }
+        std::shared_ptr<arrow::Schema> read_schema =
+            DataField::ConvertDataFieldsToArrowSchema(read_fields);
+        std::unique_ptr<BatchReader> reader =
+            PrepareCompleteRowKindBatchReader(file_name, read_schema, /*batch_size=*/1);
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+        ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+        reader->Close();
+        reader.reset();
+
+        arrow::Result<std::shared_ptr<arrow::Array>> imported =
+            arrow::ImportArray(batch.first.get(), batch.second.get());
+        ASSERT_TRUE(imported.ok()) << imported.status();
+        std::shared_ptr<arrow::Array> result = std::move(imported).ValueOrDie();
+        ASSERT_EQ(1, result->length());
+        result.reset();
+    }
+}
+
 TEST_F(CompleteRowKindBatchReaderTest, TestNestedType) {
     arrow::FieldVector fields = {
         arrow::field("f0", arrow::list(arrow::struct_(

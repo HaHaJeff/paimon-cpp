@@ -259,49 +259,53 @@ Status MergeTreeWriter::FlushWriteBuffer(bool wait_for_latest_compaction,
         // 1. flush write buffer to get sorted readers
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
                                write_buffer_->CreateReaders());
-        // 2. prepare loser tree sort merge reader
-        auto sort_merge_reader = std::make_unique<SortMergeReaderWithLoserTree>(
-            std::move(readers), key_comparator_, user_defined_seq_comparator_,
-            merge_function_wrapper_);
-        // 3. project key value to arrow array
-        auto create_consumer = [target_schema = write_schema_, pool = pool_]()
-            -> Result<std::unique_ptr<RowToArrowArrayConverter<KeyValue, KeyValueBatch>>> {
-            return KeyValueMetaProjectionConsumer::Create(target_schema, pool);
-        };
-        // consumer batch size is WriteBatchSize
-        auto async_key_value_producer_consumer =
-            std::make_unique<AsyncKeyValueProducerAndConsumer<KeyValue, KeyValueBatch>>(
-                std::move(sort_merge_reader), create_consumer, options_.GetWriteBatchSize(),
-                /*projection_thread_num=*/1, pool_);
-        std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>
-            rolling_writer;
-        PAIMON_ASSIGN_OR_RAISE(rolling_writer, CreateRollingRowWriter());
-        ScopeGuard write_guard([&]() -> void {
-            rolling_writer->Abort();
-            async_key_value_producer_consumer->Close();
-        });
-        while (true) {
-            PAIMON_ASSIGN_OR_RAISE(KeyValueBatch key_value_batch,
-                                   async_key_value_producer_consumer->NextBatch());
-            if (key_value_batch.batch == nullptr) {
-                break;
-            }
-            PAIMON_RETURN_NOT_OK(rolling_writer->Write(std::move(key_value_batch)));
-        }
-        PAIMON_RETURN_NOT_OK(rolling_writer->Close());
-        PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<DataFileMeta>> flushed_files,
-                               rolling_writer->GetResult());
-        async_key_value_producer_consumer->Close();
-        write_guard.Release();
-
-        for (const auto& flushed_file : flushed_files) {
-            new_files_.emplace_back(flushed_file);
-            PAIMON_RETURN_NOT_OK(compact_manager_->AddNewFile(flushed_file));
-        }
-        metrics_->Merge(rolling_writer->GetMetrics());
+        PAIMON_RETURN_NOT_OK(WriteSortedReaders(std::move(readers)));
     }
     PAIMON_RETURN_NOT_OK(TrySyncLatestCompaction(wait_for_latest_compaction));
     PAIMON_RETURN_NOT_OK(compact_manager_->TriggerCompaction(forced_full_compaction));
+    return Status::OK();
+}
+
+Status MergeTreeWriter::WriteSortedReaders(
+    std::vector<std::unique_ptr<KeyValueRecordReader>>&& sorted_readers) {
+    // prepare loser tree sort merge reader
+    auto sort_merge_reader = std::make_unique<SortMergeReaderWithLoserTree>(
+        std::move(sorted_readers), key_comparator_, user_defined_seq_comparator_,
+        merge_function_wrapper_);
+    // project key value to arrow array
+    auto create_consumer = [target_schema = write_schema_, pool = pool_]()
+        -> Result<std::unique_ptr<RowToArrowArrayConverter<KeyValue, KeyValueBatch>>> {
+        return KeyValueMetaProjectionConsumer::Create(target_schema, pool);
+    };
+    // consumer batch size is WriteBatchSize
+    auto async_key_value_producer_consumer =
+        std::make_unique<AsyncKeyValueProducerAndConsumer<KeyValue, KeyValueBatch>>(
+            std::move(sort_merge_reader), create_consumer, options_.GetWriteBatchSize(),
+            /*projection_thread_num=*/1, pool_);
+    ScopeGuard reader_guard([&]() { async_key_value_producer_consumer->Close(); });
+    std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>> rolling_writer;
+    PAIMON_ASSIGN_OR_RAISE(rolling_writer, CreateRollingRowWriter());
+    ScopeGuard write_guard([&]() { rolling_writer->Abort(); });
+    while (true) {
+        PAIMON_ASSIGN_OR_RAISE(KeyValueBatch key_value_batch,
+                               async_key_value_producer_consumer->NextBatch());
+        if (key_value_batch.batch == nullptr) {
+            break;
+        }
+        PAIMON_RETURN_NOT_OK(rolling_writer->Write(std::move(key_value_batch)));
+    }
+    PAIMON_RETURN_NOT_OK(rolling_writer->Close());
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<DataFileMeta>> flushed_files,
+                           rolling_writer->GetResult());
+    async_key_value_producer_consumer->Close();
+    reader_guard.Release();
+    write_guard.Release();
+
+    for (const auto& flushed_file : flushed_files) {
+        new_files_.emplace_back(flushed_file);
+        PAIMON_RETURN_NOT_OK(compact_manager_->AddNewFile(flushed_file));
+    }
+    metrics_->Merge(rolling_writer->GetMetrics());
     return Status::OK();
 }
 

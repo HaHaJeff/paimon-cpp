@@ -24,7 +24,10 @@
 #include <utility>
 #include <vector>
 
+#include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
+#include "paimon/core/realtime/primary_key_realtime_options.h"
+#include "paimon/core/schema/table_schema.h"
 #include "paimon/core/snapshot.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/plan_impl.h"
@@ -36,6 +39,38 @@
 #include "paimon/status.h"
 
 namespace paimon {
+
+Result<std::unique_ptr<TableScan>> RealtimeTableScan::Create(
+    std::unique_ptr<TableScan>&& disk_scan, const TableSchema& table_schema,
+    const CoreOptions& core_options, const ScanContext& context,
+    const std::shared_ptr<FileStorePathFactory>& path_factory,
+    const std::shared_ptr<SnapshotManager>& snapshot_manager) {
+    if (core_options.GetBucket() <= 0) {
+        return Status::Invalid("real-time union read requires fixed bucket mode");
+    }
+    if (core_options.DataEvolutionEnabled()) {
+        return Status::Invalid("real-time union read does not support data evolution");
+    }
+    if (!table_schema.PrimaryKeys().empty()) {
+        PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options));
+    }
+    if (context.IsStreamingMode()) {
+        return Status::Invalid("real-time union read currently supports batch scans only");
+    }
+    if (context.GetLimit()) {
+        return Status::Invalid("real-time union read does not support scan limit pushdown");
+    }
+    if (context.GetGlobalIndexResult()) {
+        return Status::Invalid("real-time union read does not support global index splits");
+    }
+    StartupMode startup_mode = core_options.GetStartupMode();
+    if (!(startup_mode == StartupMode::LatestFull() || startup_mode == StartupMode::Latest())) {
+        return Status::Invalid("real-time union read requires the latest snapshot");
+    }
+    return std::unique_ptr<TableScan>(new RealtimeTableScan(
+        std::move(disk_scan), context.GetRealtimeContext(), path_factory, snapshot_manager,
+        core_options.GetFileSystem(), context.GetScanFilters()));
+}
 
 int64_t RealtimeTableScan::GetCommittedOffset(const RealtimeOffsetMap& committed_offsets,
                                               const RealtimePartitionBucket& partition_bucket) {
@@ -105,7 +140,7 @@ Result<std::vector<std::shared_ptr<Split>>> RealtimeTableScan::CreateRealtimeSpl
     for (const std::shared_ptr<Split>& split : disk_splits) {
         std::shared_ptr<DataSplitImpl> data_split = std::dynamic_pointer_cast<DataSplitImpl>(split);
         if (!data_split) {
-            return Status::Invalid("real-time append scan requires process-local data splits");
+            return Status::Invalid("real-time scan requires process-local data splits");
         }
         std::vector<std::pair<std::string, std::string>> partition_values;
         PAIMON_ASSIGN_OR_RAISE(partition_values,

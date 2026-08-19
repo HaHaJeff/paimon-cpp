@@ -38,10 +38,37 @@
 
 namespace paimon {
 
+void CompleteRowKindBatchReader::ReleaseExportedArray(ArrowArray* array) {
+    std::unique_ptr<ExportedArrayPrivateData> private_data(
+        static_cast<ExportedArrayPrivateData*>(array->private_data));
+    array->release = private_data->release;
+    array->private_data = private_data->private_data;
+    array->release(array);
+}
+
+void CompleteRowKindBatchReader::RetainResources(
+    ArrowArray* array, std::unique_ptr<ExportedArrayPrivateData>&& private_data) {
+    private_data->release = array->release;
+    private_data->private_data = array->private_data;
+    array->release = ReleaseExportedArray;
+    array->private_data = private_data.release();
+}
+
 Result<BatchReader::ReadBatch> CompleteRowKindBatchReader::NextBatch() {
     PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatchWithBitmap batch_with_bitmap,
                            NextBatchWithBitmap());
-    return ReaderUtils::ApplyBitmapToReadBatch(std::move(batch_with_bitmap), arrow_pool_.get());
+    if (BatchReader::IsEofBatch(batch_with_bitmap) ||
+        batch_with_bitmap.second.Cardinality() == batch_with_bitmap.first.first->length) {
+        return std::move(batch_with_bitmap.first);
+    }
+    auto private_data = std::make_unique<ExportedArrayPrivateData>();
+    private_data->arrow_pool = arrow_pool_;
+    private_data->reader = reader_;
+    PAIMON_ASSIGN_OR_RAISE(
+        BatchReader::ReadBatch filtered,
+        ReaderUtils::ApplyBitmapToReadBatch(std::move(batch_with_bitmap), arrow_pool_.get()));
+    RetainResources(filtered.first.get(), std::move(private_data));
+    return filtered;
 }
 
 Result<BatchReader::ReadBatchWithBitmap> CompleteRowKindBatchReader::NextBatchWithBitmap() {
@@ -58,10 +85,14 @@ Result<BatchReader::ReadBatchWithBitmap> CompleteRowKindBatchReader::NextBatchWi
         return Status::Invalid("cannot cast array to StructArray in CompleteRowKindBatchReader");
     }
     auto struct_array = checked_pointer_cast<arrow::StructArray>(arrow_array);
+    auto private_data = std::make_unique<ExportedArrayPrivateData>();
+    private_data->arrow_pool = arrow_pool_;
+    private_data->reader = reader_;
     if (struct_array->GetFieldByName(SpecialFields::ValueKind().Name())) {
         // batch returned by reader_ has value kind, just return
         PAIMON_RETURN_NOT_OK_FROM_ARROW(
             arrow::ExportArray(*struct_array, c_array.get(), c_schema.get()));
+        RetainResources(c_array.get(), std::move(private_data));
         return batch_with_bitmap;
     }
     // create value kind array, all are insert
@@ -77,6 +108,7 @@ Result<BatchReader::ReadBatchWithBitmap> CompleteRowKindBatchReader::NextBatchWi
         arrow::StructArray::Make(fields_with_row_kind, field_names_with_row_kind_));
     PAIMON_RETURN_NOT_OK_FROM_ARROW(
         arrow::ExportArray(*array_with_row_kind, c_array.get(), c_schema.get()));
+    RetainResources(c_array.get(), std::move(private_data));
     return batch_with_bitmap;
 }
 

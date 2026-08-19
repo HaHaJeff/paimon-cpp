@@ -24,20 +24,58 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
+#include "arrow/c/abi.h"
 #include "paimon/reader/batch_reader.h"
 #include "paimon/record_batch.h"
 #include "paimon/result.h"
 #include "paimon/utils/range.h"
 #include "paimon/visibility.h"
 
-struct ArrowSchema;
-
 namespace paimon {
 
 class MemoryPool;
+class FileSystem;
 class Predicate;
+
+/// Creation settings for an append-table memory indexer.
+struct PAIMON_EXPORT AppendMemIndexerCreateConfig {};
+
+/// Creation settings used only by a primary-key memory indexer.
+struct PAIMON_EXPORT PrimaryKeyMemIndexerCreateConfig {
+    /// Trimmed primary-key field names.
+    std::vector<std::string> primary_keys;
+    /// Largest sequence number found in existing files, or `-1` when the bucket is empty.
+    int64_t restore_max_sequence_number;
+    /// Filesystem used by the built-in primary-key indexer.
+    std::shared_ptr<FileSystem> file_system;
+    /// Temporary directory used by the built-in primary-key indexer.
+    std::string temp_directory;
+    /// Whether the built-in primary-key indexer may spill with multiple threads.
+    bool enable_multi_thread_spill = false;
+};
+
+/// Strongly typed table-mode settings for memory-indexer creation.
+using MemIndexerCreateConfig =
+    std::variant<AppendMemIndexerCreateConfig, PrimaryKeyMemIndexerCreateConfig>;
+
+/// Common creation request for one partition-bucket memory indexer.
+struct PAIMON_EXPORT MemIndexerCreateRequest {
+    /// Complete write schema whose ownership is transferred to the factory.
+    std::unique_ptr<::ArrowSchema> write_schema;
+    /// Effective table options.
+    std::map<std::string, std::string> options;
+    /// Memory pool provided by the write context.
+    std::shared_ptr<MemoryPool> memory_pool;
+    /// Logical partition values, before partition-path escaping.
+    std::map<std::string, std::string> partition;
+    /// Fixed bucket id.
+    int32_t bucket = -1;
+    /// Explicit table-mode settings.
+    MemIndexerCreateConfig mode_config;
+};
 
 /// A table record batch and its framework-assigned contiguous offset range.
 ///
@@ -109,11 +147,10 @@ class PAIMON_EXPORT MemIndexer {
     /// Returns an immutable segment handle, or `std::nullopt` when there is no data to seal.
     virtual Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() = 0;
 
-    /// Creates readers that expose all rows in a sealed segment for Paimon file writing.
+    /// Creates readers for a sealed segment for Paimon file writing.
     ///
-    /// Concatenating the returned readers must produce every sealed row exactly once and in write
-    /// order. Each output batch contains `_VALUE_KIND` followed by all fields from the factory's
-    /// `write_schema`.
+    /// The factory-specific contract defines reader ordering, output schema, and whether mutations
+    /// are combined.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -147,19 +184,19 @@ class PAIMON_EXPORT MemIndexer {
 };
 
 /// Factory for application-provided `MemIndexer` implementations.
+///
+/// In append mode, concatenating `CreateCommitReaders` results must reproduce the raw input stream
+/// exactly once and in write order. Each batch contains `_VALUE_KIND` followed by the write fields.
+/// In primary-key mode, each reader must be sorted by primary key and contain non-null
+/// `_SEQUENCE_NUMBER` and `_VALUE_KIND` followed by the write fields. Readers need not be globally
+/// sorted with one another. A custom factory may support either mode and return `NotImplemented`
+/// for the other.
 class PAIMON_EXPORT MemIndexerFactory {
  public:
     virtual ~MemIndexerFactory() = default;
 
-    /// Creates an indexer configured with the supplied schema, options, and memory pool.
-    /// @param write_schema Complete table write schema whose ownership is transferred to the
-    /// factory. The factory may consume it or retain it in the created indexer.
-    /// @param options Effective table options available to the indexer.
-    /// @param memory_pool Memory pool provided by the write context.
-    virtual Result<std::shared_ptr<MemIndexer>> Create(
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool) = 0;
+    /// Creates an indexer by consuming the complete request.
+    virtual Result<std::shared_ptr<MemIndexer>> Create(MemIndexerCreateRequest&& request) = 0;
 };
 
 }  // namespace paimon

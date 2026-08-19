@@ -95,7 +95,7 @@ class PAIMON_EXPORT FileStoreWrite {
     /// Generates commit messages together with partition-bucket real-time offset ranges.
     ///
     /// Each range is returned atomically with the commit message generated from the same sealed
-    /// segment.
+    /// segment. Real-time writers do not perform internal compaction.
     ///
     /// @param commit_identifier Identifier of this prepare-commit operation in streaming mode.
     /// @return Real-time commit messages with their partition-bucket offset ranges.

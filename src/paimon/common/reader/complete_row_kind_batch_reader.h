@@ -60,13 +60,24 @@ class CompleteRowKindBatchReader : public BatchReader {
     }
 
  private:
+    struct ExportedArrayPrivateData {
+        void (*release)(ArrowArray*);
+        void* private_data;
+        std::shared_ptr<arrow::MemoryPool> arrow_pool;
+        std::shared_ptr<BatchReader> reader;
+    };
+
+    static void ReleaseExportedArray(ArrowArray* array);
+    static void RetainResources(ArrowArray* array,
+                                std::unique_ptr<ExportedArrayPrivateData>&& private_data);
+
     Result<std::shared_ptr<arrow::Array>> PrepareRowKindArray(int32_t struct_array_length);
 
     void UpdateFieldNamesWithRowKind(const std::shared_ptr<arrow::StructArray>& struct_array);
 
  private:
-    std::unique_ptr<arrow::MemoryPool> arrow_pool_;
-    std::unique_ptr<BatchReader> reader_;
+    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
+    std::shared_ptr<BatchReader> reader_;
     std::shared_ptr<arrow::Array> row_kind_array_;
     std::vector<std::string> field_names_with_row_kind_;
 };

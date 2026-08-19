@@ -49,6 +49,7 @@ namespace paimon {
 class DataFilePathFactory;
 class IOManager;
 class FieldsComparator;
+class KeyValueRecordReader;
 class MemoryPool;
 class Metrics;
 template <typename T>
@@ -68,6 +69,8 @@ class MergeTreeWriter : public BatchWriter {
         const std::shared_ptr<MemoryPool>& pool);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
+
+    Status WriteSortedReaders(std::vector<std::unique_ptr<KeyValueRecordReader>>&& sorted_readers);
 
     Status Compact(bool full_compaction) override;
 

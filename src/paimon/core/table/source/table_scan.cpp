@@ -214,36 +214,6 @@ Result<std::unique_ptr<TableScan>> TableScan::Create(std::unique_ptr<ScanContext
 
 namespace {
 
-Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& core_options,
-                            const ScanContext& context) {
-    if (!context.GetRealtimeContext()) {
-        return Status::OK();
-    }
-    if (!table_schema.PrimaryKeys().empty()) {
-        return Status::Invalid("real-time union read currently supports append tables only");
-    }
-    if (core_options.GetBucket() <= 0) {
-        return Status::Invalid("real-time union read requires fixed bucket mode");
-    }
-    if (core_options.DataEvolutionEnabled()) {
-        return Status::Invalid("real-time union read does not support data evolution");
-    }
-    if (context.IsStreamingMode()) {
-        return Status::Invalid("real-time union read currently supports batch scans only");
-    }
-    if (context.GetLimit()) {
-        return Status::Invalid("real-time union read does not support scan limit pushdown");
-    }
-    if (context.GetGlobalIndexResult()) {
-        return Status::Invalid("real-time union read does not support global index splits");
-    }
-    StartupMode startup_mode = core_options.GetStartupMode();
-    if (!(startup_mode == StartupMode::LatestFull() || startup_mode == StartupMode::Latest())) {
-        return Status::Invalid("real-time union read requires the latest snapshot");
-    }
-    return Status::OK();
-}
-
 Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanContext>& context) {
     PAIMON_ASSIGN_OR_RAISE(
         CoreOptions tmp_options,
@@ -275,7 +245,6 @@ Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanCo
                            CoreOptions::FromMap(options, context->GetSpecificFileSystem(), {}));
     core_options.WithCache(context->GetCache());
 
-    PAIMON_RETURN_NOT_OK(ValidateRealtimeScan(*table_schema, core_options, *context));
     // validate options
     if (core_options.GetBucket() == -1) {
         if (!table_schema->PrimaryKeys().empty()) {
@@ -328,23 +297,27 @@ Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanCo
         return Status::NotImplemented(
             "read-optimized system table does not support streaming scan for primary key table");
     }
+    std::unique_ptr<TableScan> disk_scan;
     if (context->IsStreamingMode()) {
-        return std::make_unique<DataTableStreamScan>(core_options, snapshot_reader);
+        disk_scan = std::make_unique<DataTableStreamScan>(core_options, snapshot_reader);
+    } else {
+        auto batch_scan = std::make_unique<DataTableBatchScan>(
+            /*pk_table=*/pk_table, core_options, snapshot_reader, read_optimized,
+            context->GetLimit());
+        if (core_options.DataEvolutionEnabled()) {
+            disk_scan = std::make_unique<DataEvolutionBatchScan>(
+                context->GetPath(), snapshot_reader, std::move(batch_scan),
+                context->GetGlobalIndexResult(), core_options, context->GetMemoryPool(),
+                context->GetExecutor());
+        } else {
+            disk_scan = std::move(batch_scan);
+        }
     }
-    auto batch_scan = std::make_unique<DataTableBatchScan>(
-        /*pk_table=*/pk_table, core_options, snapshot_reader, read_optimized, context->GetLimit());
-    if (context->GetRealtimeContext()) {
-        return std::make_unique<RealtimeTableScan>(
-            std::move(batch_scan), context->GetRealtimeContext(), path_factory,
-            snapshot_reader->GetSnapshotManager(), core_options.GetFileSystem(),
-            context->GetScanFilters());
+    if (!context->GetRealtimeContext()) {
+        return disk_scan;
     }
-    if (!core_options.DataEvolutionEnabled()) {
-        return batch_scan;
-    }
-    return std::make_unique<DataEvolutionBatchScan>(
-        context->GetPath(), snapshot_reader, std::move(batch_scan), context->GetGlobalIndexResult(),
-        core_options, context->GetMemoryPool(), context->GetExecutor());
+    return RealtimeTableScan::Create(std::move(disk_scan), *table_schema, core_options, *context,
+                                     path_factory, snapshot_reader->GetSnapshotManager());
 }
 
 }  // namespace

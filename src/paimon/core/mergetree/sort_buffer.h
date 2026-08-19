@@ -58,6 +58,12 @@ class SortBuffer {
     /// This does not clear the buffer; the caller should invoke Clear() afterwards.
     virtual Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() = 0;
 
+    /// Create readers from current buffered data without running the final spill-file merge.
+    virtual Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
+    CreateReadersWithoutFinalMerge() {
+        return CreateReaders();
+    }
+
     /// Return true if there is any data to output (in-memory or on-disk).
     virtual bool HasData() const = 0;
 };

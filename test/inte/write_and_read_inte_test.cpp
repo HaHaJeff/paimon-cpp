@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -33,10 +34,12 @@
 #include "gtest/gtest.h"
 #include "paimon/commit_context.h"
 #include "paimon/common/data/shredding/map_shared_shredding_utils.h"
+#include "paimon/common/factories/io_hook.h"
 #include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/path_util.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/common/utils/string_utils.h"
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/schema/schema_manager.h"
@@ -51,6 +54,7 @@
 #include "paimon/predicate/predicate_builder.h"
 #include "paimon/read_context.h"
 #include "paimon/reader/batch_reader.h"
+#include "paimon/realtime/realtime_context.h"
 #include "paimon/record_batch.h"
 #include "paimon/result.h"
 #include "paimon/scan_context.h"
@@ -73,6 +77,11 @@ namespace paimon::test {
 class WriteAndReadInteTest
     : public ::testing::Test,
       public ::testing::WithParamInterface<std::pair<std::string, std::string>> {
+    struct RealtimeWriterState {
+        std::shared_ptr<RealtimeContext> context;
+        std::unique_ptr<FileStoreWrite> writer;
+    };
+
     void SetUp() override {
         auto [file_format, file_system] = GetParam();
         dir_ = UniqueTestDirectory::Create(file_system);
@@ -255,6 +264,109 @@ class WriteAndReadInteTest
         return MapSharedShreddingUtils::DeserializeMetadata(metadata_copy);
     }
 
+    std::map<std::string, std::string> PkRealtimeRecoveryOptions(
+        const std::string& file_format, const std::string& file_system) const {
+        return {
+            {Options::MANIFEST_FORMAT, "avro"},
+            {Options::FILE_FORMAT, file_format},
+            {Options::BUCKET, "1"},
+            {Options::BUCKET_KEY, "id"},
+            {Options::FILE_SYSTEM, file_system},
+            {Options::WRITE_BUFFER_SIZE, "1"},
+            {Options::WRITE_BUFFER_SPILLABLE, "true"},
+            {Options::WRITE_ONLY, "true"},
+        };
+    }
+
+    Result<std::unique_ptr<TestHelper>> CreatePkRealtimeRecoveryTable(
+        const std::string& root_path, const arrow::FieldVector& fields,
+        const std::map<std::string, std::string>& options) const {
+        const std::string temp_directory = PathUtil::JoinPath(root_path, "spill");
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<TestHelper> helper,
+            TestHelper::Create(root_path, arrow::schema(fields), /*partition_keys=*/{},
+                               /*primary_keys=*/{"id"}, options,
+                               /*is_streaming_mode=*/false, /*ignore_if_exists=*/false,
+                               temp_directory));
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<RecordBatch> seed_batch,
+            TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([[1, "old"]])",
+                                        /*partition_map=*/{}, /*bucket=*/0, {}));
+        PAIMON_RETURN_NOT_OK(helper->WriteAndCommit(std::move(seed_batch), /*commit_identifier=*/0,
+                                                    /*expected_commit_messages=*/std::nullopt));
+        PAIMON_RETURN_NOT_OK(helper->write_->Close());
+        helper->write_.reset();
+        return helper;
+    }
+
+    Result<RealtimeWriterState> CreatePkRealtimeWriter(
+        const std::string& root_path, const std::map<std::string, std::string>& options) const {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContext> context, RealtimeContext::Create());
+        WriteContextBuilder builder(PathUtil::JoinPath(root_path, "foo.db/bar"),
+                                    /*commit_user=*/"commit_user");
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteContext> write_context,
+                               builder.SetOptions(options)
+                                   .WithStreamingMode(true)
+                                   .WithRealtimeContext(context)
+                                   .WithTempDirectory(PathUtil::JoinPath(root_path, "spill"))
+                                   .Finish());
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreWrite> writer,
+                               FileStoreWrite::Create(std::move(write_context)));
+        return RealtimeWriterState{std::move(context), std::move(writer)};
+    }
+
+    Status ReplayPkRealtimeInput(TestHelper* helper, const std::string& root_path,
+                                 const arrow::FieldVector& fields,
+                                 const std::map<std::string, std::string>& options,
+                                 const std::string& durable_input) const {
+        arrow::FieldVector expected_fields = fields;
+        expected_fields.insert(expected_fields.begin(), arrow::field("_VALUE_KIND", arrow::int8()));
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<std::shared_ptr<Split>> splits_before_replay,
+            helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt,
+                            /*is_streaming=*/false));
+        PAIMON_ASSIGN_OR_RAISE(
+            bool unchanged, helper->ReadAndCheckResult(arrow::struct_(expected_fields),
+                                                       splits_before_replay, R"([[0, 1, "old"]])"));
+        if (!unchanged) {
+            return Status::Invalid("failed real-time attempt changed committed rows");
+        }
+
+        PAIMON_ASSIGN_OR_RAISE(RealtimeWriterState state,
+                               CreatePkRealtimeWriter(root_path, options));
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<RecordBatch> replay_batch,
+                               TestHelper::MakeRecordBatch(arrow::struct_(fields), durable_input,
+                                                           /*partition_map=*/{}, /*bucket=*/0, {}));
+        PAIMON_RETURN_NOT_OK(state.writer->Write(std::move(replay_batch)));
+        PAIMON_ASSIGN_OR_RAISE(std::vector<RealtimeCommitProgress> progress,
+                               state.writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+        if (progress.size() != 1 || progress[0].offset_range.from != 0 ||
+            progress[0].offset_range.to != 1) {
+            return Status::Invalid("replayed real-time progress has an unexpected offset range");
+        }
+        PAIMON_ASSIGN_OR_RAISE(int64_t snapshot_id, helper->commit_->CommitWithProgress(
+                                                        progress, /*commit_identifier=*/1,
+                                                        /*watermark=*/std::nullopt));
+        if (snapshot_id < 1) {
+            return Status::Invalid("replayed real-time commit returned an invalid snapshot id");
+        }
+        PAIMON_RETURN_NOT_OK(state.writer->Close());
+        state.writer.reset();
+        state.context.reset();
+
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<std::shared_ptr<Split>> splits,
+            helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt,
+                            /*is_streaming=*/false));
+        PAIMON_ASSIGN_OR_RAISE(bool success,
+                               helper->ReadAndCheckResult(arrow::struct_(expected_fields), splits,
+                                                          R"([[0, 1, "new"], [0, 2, "two"]])"));
+        if (!success) {
+            return Status::Invalid("replayed real-time rows do not match the expected result");
+        }
+        return Status::OK();
+    }
+
  private:
     std::string test_dir_;
     std::unique_ptr<UniqueTestDirectory> dir_;
@@ -368,6 +480,156 @@ TEST_P(WriteAndReadInteTest, TestPKSimple) {
     ])";
     ASSERT_OK_AND_ASSIGN(bool success, helper->ReadAndCheckResult(data_type, data_splits, data));
     ASSERT_TRUE(success);
+}
+
+TEST_P(WriteAndReadInteTest, TestPkRealtimeWriteRecovery) {
+    auto [file_format, file_system] = GetParam();
+    if (file_format != "parquet" || file_system != "local") {
+        return;
+    }
+
+    const arrow::FieldVector fields = {arrow::field("id", arrow::int64()),
+                                       arrow::field("payload", arrow::utf8())};
+    const std::map<std::string, std::string> options =
+        PkRealtimeRecoveryOptions(file_format, file_system);
+    const std::string durable_input = R"([[1, "new"], [2, "two"]])";
+    IOHook* io_hook = IOHook::GetInstance();
+    ScopeGuard hook_guard([io_hook]() { io_hook->Clear(); });
+
+    const std::string probe_root = PathUtil::JoinPath(test_dir_, "write-probe");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> probe_helper,
+                         CreatePkRealtimeRecoveryTable(probe_root, fields, options));
+    ASSERT_OK_AND_ASSIGN(RealtimeWriterState probe_state,
+                         CreatePkRealtimeWriter(probe_root, options));
+    // Initialize the partition-bucket writer before enabling the hook so the measured I/O belongs
+    // to spill inside the non-empty Write call.
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> empty_batch,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), "[]",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(probe_state.writer->Write(std::move(empty_batch)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> probe_batch,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), durable_input,
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    io_hook->Reset(std::numeric_limits<int64_t>::max(), IOHook::Mode::RETURN_ERROR);
+    ASSERT_OK(probe_state.writer->Write(std::move(probe_batch)));
+    const int64_t write_io_count = io_hook->IOCount();
+    io_hook->Clear();
+    ASSERT_GT(write_io_count, 1);
+    ASSERT_GT(TestHelper::CountChannelFiles(dir_->GetFileSystem(),
+                                            PathUtil::JoinPath(probe_root, "spill")),
+              0);
+    probe_state.writer.reset();
+    probe_state.context.reset();
+    ASSERT_EQ(TestHelper::CountChannelFiles(dir_->GetFileSystem(),
+                                            PathUtil::JoinPath(probe_root, "spill")),
+              0);
+
+    const std::vector<int64_t> positions = {0, write_io_count - 1};
+    for (int64_t position : positions) {
+        SCOPED_TRACE(fmt::format("write io position {} of {}", position, write_io_count));
+        const std::string root_path =
+            PathUtil::JoinPath(test_dir_, fmt::format("write-{}", position));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                             CreatePkRealtimeRecoveryTable(root_path, fields, options));
+        ASSERT_OK_AND_ASSIGN(RealtimeWriterState state, CreatePkRealtimeWriter(root_path, options));
+        // Keep lazy writer creation outside the injected Write call.
+        ASSERT_OK_AND_ASSIGN(empty_batch,
+                             TestHelper::MakeRecordBatch(arrow::struct_(fields), "[]",
+                                                         /*partition_map=*/{}, /*bucket=*/0, {}));
+        ASSERT_OK(state.writer->Write(std::move(empty_batch)));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                             TestHelper::MakeRecordBatch(arrow::struct_(fields), durable_input,
+                                                         /*partition_map=*/{}, /*bucket=*/0, {}));
+
+        io_hook->Reset(position, IOHook::Mode::RETURN_ERROR);
+        Status failed_write = state.writer->Write(std::move(batch));
+        const int64_t observed_io_count = io_hook->IOCount();
+        io_hook->Clear();
+        ASSERT_TRUE(failed_write.IsIOError()) << failed_write.ToString();
+        ASSERT_GT(observed_io_count, position);
+        ASSERT_NE(failed_write.ToString().find(
+                      fmt::format("io hook triggered io error at position {}", position)),
+                  std::string::npos);
+
+        state.writer.reset();
+        state.context.reset();
+        ASSERT_EQ(TestHelper::CountChannelFiles(dir_->GetFileSystem(),
+                                                PathUtil::JoinPath(root_path, "spill")),
+                  0);
+        ASSERT_OK(ReplayPkRealtimeInput(helper.get(), root_path, fields, options, durable_input));
+    }
+}
+
+TEST_P(WriteAndReadInteTest, TestPkRealtimePrepareRecovery) {
+    auto [file_format, file_system] = GetParam();
+    if (file_format != "parquet" || file_system != "local") {
+        return;
+    }
+
+    const arrow::FieldVector fields = {arrow::field("id", arrow::int64()),
+                                       arrow::field("payload", arrow::utf8())};
+    const std::map<std::string, std::string> options =
+        PkRealtimeRecoveryOptions(file_format, file_system);
+    const std::string durable_input = R"([[1, "new"], [2, "two"]])";
+    IOHook* io_hook = IOHook::GetInstance();
+    ScopeGuard hook_guard([io_hook]() { io_hook->Clear(); });
+
+    const std::string probe_root = PathUtil::JoinPath(test_dir_, "prepare-probe");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> probe_helper,
+                         CreatePkRealtimeRecoveryTable(probe_root, fields, options));
+    ASSERT_OK_AND_ASSIGN(RealtimeWriterState probe_state,
+                         CreatePkRealtimeWriter(probe_root, options));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> probe_batch,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), durable_input,
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(probe_state.writer->Write(std::move(probe_batch)));
+    io_hook->Reset(std::numeric_limits<int64_t>::max(), IOHook::Mode::RETURN_ERROR);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> probe_progress,
+                         probe_state.writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    const int64_t prepare_io_count = io_hook->IOCount();
+    io_hook->Clear();
+    ASSERT_EQ(probe_progress.size(), 1);
+    ASSERT_GT(prepare_io_count, 2);
+    ASSERT_OK(probe_state.writer->Close());
+    probe_state.writer.reset();
+    probe_state.context.reset();
+
+    // The final prepare I/O is quiet cleanup. The preceding position is the latest one whose
+    // failure is returned to the caller.
+    std::vector<int64_t> positions = {0, prepare_io_count / 2, prepare_io_count - 2};
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+    ASSERT_GE(positions.size(), 2);
+    for (int64_t position : positions) {
+        SCOPED_TRACE(fmt::format("prepare io position {} of {}", position, prepare_io_count));
+        const std::string root_path =
+            PathUtil::JoinPath(test_dir_, fmt::format("prepare-{}", position));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                             CreatePkRealtimeRecoveryTable(root_path, fields, options));
+        ASSERT_OK_AND_ASSIGN(RealtimeWriterState state, CreatePkRealtimeWriter(root_path, options));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                             TestHelper::MakeRecordBatch(arrow::struct_(fields), durable_input,
+                                                         /*partition_map=*/{}, /*bucket=*/0, {}));
+        ASSERT_OK(state.writer->Write(std::move(batch)));
+
+        io_hook->Reset(position, IOHook::Mode::RETURN_ERROR);
+        Result<std::vector<RealtimeCommitProgress>> failed_prepare =
+            state.writer->PrepareCommitWithProgress(/*commit_identifier=*/1);
+        const int64_t observed_io_count = io_hook->IOCount();
+        io_hook->Clear();
+        ASSERT_TRUE(failed_prepare.status().IsIOError()) << failed_prepare.status().ToString();
+        ASSERT_GT(observed_io_count, position);
+        ASSERT_NE(failed_prepare.status().ToString().find(
+                      fmt::format("io hook triggered io error at position {}", position)),
+                  std::string::npos);
+
+        state.writer.reset();
+        state.context.reset();
+        ASSERT_EQ(TestHelper::CountChannelFiles(dir_->GetFileSystem(),
+                                                PathUtil::JoinPath(root_path, "spill")),
+                  0);
+        ASSERT_OK(ReplayPkRealtimeInput(helper.get(), root_path, fields, options, durable_input));
+    }
 }
 
 TEST_P(WriteAndReadInteTest, TestNestedType) {

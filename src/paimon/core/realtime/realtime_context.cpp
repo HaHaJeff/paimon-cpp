@@ -29,6 +29,7 @@
 
 #include "arrow/c/helpers.h"
 #include "paimon/arrow/abi.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/macros.h"
 #include "paimon/realtime/arrow_mem_indexer_factory.h"
 #include "paimon/realtime/mem_indexer.h"
@@ -38,32 +39,27 @@ namespace paimon {
 
 class RealtimeContext::Impl {
  public:
-    explicit Impl(const std::shared_ptr<MemIndexerFactory>& factory) : factory_(factory) {}
+    explicit Impl(std::shared_ptr<MemIndexerFactory> factory) : factory_(std::move(factory)) {}
 
-    Result<RealtimeMemIndexerState> GetOrCreateMemIndexer(
-        const std::map<std::string, std::string>& partition, int32_t bucket,
-        std::unique_ptr<ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool) {
+    Result<RealtimeMemIndexerState> GetOrCreate(MemIndexerCreateRequest&& request) {
+        ScopeGuard schema_guard([schema = request.write_schema.get()]() {
+            if (schema && schema->release) {
+                ArrowSchemaRelease(schema);
+            }
+        });
         std::lock_guard<std::mutex> progress_lock(progress_mutex_);
         std::lock_guard<std::mutex> registry_lock(mutex_);
-        const RealtimePartitionBucket key(partition, bucket);
+        const RealtimePartitionBucket key(request.partition, request.bucket);
         int64_t initial_offset = 0;
         auto offset_iter = committed_offsets_.find(key);
         if (offset_iter != committed_offsets_.end()) {
             if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
-                if (write_schema) {
-                    ArrowSchemaRelease(write_schema.get());
-                }
                 return Status::Invalid("real-time offset has reached INT64_MAX");
             }
             initial_offset = offset_iter->second + 1;
         }
         auto iter = indexers_.find(key);
         if (iter != indexers_.end()) {
-            if (write_schema) {
-                ArrowSchemaRelease(write_schema.get());
-            }
             PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemReadView> read_view,
                                    iter->second->AcquireReadView());
             if (!read_view) {
@@ -82,9 +78,12 @@ class RealtimeContext::Impl {
             }
             return RealtimeMemIndexerState{iter->second, initial_offset};
         }
-        Result<std::shared_ptr<MemIndexer>> indexer_result =
-            factory_->Create(std::move(write_schema), options, memory_pool);
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer, std::move(indexer_result));
+        schema_guard.Release();
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> indexer,
+                               factory_->Create(std::move(request)));
+        if (!indexer) {
+            return Status::Invalid("mem indexer factory returned null");
+        }
         indexers_.emplace(key, indexer);
         if (offset_iter != committed_offsets_.end()) {
             reclaimed_offsets_.emplace(key, offset_iter->second);
@@ -92,6 +91,16 @@ class RealtimeContext::Impl {
         return RealtimeMemIndexerState{std::move(indexer), initial_offset};
     }
 
+    Status BindPrimaryKeyWriter() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (primary_key_writer_bound_) {
+            return Status::Invalid("real-time context is already bound to a primary-key writer");
+        }
+        primary_key_writer_bound_ = true;
+        return Status::OK();
+    }
+
+ public:
     Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews() {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<RealtimePartitionBucketView> result;
@@ -166,6 +175,7 @@ class RealtimeContext::Impl {
     std::mutex mutex_;
     std::mutex progress_mutex_;
     std::map<RealtimePartitionBucket, std::shared_ptr<MemIndexer>> indexers_;
+    bool primary_key_writer_bound_ = false;
     RealtimeOffsetMap committed_offsets_;
     RealtimeOffsetMap reclaimed_offsets_;
     std::optional<int64_t> last_refreshed_snapshot_id_;
@@ -188,11 +198,8 @@ RealtimeContext::RealtimeContext(std::unique_ptr<Impl>&& impl) : impl_(std::move
 RealtimeContext::~RealtimeContext() = default;
 
 Result<RealtimeMemIndexerState> RealtimeContext::GetOrCreateMemIndexer(
-    const std::map<std::string, std::string>& partition, int32_t bucket,
-    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
-    return impl_->GetOrCreateMemIndexer(partition, bucket, std::move(write_schema), options,
-                                        memory_pool);
+    MemIndexerCreateRequest&& request) {
+    return impl_->GetOrCreate(std::move(request));
 }
 
 Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadViews() {
@@ -202,6 +209,10 @@ Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadVie
 Status RealtimeContext::AdvanceCommittedProgress(int64_t snapshot_id,
                                                  const RealtimeOffsetMap& committed_offsets) {
     return impl_->AdvanceCommittedProgress(snapshot_id, committed_offsets);
+}
+
+Status RealtimeContext::BindPrimaryKeyWriter() {
+    return impl_->BindPrimaryKeyWriter();
 }
 
 }  // namespace paimon

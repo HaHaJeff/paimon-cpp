@@ -36,6 +36,7 @@
 #include "paimon/core/operation/key_value_file_store_write.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/postpone/postpone_bucket_file_store_write.h"
+#include "paimon/core/realtime/primary_key_realtime_options.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/table/bucket_mode.h"
@@ -55,6 +56,24 @@ namespace paimon {
 struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
+
+namespace {
+
+Status ValidatePrimaryKeyRealtimeWriteContext(const WriteContext& context,
+                                              bool ignore_previous_files) {
+    if (ignore_previous_files) {
+        return Status::NotImplemented("PK realtime v1 requires restore from the latest snapshot");
+    }
+    if (!context.GetWriteSchema().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support a custom write schema");
+    }
+    if (context.GetTempDirectory().empty()) {
+        return Status::Invalid("PK realtime v1 requires a spill temp directory");
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 Result<std::vector<RealtimeCommitProgress>> FileStoreWrite::PrepareCommitWithProgress(int64_t) {
     return Status::Invalid("prepare commit with progress requires a real-time writer");
@@ -191,7 +210,18 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            return Status::Invalid("real-time write currently supports append tables only");
+            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeWriteOptions(options));
+            PAIMON_RETURN_NOT_OK(
+                ValidatePrimaryKeyRealtimeWriteContext(*ctx, ignore_previous_files));
+            PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
+                                   snapshot_manager->LatestSnapshot());
+            if (latest_snapshot) {
+                PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap realtime_committed_offsets,
+                                       RealtimeCommitProperties::ReadOffsets(
+                                           latest_snapshot, options.GetFileSystem()));
+                PAIMON_RETURN_NOT_OK(ctx->GetRealtimeContext()->AdvanceCommittedProgress(
+                    latest_snapshot->Id(), realtime_committed_offsets));
+            }
         }
         if (options.GetBucket() == BucketModeDefine::POSTPONE_BUCKET) {
             return PostponeBucketFileStoreWrite::Create(
@@ -242,12 +272,16 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                 std::make_shared<BucketedDvMaintainer::Factory>(index_file_handler);
         }
 
+        if (ctx->GetRealtimeContext()) {
+            PAIMON_RETURN_NOT_OK(ctx->GetRealtimeContext()->BindPrimaryKeyWriter());
+        }
         return std::make_unique<KeyValueFileStoreWrite>(
             file_store_path_factory, snapshot_manager, schema_manager, ctx->GetCommitUser(),
             ctx->GetRootPath(), schema, arrow_schema, partition_schema, dv_maintainer_factory,
             io_manager, key_comparator, sequence_fields_comparator, merge_function_wrapper, options,
             ignore_previous_files, ctx->IsStreamingMode(), ctx->IgnoreNumBucketCheck(),
-            ctx->EnableMultiThreadSpill(), ctx->GetExecutor(), ctx->GetMemoryPool());
+            ctx->EnableMultiThreadSpill(), ctx->GetRealtimeContext(), ctx->GetExecutor(),
+            ctx->GetMemoryPool());
     }
 }
 

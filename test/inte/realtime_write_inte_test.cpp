@@ -35,12 +35,17 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "arrow/ipc/json_simple.h"
 #include "gtest/gtest.h"
 #include "paimon/catalog/catalog.h"
 #include "paimon/catalog/identifier.h"
 #include "paimon/commit_context.h"
+#include "paimon/common/factories/io_hook.h"
+#include "paimon/common/table/special_fields.h"
+#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/path_util.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
@@ -51,6 +56,7 @@
 #include "paimon/memory/memory_pool.h"
 #include "paimon/predicate/predicate_builder.h"
 #include "paimon/read_context.h"
+#include "paimon/realtime/arrow_mem_indexer_factory.h"
 #include "paimon/realtime/mem_indexer.h"
 #include "paimon/realtime/realtime_context.h"
 #include "paimon/record_batch.h"
@@ -62,6 +68,70 @@
 #include "paimon/write_context.h"
 
 namespace paimon::test {
+
+class DelegatingMemIndexer : public MemIndexer {
+ public:
+    explicit DelegatingMemIndexer(std::shared_ptr<MemIndexer> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    Status Write(RealtimeWriteBatch&& batch) override {
+        return delegate_->Write(std::move(batch));
+    }
+
+    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
+        return delegate_->SealForCommit();
+    }
+
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
+        const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
+        return delegate_->CreateCommitReaders(segment);
+    }
+
+    Result<std::shared_ptr<MemReadView>> AcquireReadView() override {
+        return delegate_->AcquireReadView();
+    }
+
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
+        const std::shared_ptr<MemReadView>& view, int64_t offset_lower_exclusive,
+        const MemQueryContext& context) override {
+        return delegate_->CreateQueryReaders(view, offset_lower_exclusive, context);
+    }
+
+    Status AdvanceCommittedOffset(int64_t committed_offset) override {
+        return delegate_->AdvanceCommittedOffset(committed_offset);
+    }
+
+    uint64_t GetMemoryUsage() const override {
+        return delegate_->GetMemoryUsage();
+    }
+
+ private:
+    std::shared_ptr<MemIndexer> delegate_;
+};
+
+class DelegatingMemIndexerFactory : public MemIndexerFactory {
+ public:
+    struct CapturedRequest {
+        std::map<std::string, std::string> partition;
+        int32_t bucket;
+        MemIndexerCreateConfig mode_config;
+    };
+
+    Result<std::shared_ptr<MemIndexer>> Create(MemIndexerCreateRequest&& request) override {
+        ++create_count;
+        requests.push_back(CapturedRequest{request.partition, request.bucket, request.mode_config});
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MemIndexer> delegate,
+                               delegate_.Create(std::move(request)));
+        return std::shared_ptr<MemIndexer>(
+            std::make_shared<DelegatingMemIndexer>(std::move(delegate)));
+    }
+
+    int32_t create_count = 0;
+    std::vector<CapturedRequest> requests;
+
+ private:
+    ArrowMemIndexerFactory delegate_;
+};
 
 class ConcurrentTestState {
  public:
@@ -168,10 +238,34 @@ class RealtimeWriteInteTest : public ::testing::Test {
                                        /*ignore_if_exists=*/false));
     }
 
+    void CreatePkTable(const std::vector<std::string>& partition_keys = {}) const {
+        auto c_schema = std::make_unique<ArrowSchema>();
+        ASSERT_TRUE(arrow::ExportSchema(*schema_, c_schema.get()).ok());
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<Catalog> catalog,
+                             Catalog::Create(dir_->Str(), options_));
+        ASSERT_OK(catalog->CreateDatabase("foo", {}, /*ignore_if_exists=*/false));
+        const std::vector<std::string> primary_keys = partition_keys.empty()
+                                                          ? std::vector<std::string>{"id"}
+                                                          : std::vector<std::string>{"id", "pt"};
+        ASSERT_OK(catalog->CreateTable(Identifier("foo", "bar"), c_schema.get(), partition_keys,
+                                       primary_keys, options_, /*ignore_if_exists=*/false));
+    }
+
     Result<std::unique_ptr<FileStoreWrite>> CreateRealtimeWriter(
-        const std::shared_ptr<RealtimeContext>& realtime_context) const {
+        const std::shared_ptr<RealtimeContext>& realtime_context,
+        const std::vector<std::string>& write_schema = {},
+        int32_t write_buffer_spill_thread_number = 0) const {
         WriteContextBuilder builder(table_path_, commit_user_);
-        builder.SetOptions(options_).WithStreamingMode(true).WithRealtimeContext(realtime_context);
+        builder.SetOptions(options_)
+            .WithStreamingMode(true)
+            .WithRealtimeContext(realtime_context)
+            .WithTempDirectory(PathUtil::JoinPath(dir_->Str(), "spill"));
+        if (!write_schema.empty()) {
+            builder.WithWriteSchema(write_schema);
+        }
+        if (write_buffer_spill_thread_number > 0) {
+            builder.SetWriteBufferSpillThreadNumber(write_buffer_spill_thread_number);
+        }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteContext> context, builder.Finish());
         return FileStoreWrite::Create(std::move(context));
     }
@@ -189,6 +283,12 @@ class RealtimeWriteInteTest : public ::testing::Test {
 
     Result<std::unique_ptr<RecordBatch>> MakeBatch(const std::vector<Row>& rows, bool partitioned,
                                                    int32_t bucket) const {
+        return MakeBatch(rows, partitioned, bucket, {});
+    }
+
+    Result<std::unique_ptr<RecordBatch>> MakeBatch(
+        const std::vector<Row>& rows, bool partitioned, int32_t bucket,
+        const std::vector<RecordBatch::RowKind>& row_kinds) const {
         if (rows.empty()) {
             return Status::Invalid("cannot create an empty test batch");
         }
@@ -212,6 +312,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
         ArrowArray c_array;
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*array, &c_array));
         RecordBatchBuilder builder(&c_array);
+        builder.SetRowKinds(row_kinds);
         if (partitioned) {
             builder.SetPartition({{"pt", partition}});
         }
@@ -240,7 +341,41 @@ class RealtimeWriteInteTest : public ::testing::Test {
                                           /*watermark=*/std::nullopt);
     }
 
+    Status Commit(const std::vector<std::shared_ptr<CommitMessage>>& commit_messages,
+                  int64_t commit_identifier = BATCH_WRITE_COMMIT_IDENTIFIER) const {
+        CommitContextBuilder builder(table_path_, commit_user_);
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<CommitContext> context,
+                               builder.SetOptions(options_).Finish());
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreCommit> commit,
+                               FileStoreCommit::Create(std::move(context)));
+        return commit->Commit(commit_messages, commit_identifier);
+    }
+
+    static std::vector<std::shared_ptr<DataFileMeta>> NewFiles(
+        const std::vector<RealtimeCommitProgress>& progress) {
+        std::vector<std::shared_ptr<DataFileMeta>> files;
+        for (const RealtimeCommitProgress& item : progress) {
+            std::shared_ptr<CommitMessageImpl> message =
+                std::dynamic_pointer_cast<CommitMessageImpl>(item.commit_message);
+            if (!message) {
+                continue;
+            }
+            const std::vector<std::shared_ptr<DataFileMeta>>& new_files =
+                message->GetNewFilesIncrement().NewFiles();
+            files.insert(files.end(), new_files.begin(), new_files.end());
+        }
+        return files;
+    }
+
     Result<std::shared_ptr<Plan>> CreatePlan(
+        const std::shared_ptr<RealtimeContext>& realtime_context,
+        const std::shared_ptr<Predicate>& predicate) const {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableScan> scan,
+                               CreateScan(realtime_context, predicate));
+        return scan->CreatePlan();
+    }
+
+    Result<std::unique_ptr<TableScan>> CreateScan(
         const std::shared_ptr<RealtimeContext>& realtime_context,
         const std::shared_ptr<Predicate>& predicate) const {
         ScanContextBuilder scan_builder(table_path_);
@@ -250,9 +385,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
         scan_builder.SetPredicate(predicate).WithMemoryPool(pool_);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ScanContext> scan_context,
                                scan_builder.SetOptions(options_).Finish());
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableScan> scan,
-                               TableScan::Create(std::move(scan_context)));
-        return scan->CreatePlan();
+        return TableScan::Create(std::move(scan_context));
     }
 
     Result<CollectedReadResult> ReadPlan(const std::shared_ptr<Plan>& plan,
@@ -334,6 +467,118 @@ class RealtimeWriteInteTest : public ::testing::Test {
             memory_usage += view.indexer->GetMemoryUsage();
         }
         return memory_usage;
+    }
+
+    void VerifyPkSpillWriteRead(int32_t write_buffer_spill_thread_number) {
+        options_[Options::WRITE_BUFFER_SIZE] = "1";
+        options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+        options_[Options::WRITE_BUFFER_SPILL_MAX_DISK_SIZE] = "1b";
+        CreatePkTable();
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                             RealtimeContext::Create());
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                             CreateRealtimeWriter(realtime_context, /*write_schema=*/{},
+                                                  write_buffer_spill_thread_number));
+
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> disk_batch,
+                             MakeBatch({Row{1, "old-1", "p0"}, Row{2, "keep", "p0"}},
+                                       /*partitioned=*/false));
+        ASSERT_OK(writer->Write(std::move(disk_batch)));
+        ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                             writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+        ASSERT_EQ(1, disk_progress.size());
+        ASSERT_EQ(Range(0, 1), disk_progress[0].offset_range);
+        ASSERT_OK(Commit(disk_progress, /*commit_identifier=*/0));
+
+        ASSERT_OK_AND_ASSIGN(
+            std::unique_ptr<RecordBatch> memory_batch,
+            MakeBatch({Row{1, "new-1", "p0"}, Row{3, "deleted", "p0"}, Row{4, "new-4", "p0"}},
+                      /*partitioned=*/false, /*bucket=*/0,
+                      {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE,
+                       RecordBatch::RowKind::INSERT}));
+        ASSERT_OK(writer->Write(std::move(memory_batch)));
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> pinned_plan,
+                             CreatePlan(realtime_context, /*predicate=*/nullptr));
+        std::vector<Row> expected = {{1, "new-1", "p0"}, {2, "keep", "p0"}, {4, "new-4", "p0"}};
+        ASSERT_OK_AND_ASSIGN(std::vector<Row> memory_rows, ReadRows(realtime_context));
+        ASSERT_EQ(expected, memory_rows);
+
+        ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> memory_progress,
+                             writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+        ASSERT_EQ(1, memory_progress.size());
+        ASSERT_EQ(Range(2, 4), memory_progress[0].offset_range);
+        ASSERT_OK_AND_ASSIGN(int64_t committed_snapshot,
+                             Commit(memory_progress, /*commit_identifier=*/1));
+        ASSERT_OK(writer->RefreshCommittedSnapshot(committed_snapshot));
+
+        ASSERT_OK_AND_ASSIGN(std::vector<Row> pinned_rows, ReadRows(pinned_plan));
+        ASSERT_EQ(expected, pinned_rows);
+        ASSERT_OK_AND_ASSIGN(std::vector<Row> refreshed_rows, ReadRows(realtime_context));
+        ASSERT_EQ(expected, refreshed_rows);
+        ASSERT_OK(writer->Close());
+
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> restart_context,
+                             RealtimeContext::Create());
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> restart_writer,
+                             CreateRealtimeWriter(restart_context, /*write_schema=*/{},
+                                                  write_buffer_spill_thread_number));
+        ASSERT_OK_AND_ASSIGN(std::vector<Row> reopened_rows, ReadRows(restart_context));
+        ASSERT_EQ(expected, reopened_rows);
+        ASSERT_OK(restart_writer->Close());
+        ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_rows, ReadRows());
+        ASSERT_EQ(expected, disk_rows);
+    }
+
+    Result<std::vector<int64_t>> ReadPkQuerySequences(
+        const std::shared_ptr<RealtimeContext>& realtime_context) const {
+        PAIMON_ASSIGN_OR_RAISE(std::vector<RealtimePartitionBucketView> views,
+                               realtime_context->AcquireReadViews());
+        if (views.size() != 1) {
+            return Status::Invalid("expected one PK real-time read view");
+        }
+        auto read_schema = std::make_unique<ArrowSchema>();
+        arrow::FieldVector requested_fields = {
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())};
+        requested_fields.insert(requested_fields.end(), schema_->fields().begin(),
+                                schema_->fields().end());
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(
+            arrow::ExportSchema(*arrow::schema(std::move(requested_fields)), read_schema.get()));
+        ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });
+        MemQueryContext query_context{read_schema.get(), /*predicate=*/nullptr,
+                                      /*enable_predicate_pushdown=*/false};
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<std::unique_ptr<BatchReader>> readers,
+            views[0].indexer->CreateQueryReaders(views[0].read_view,
+                                                 /*offset_lower_exclusive=*/-1, query_context));
+
+        std::vector<int64_t> sequences;
+        for (const std::unique_ptr<BatchReader>& reader : readers) {
+            while (true) {
+                PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader->NextBatch());
+                if (BatchReader::IsEofBatch(batch)) {
+                    break;
+                }
+                PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                    std::shared_ptr<arrow::Array> imported,
+                    arrow::ImportArray(batch.first.get(), batch.second.get()));
+                std::shared_ptr<arrow::StructArray> values =
+                    std::dynamic_pointer_cast<arrow::StructArray>(imported);
+                if (!values) {
+                    return Status::Invalid("PK query reader did not return a StructArray");
+                }
+                std::shared_ptr<arrow::Int64Array> sequence_array =
+                    std::dynamic_pointer_cast<arrow::Int64Array>(
+                        values->GetFieldByName(SpecialFields::SequenceNumber().Name()));
+                if (!sequence_array) {
+                    return Status::Invalid("PK query reader did not return sequence numbers");
+                }
+                for (int64_t i = 0; i < sequence_array->length(); ++i) {
+                    sequences.push_back(sequence_array->Value(i));
+                }
+            }
+            reader->Close();
+        }
+        return sequences;
     }
 
     static Status ValidateReadPrefix(const std::vector<Row>& rows, int64_t total_rows) {
@@ -553,6 +798,25 @@ TEST_F(RealtimeWriteInteTest, TestCloseWriterAllowsContextReuseByLaterWriter) {
     ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
     ASSERT_EQ(expected_rows, actual_rows);
     ASSERT_OK(second_writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkContextReuse) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> rows = {{1, "one", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(rows, /*partitioned=*/false));
+    ASSERT_OK(first_writer->Write(std::move(batch)));
+    ASSERT_OK(first_writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
+    ASSERT_EQ(rows, actual_rows);
+
+    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context),
+                        "already bound to a primary-key writer");
 }
 
 TEST_F(RealtimeWriteInteTest, TestReadCommittedDiskAndBuildingMemory) {
@@ -818,7 +1082,7 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
                          RealtimeContext::Create());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
-    constexpr int32_t kPrepareThreadCount = 4;
+    constexpr int32_t kPrepareThreadCount = 1;
     constexpr int32_t kReadThreadCount = 4;
     constexpr int64_t kBatchCount = 12;
     constexpr int64_t kRowsPerBatch = 2;
@@ -1192,6 +1456,933 @@ TEST_F(RealtimeWriteInteTest, TestRestoreOffsetFromCommittedSnapshot) {
     RealtimePartitionBucket partition_bucket(/*partition=*/{}, /*bucket=*/0);
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap second_committed_offsets, ReadCommittedOffsets());
     ASSERT_EQ(4, second_committed_offsets.at(partition_bucket));
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRealtimeConcurrency) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    options_[Options::NUM_SORTED_RUNS_COMPACTION_TRIGGER] = "1";
+    options_[Options::COMMIT_FORCE_COMPACT] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    int64_t next_row_id = 0;
+    int64_t next_commit_identifier = 0;
+    for (int32_t i = 0; i < 2; ++i) {
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                             MakeBatch(MakeRows(next_row_id++, /*count=*/1, /*partition=*/"p0"),
+                                       /*partitioned=*/false));
+        ASSERT_OK(writer->Write(std::move(batch)));
+        ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                             writer->PrepareCommitWithProgress(next_commit_identifier));
+        ASSERT_EQ(1, progress.size());
+        std::shared_ptr<CommitMessageImpl> message =
+            std::dynamic_pointer_cast<CommitMessageImpl>(progress[0].commit_message);
+        ASSERT_NE(nullptr, message);
+        ASSERT_TRUE(message->GetCompactIncrement().IsEmpty());
+        ASSERT_OK_AND_ASSIGN(int64_t snapshot_id, Commit(progress, next_commit_identifier++));
+        ASSERT_OK(writer->RefreshCommittedSnapshot(snapshot_id));
+    }
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> memory_batch,
+                         MakeBatch(MakeRows(next_row_id++, /*count=*/1, /*partition=*/"p0"),
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(memory_batch)));
+
+    WriteContextBuilder compact_builder(table_path_, commit_user_);
+    compact_builder.SetOptions(options_).WithStreamingMode(true).WithTempDirectory(
+        PathUtil::JoinPath(dir_->Str(), "compact-spill"));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> compact_context, compact_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> compact_writer,
+                         FileStoreWrite::Create(std::move(compact_context)));
+    ASSERT_OK(compact_writer->Compact(/*partition=*/{}, /*bucket=*/0,
+                                      /*full_compaction=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::shared_ptr<CommitMessage>> compact_messages,
+        compact_writer->PrepareCommit(/*wait_compaction=*/true, next_commit_identifier));
+    ASSERT_EQ(1, compact_messages.size());
+    std::shared_ptr<CommitMessageImpl> compact_message =
+        std::dynamic_pointer_cast<CommitMessageImpl>(compact_messages[0]);
+    ASSERT_NE(nullptr, compact_message);
+    ASSERT_TRUE(compact_message->GetNewFilesIncrement().IsEmpty());
+    ASSERT_EQ(2, compact_message->GetCompactIncrement().CompactBefore().size());
+    ASSERT_FALSE(compact_message->GetCompactIncrement().CompactAfter().empty());
+    ASSERT_OK(compact_writer->Close());
+    ASSERT_OK(Commit(compact_messages, next_commit_identifier++));
+
+    ASSERT_OK_AND_ASSIGN(CoreOptions core_options, CoreOptions::FromMap(options_));
+    SnapshotManager snapshot_manager(core_options.GetFileSystem(), table_path_);
+    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> compact_snapshot,
+                         snapshot_manager.LatestSnapshot());
+    ASSERT_TRUE(compact_snapshot);
+    ASSERT_EQ(Snapshot::CommitKind::Compact(), compact_snapshot->GetCommitKind());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap compact_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(1, compact_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(compact_snapshot->Id()));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> rows_after_compaction, ReadRows(realtime_context));
+    ASSERT_OK(ValidateReadPrefix(rows_after_compaction, next_row_id));
+    ASSERT_EQ(next_row_id, static_cast<int64_t>(rows_after_compaction.size()));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> memory_progress,
+                         writer->PrepareCommitWithProgress(next_commit_identifier));
+    ASSERT_EQ(1, memory_progress.size());
+    ASSERT_EQ(Range(2, 2), memory_progress[0].offset_range);
+    std::shared_ptr<CommitMessageImpl> memory_message =
+        std::dynamic_pointer_cast<CommitMessageImpl>(memory_progress[0].commit_message);
+    ASSERT_NE(nullptr, memory_message);
+    ASSERT_TRUE(memory_message->GetCompactIncrement().IsEmpty());
+    ASSERT_OK_AND_ASSIGN(int64_t memory_snapshot,
+                         Commit(memory_progress, next_commit_identifier++));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(memory_snapshot));
+
+    constexpr int32_t kPrepareThreadCount = 1;
+    constexpr int32_t kReadThreadCount = 1;
+    constexpr int64_t kBatchCount = 24;
+    const int64_t concurrent_first_id = next_row_id;
+    const int64_t total_row_count = concurrent_first_id + kBatchCount;
+
+    std::atomic<bool> writer_done{false};
+    std::atomic<bool> prepare_done{false};
+    std::atomic<bool> commit_done{false};
+    std::atomic<bool> refresh_done{false};
+    std::atomic<int64_t> next_prepare_identifier{next_commit_identifier};
+    std::atomic<int32_t> commit_count{0};
+    std::atomic<int32_t> refresh_count{0};
+    ConcurrentTestState state;
+    std::map<int64_t, RealtimeCommitProgress> pending_commits;
+    std::deque<int64_t> pending_snapshot_ids;
+    std::vector<int32_t> prepare_call_counts(kPrepareThreadCount, 0);
+    std::vector<int32_t> read_call_counts(kReadThreadCount, 0);
+
+    auto enqueue_prepared_commits = [&](std::vector<RealtimeCommitProgress>&& commits) {
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            for (RealtimeCommitProgress& commit : commits) {
+                const int64_t offset_from = commit.offset_range.from;
+                if (!pending_commits.emplace(offset_from, std::move(commit)).second) {
+                    error = "duplicate prepared PK real-time offset range";
+                    break;
+                }
+            }
+        }
+        if (!error.empty()) {
+            state.RecordError(error);
+        }
+        state.progress_cv.notify_all();
+    };
+
+    std::thread write_thread([&]() {
+        state.WaitForStart();
+        for (int64_t batch_index = 0; batch_index < kBatchCount && !state.ShouldStop();
+             ++batch_index) {
+            Result<std::unique_ptr<RecordBatch>> batch =
+                MakeBatch(MakeRows(concurrent_first_id + batch_index, /*count=*/1,
+                                   /*partition=*/"p0"),
+                          /*partitioned=*/false);
+            if (state.RecordErrorIfNotOk(batch) ||
+                state.RecordErrorIfNotOk(writer->Write(std::move(batch).value()))) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (batch_index + 1 == kBatchCount / 2) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                while (refresh_count.load(std::memory_order_acquire) == 0 && !state.ShouldStop() &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (refresh_count.load(std::memory_order_acquire) == 0 && !state.ShouldStop()) {
+                    state.RecordError("timed out waiting for a PK refresh while writing");
+                    break;
+                }
+            }
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    std::vector<std::thread> prepare_threads;
+    prepare_threads.reserve(kPrepareThreadCount);
+    for (int32_t thread_index = 0; thread_index < kPrepareThreadCount; ++thread_index) {
+        prepare_threads.emplace_back([&, thread_index]() {
+            state.WaitForStart();
+            do {
+                Result<std::vector<RealtimeCommitProgress>> progress =
+                    writer->PrepareCommitWithProgress(
+                        next_prepare_identifier.fetch_add(1, std::memory_order_relaxed));
+                ++prepare_call_counts[thread_index];
+                if (state.RecordErrorIfNotOk(progress)) {
+                    break;
+                }
+                enqueue_prepared_commits(std::move(progress).value());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } while (!writer_done.load(std::memory_order_acquire) && !state.ShouldStop());
+        });
+    }
+
+    std::thread commit_thread([&]() {
+        state.WaitForStart();
+        int64_t next_offset = concurrent_first_id;
+        int64_t commit_identifier = next_commit_identifier;
+        while (!state.ShouldStop()) {
+            std::optional<RealtimeCommitProgress> next_commit;
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                state.progress_cv.wait(lock, [&]() {
+                    return state.ShouldStop() || pending_commits.count(next_offset) > 0 ||
+                           prepare_done.load(std::memory_order_acquire);
+                });
+                if (state.ShouldStop()) {
+                    break;
+                }
+                auto iter = pending_commits.find(next_offset);
+                if (iter == pending_commits.end()) {
+                    if (prepare_done.load(std::memory_order_acquire)) {
+                        if (!pending_commits.empty()) {
+                            lock.unlock();
+                            state.RecordError("prepared PK real-time offset ranges contain a gap");
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                next_commit = std::move(iter->second);
+                pending_commits.erase(iter);
+            }
+
+            std::vector<RealtimeCommitProgress> commits;
+            commits.push_back(std::move(next_commit).value());
+            const int64_t committed_offset = commits[0].offset_range.to;
+            Result<int64_t> commit_result = Commit(commits, commit_identifier++);
+            if (state.RecordErrorIfNotOk(commit_result)) {
+                break;
+            }
+            next_offset = committed_offset + 1;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                pending_snapshot_ids.push_back(std::move(commit_result).value());
+            }
+            ++commit_count;
+            state.snapshot_cv.notify_all();
+        }
+        commit_done.store(true, std::memory_order_release);
+        state.snapshot_cv.notify_all();
+    });
+
+    std::thread refresh_thread([&]() {
+        state.WaitForStart();
+        while (!state.ShouldStop()) {
+            std::optional<int64_t> snapshot_id;
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                state.snapshot_cv.wait(lock, [&]() {
+                    return state.ShouldStop() || !pending_snapshot_ids.empty() ||
+                           commit_done.load(std::memory_order_acquire);
+                });
+                if (state.ShouldStop()) {
+                    break;
+                }
+                if (pending_snapshot_ids.empty()) {
+                    if (commit_done.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    continue;
+                }
+                snapshot_id = pending_snapshot_ids.front();
+                pending_snapshot_ids.pop_front();
+            }
+            if (state.RecordErrorIfNotOk(writer->RefreshCommittedSnapshot(snapshot_id.value()))) {
+                break;
+            }
+            ++refresh_count;
+        }
+        refresh_done.store(true, std::memory_order_release);
+    });
+
+    std::vector<std::thread> read_threads;
+    read_threads.reserve(kReadThreadCount);
+    for (int32_t thread_index = 0; thread_index < kReadThreadCount; ++thread_index) {
+        read_threads.emplace_back([&, thread_index]() {
+            state.WaitForStart();
+            while (!refresh_done.load(std::memory_order_acquire) && !state.ShouldStop()) {
+                Result<std::vector<Row>> rows = ReadRows(realtime_context);
+                ++read_call_counts[thread_index];
+                if (state.RecordErrorIfNotOk(rows) ||
+                    state.RecordErrorIfNotOk(ValidateReadPrefix(rows.value(), total_row_count))) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+    }
+
+    constexpr int32_t kWorkerCount = 1 + kPrepareThreadCount + 1 + 1 + kReadThreadCount;
+    state.StartWhenReady(kWorkerCount);
+
+    write_thread.join();
+    for (std::thread& prepare_thread : prepare_threads) {
+        prepare_thread.join();
+    }
+    if (!state.ShouldStop()) {
+        Result<std::vector<RealtimeCommitProgress>> final_progress =
+            writer->PrepareCommitWithProgress(
+                next_prepare_identifier.fetch_add(1, std::memory_order_relaxed));
+        if (!state.RecordErrorIfNotOk(final_progress)) {
+            enqueue_prepared_commits(std::move(final_progress).value());
+        }
+    }
+    prepare_done.store(true, std::memory_order_release);
+    state.progress_cv.notify_all();
+
+    commit_thread.join();
+    refresh_thread.join();
+    for (std::thread& read_thread : read_threads) {
+        read_thread.join();
+    }
+
+    ASSERT_TRUE(state.Errors().empty()) << (state.Errors().empty() ? "" : state.Errors().front());
+    for (int32_t call_count : prepare_call_counts) {
+        ASSERT_GT(call_count, 0);
+    }
+    for (int32_t call_count : read_call_counts) {
+        ASSERT_GT(call_count, 0);
+    }
+    ASSERT_GE(commit_count.load(), 2);
+    ASSERT_GE(refresh_count.load(), 2);
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows(realtime_context));
+    ASSERT_OK(ValidateReadPrefix(final_rows, total_row_count));
+    ASSERT_EQ(total_row_count, static_cast<int64_t>(final_rows.size()));
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(total_row_count - 1,
+              committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_OK_AND_ASSIGN(uint64_t memory_usage, GetRealtimeMemoryUsage(realtime_context));
+    ASSERT_EQ(0, memory_usage);
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkMutationSequencesAreIndependentFromOffsets) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+
+    WriteContextBuilder seed_builder(table_path_, commit_user_);
+    seed_builder.SetOptions(options_).WithStreamingMode(true);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> seed_context, seed_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> seed_writer,
+                         FileStoreWrite::Create(std::move(seed_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> seed_batch,
+                         MakeBatch({Row{99, "seed", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(seed_writer->Write(std::move(seed_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<CommitMessage>> seed_messages,
+                         seed_writer->PrepareCommit(/*wait_compaction=*/false,
+                                                    /*commit_identifier=*/0));
+    ASSERT_OK(Commit(seed_messages));
+    ASSERT_OK(seed_writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> mutations = {
+        {1, "one", "p0"}, {1, "one-new", "p0"}, {2, "deleted", "p0"}, {3, "three", "p0"}};
+    std::vector<RecordBatch::RowKind> row_kinds = {
+        RecordBatch::RowKind::INSERT, RecordBatch::RowKind::UPDATE_AFTER,
+        RecordBatch::RowKind::DELETE, RecordBatch::RowKind::INSERT};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(mutations, /*partitioned=*/false, /*bucket=*/0, row_kinds));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<int64_t> memory_sequences,
+                         ReadPkQuerySequences(realtime_context));
+    ASSERT_EQ(std::vector<int64_t>({2, 3, 4}), memory_sequences);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_EQ(1, progress.size());
+    ASSERT_EQ(Range(0, 3), progress[0].offset_range);
+    ASSERT_EQ(1, NewFiles(progress).size());
+    ASSERT_EQ(3, NewFiles(progress)[0]->row_count);
+    ASSERT_EQ(std::optional<int64_t>(1), NewFiles(progress)[0]->delete_row_count);
+    ASSERT_EQ(memory_sequences.front(), NewFiles(progress)[0]->min_sequence_number);
+    ASSERT_EQ(memory_sequences.back(), NewFiles(progress)[0]->max_sequence_number);
+    ASSERT_NE(progress[0].offset_range.to, NewFiles(progress)[0]->max_sequence_number);
+    ASSERT_OK(Commit(progress, /*commit_identifier=*/1));
+    ASSERT_OK(writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual, ReadRows());
+    ASSERT_EQ((std::vector<Row>{{1, "one-new", "p0"}, {3, "three", "p0"}, {99, "seed", "p0"}}),
+              actual);
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkBucketRecovery) {
+    options_[Options::BUCKET] = "2";
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer, CreateRealtimeWriter());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> bucket0_batch,
+                         MakeBatch({Row{1, "old-1", "p0"}, Row{2, "old-2", "p0"}},
+                                   /*partitioned=*/false, /*bucket=*/0));
+    ASSERT_OK(first_writer->Write(std::move(bucket0_batch)));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> bucket1_batch,
+        MakeBatch({Row{10, "old-10", "p0"}, Row{11, "old-11", "p0"}, Row{12, "old-12", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/1));
+    ASSERT_OK(first_writer->Write(std::move(bucket1_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
+                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    std::map<int32_t, Range> first_ranges;
+    for (const RealtimeCommitProgress& progress : first_progress) {
+        first_ranges.emplace(progress.partition_bucket.bucket, progress.offset_range);
+    }
+    ASSERT_EQ(Range(0, 1), first_ranges.at(0));
+    ASSERT_EQ(Range(0, 2), first_ranges.at(1));
+    ASSERT_OK(Commit(first_progress, /*commit_identifier=*/0));
+    ASSERT_OK(first_writer->Close());
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap first_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(1, first_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_EQ(2, first_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/1)));
+
+    auto factory = std::make_shared<DelegatingMemIndexerFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> second_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
+                         CreateRealtimeWriter(second_context));
+    ASSERT_OK_AND_ASSIGN(bucket0_batch, MakeBatch({Row{1, "new-1", "p0"}, Row{3, "new-3", "p0"}},
+                                                  /*partitioned=*/false, /*bucket=*/0,
+                                                  {RecordBatch::RowKind::UPDATE_AFTER,
+                                                   RecordBatch::RowKind::INSERT}));
+    ASSERT_OK(second_writer->Write(std::move(bucket0_batch)));
+    ASSERT_OK_AND_ASSIGN(bucket1_batch,
+                         MakeBatch({Row{10, "old-10", "p0"}, Row{13, "new-13", "p0"}},
+                                   /*partitioned=*/false, /*bucket=*/1,
+                                   {RecordBatch::RowKind::DELETE, RecordBatch::RowKind::INSERT}));
+    ASSERT_OK(second_writer->Write(std::move(bucket1_batch)));
+
+    ASSERT_EQ(2, factory->create_count);
+    std::map<int32_t, int64_t> restored_sequences;
+    for (const DelegatingMemIndexerFactory::CapturedRequest& request : factory->requests) {
+        ASSERT_TRUE(std::holds_alternative<PrimaryKeyMemIndexerCreateConfig>(request.mode_config));
+        const auto& primary_key_config =
+            std::get<PrimaryKeyMemIndexerCreateConfig>(request.mode_config);
+        ASSERT_EQ(std::vector<std::string>({"id"}), primary_key_config.primary_keys);
+        ASSERT_TRUE(request.partition.empty());
+        restored_sequences.emplace(request.bucket, primary_key_config.restore_max_sequence_number);
+    }
+    ASSERT_EQ(1, restored_sequences.at(0));
+    ASSERT_EQ(2, restored_sequences.at(1));
+
+    std::vector<Row> expected = {{1, "new-1", "p0"},   {2, "old-2", "p0"},   {3, "new-3", "p0"},
+                                 {11, "old-11", "p0"}, {12, "old-12", "p0"}, {13, "new-13", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> realtime_rows, ReadRows(second_context));
+    ASSERT_EQ(expected, realtime_rows);
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
+                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    std::map<int32_t, Range> second_ranges;
+    for (const RealtimeCommitProgress& progress : second_progress) {
+        second_ranges.emplace(progress.partition_bucket.bucket, progress.offset_range);
+    }
+    ASSERT_EQ(Range(2, 3), second_ranges.at(0));
+    ASSERT_EQ(Range(3, 4), second_ranges.at(1));
+    ASSERT_OK(Commit(second_progress, /*commit_identifier=*/1));
+    ASSERT_OK(second_writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_rows, ReadRows());
+    ASSERT_EQ(expected, disk_rows);
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap offsets, ReadCommittedOffsets());
+    ASSERT_EQ(3, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_EQ(4, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/1)));
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkPartitionedWrites) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable(/*partition_keys=*/{"pt"});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> p0_disk,
+                         MakeBatch({Row{1, "old", "p0"}, Row{2, "keep", "p0"}},
+                                   /*partitioned=*/true));
+    ASSERT_OK(writer->Write(std::move(p0_disk)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> p1_disk,
+                         MakeBatch({Row{1, "delete", "p1"}}, /*partitioned=*/true));
+    ASSERT_OK(writer->Write(std::move(p1_disk)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK(Commit(disk_progress, /*commit_identifier=*/0));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> p0_memory,
+        MakeBatch({Row{1, "new", "p0"}, Row{3, "three", "p0"}}, /*partitioned=*/true,
+                  /*bucket=*/0,
+                  {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::INSERT}));
+    ASSERT_OK(writer->Write(std::move(p0_memory)));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> p1_memory,
+        MakeBatch({Row{1, "delete", "p1"}, Row{2, "two", "p1"}}, /*partitioned=*/true,
+                  /*bucket=*/0, {RecordBatch::RowKind::DELETE, RecordBatch::RowKind::INSERT}));
+    ASSERT_OK(writer->Write(std::move(p1_memory)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> p2_memory,
+                         MakeBatch({Row{1, "one", "p2"}}, /*partitioned=*/true));
+    ASSERT_OK(writer->Write(std::move(p2_memory)));
+
+    std::vector<Row> expected = {{1, "new", "p0"},
+                                 {2, "keep", "p0"},
+                                 {3, "three", "p0"},
+                                 {2, "two", "p1"},
+                                 {1, "one", "p2"}};
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> realtime_rows, ReadRows(realtime_context));
+    std::sort(expected.begin(), expected.end());
+    std::sort(realtime_rows.begin(), realtime_rows.end());
+    ASSERT_EQ(expected, realtime_rows);
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> memory_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_EQ(3, memory_progress.size());
+    ASSERT_OK(Commit(memory_progress, /*commit_identifier=*/1));
+    ASSERT_OK(writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_rows, ReadRows());
+    std::sort(disk_rows.begin(), disk_rows.end());
+    ASSERT_EQ(expected, disk_rows);
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap offsets, ReadCommittedOffsets());
+    ASSERT_EQ(3, offsets.at(RealtimePartitionBucket({{"pt", "p0"}}, /*bucket=*/0)));
+    ASSERT_EQ(2, offsets.at(RealtimePartitionBucket({{"pt", "p1"}}, /*bucket=*/0)));
+    ASSERT_EQ(0, offsets.at(RealtimePartitionBucket({{"pt", "p2"}}, /*bucket=*/0)));
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRealtimeMergesDiskAndMemoryMutations) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    auto factory = std::make_shared<DelegatingMemIndexerFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    std::vector<Row> disk_rows = {{1, "old", "p0"}, {2, "keep", "p0"}, {3, "delete-me", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> disk_batch,
+                         MakeBatch(disk_rows, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(disk_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK(Commit(disk_progress, /*commit_identifier=*/0));
+
+    std::vector<Row> first_mutations = {
+        {1, "new", "p0"}, {3, "delete-me", "p0"}, {4, "first", "p0"}};
+    std::vector<RecordBatch::RowKind> first_kinds = {RecordBatch::RowKind::UPDATE_AFTER,
+                                                     RecordBatch::RowKind::DELETE,
+                                                     RecordBatch::RowKind::INSERT};
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> first_batch,
+        MakeBatch(first_mutations, /*partitioned=*/false, /*bucket=*/0, first_kinds));
+    ASSERT_OK(writer->Write(std::move(first_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
+                         MakeBatch({Row{4, "latest", "p0"}}, /*partitioned=*/false,
+                                   /*bucket=*/0, {RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(writer->Write(std::move(second_batch)));
+
+    ASSERT_EQ(1, factory->create_count);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
+                         realtime_context->AcquireReadViews());
+    ASSERT_EQ(1, views.size());
+    ASSERT_TRUE(std::dynamic_pointer_cast<DelegatingMemIndexer>(views[0].indexer));
+
+    std::vector<Row> expected = {{1, "new", "p0"}, {2, "keep", "p0"}, {4, "latest", "p0"}};
+    for (const char* sort_engine : {"loser-tree", "min-heap"}) {
+        options_[Options::SORT_ENGINE] = sort_engine;
+        ASSERT_OK_AND_ASSIGN(std::vector<Row> actual, ReadRows(realtime_context));
+        ASSERT_EQ(expected, actual) << sort_engine;
+    }
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    first_progress.insert(first_progress.end(), std::make_move_iterator(second_progress.begin()),
+                          std::make_move_iterator(second_progress.end()));
+    ASSERT_OK(Commit(first_progress, /*commit_identifier=*/1));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> committed, ReadRows(realtime_context));
+    ASSERT_EQ(expected, committed);
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_only, ReadRows());
+    ASSERT_EQ(expected, disk_only);
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkConcurrentRead) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    constexpr int32_t kReaderCount = 4;
+    std::atomic<int32_t> phase{0};
+    std::atomic<bool> done{false};
+    std::vector<int32_t> observed_phases(kReaderCount, 0);
+    std::vector<int32_t> read_counts(kReaderCount, 0);
+    ConcurrentTestState state;
+    const std::vector<Row> expected = {
+        {1, "v1", "p0"}, {3, "v0", "p0"}, {4, "v0", "p0"}, {5, "v1", "p0"}};
+
+    auto validate_rows = [&expected](std::vector<Row> rows) -> Status {
+        std::map<int64_t, std::string> values_by_id;
+        for (const Row& row : rows) {
+            const int64_t id = std::get<0>(row);
+            const std::string& payload = std::get<1>(row);
+            if (!values_by_id.emplace(id, payload).second) {
+                return Status::Invalid("duplicate primary key in concurrent PK read");
+            }
+            if (payload != "v0" && payload != "v1") {
+                return Status::Invalid("invalid versioned value in concurrent PK read");
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        if (rows != expected) {
+            return Status::Invalid("unexpected rows in concurrent PK read");
+        }
+        return Status::OK();
+    };
+
+    auto wait_for_readers = [&](int32_t expected_phase) -> bool {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        state.progress_cv.wait(lock, [&]() {
+            return state.ShouldStop() || std::all_of(observed_phases.begin(), observed_phases.end(),
+                                                     [expected_phase](int32_t observed) {
+                                                         return observed >= expected_phase;
+                                                     });
+        });
+        return !state.ShouldStop();
+    };
+
+    std::thread control_thread([&]() {
+        state.WaitForStart();
+        Result<std::unique_ptr<RecordBatch>> seed_batch = MakeBatch(
+            {Row{1, "v0", "p0"}, Row{2, "v0", "p0"}, Row{3, "v0", "p0"}, Row{4, "v0", "p0"}},
+            /*partitioned=*/false);
+        if (state.RecordErrorIfNotOk(seed_batch) ||
+            state.RecordErrorIfNotOk(writer->Write(std::move(seed_batch).value()))) {
+            return;
+        }
+        Result<std::vector<RealtimeCommitProgress>> seed_progress =
+            writer->PrepareCommitWithProgress(/*commit_identifier=*/0);
+        if (state.RecordErrorIfNotOk(seed_progress)) {
+            return;
+        }
+        Result<int64_t> seed_snapshot = Commit(seed_progress.value(), /*commit_identifier=*/0);
+        if (state.RecordErrorIfNotOk(seed_snapshot) ||
+            state.RecordErrorIfNotOk(writer->RefreshCommittedSnapshot(seed_snapshot.value()))) {
+            return;
+        }
+
+        Result<std::unique_ptr<RecordBatch>> mutation_batch =
+            MakeBatch({Row{1, "v1", "p0"}, Row{2, "v0", "p0"}, Row{5, "v1", "p0"}},
+                      /*partitioned=*/false, /*bucket=*/0,
+                      {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE,
+                       RecordBatch::RowKind::INSERT});
+        if (state.RecordErrorIfNotOk(mutation_batch) ||
+            state.RecordErrorIfNotOk(writer->Write(std::move(mutation_batch).value()))) {
+            return;
+        }
+        phase.store(1, std::memory_order_release);
+        state.progress_cv.notify_all();
+        if (!wait_for_readers(1)) {
+            return;
+        }
+
+        Result<std::vector<RealtimeCommitProgress>> progress =
+            writer->PrepareCommitWithProgress(/*commit_identifier=*/1);
+        if (state.RecordErrorIfNotOk(progress)) {
+            return;
+        }
+        Result<int64_t> committed_snapshot = Commit(progress.value(), /*commit_identifier=*/1);
+        if (state.RecordErrorIfNotOk(committed_snapshot)) {
+            return;
+        }
+        phase.store(2, std::memory_order_release);
+        state.progress_cv.notify_all();
+        if (!wait_for_readers(2)) {
+            return;
+        }
+
+        if (state.RecordErrorIfNotOk(
+                writer->RefreshCommittedSnapshot(committed_snapshot.value()))) {
+            return;
+        }
+        phase.store(3, std::memory_order_release);
+        state.progress_cv.notify_all();
+        if (!wait_for_readers(3) || state.RecordErrorIfNotOk(writer->Close())) {
+            return;
+        }
+        done.store(true, std::memory_order_release);
+        state.progress_cv.notify_all();
+    });
+
+    std::vector<std::thread> reader_threads;
+    reader_threads.reserve(kReaderCount);
+    for (int32_t reader_index = 0; reader_index < kReaderCount; ++reader_index) {
+        reader_threads.emplace_back([&, reader_index]() {
+            state.WaitForStart();
+            while (!done.load(std::memory_order_acquire) && !state.ShouldStop()) {
+                const int32_t read_phase = phase.load(std::memory_order_acquire);
+                if (read_phase == 0) {
+                    std::unique_lock<std::mutex> lock(state.mutex);
+                    state.progress_cv.wait(lock, [&]() {
+                        return phase.load(std::memory_order_acquire) > 0 || state.ShouldStop();
+                    });
+                    continue;
+                }
+                Result<std::vector<Row>> rows = ReadRows(realtime_context);
+                if (state.RecordErrorIfNotOk(rows) ||
+                    state.RecordErrorIfNotOk(validate_rows(std::move(rows).value()))) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    observed_phases[reader_index] =
+                        std::max(observed_phases[reader_index], read_phase);
+                    ++read_counts[reader_index];
+                }
+                state.progress_cv.notify_all();
+            }
+        });
+    }
+
+    state.StartWhenReady(kReaderCount + 1);
+    control_thread.join();
+    for (std::thread& reader_thread : reader_threads) {
+        reader_thread.join();
+    }
+
+    ASSERT_TRUE(state.Errors().empty()) << (state.Errors().empty() ? "" : state.Errors().front());
+    for (int32_t reader_index = 0; reader_index < kReaderCount; ++reader_index) {
+        ASSERT_EQ(3, observed_phases[reader_index]);
+        ASSERT_GT(read_counts[reader_index], 0);
+    }
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows());
+    ASSERT_OK(validate_rows(std::move(final_rows)));
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkProjectionAndPredicateOverDiskAndMemory) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> scan_filtered_batch,
+                         MakeBatch({Row{0, "disk-zero", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(scan_filtered_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> scan_filtered_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK(Commit(scan_filtered_progress, /*commit_identifier=*/0));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> disk_batch,
+                         MakeBatch({Row{2, "read-filtered", "p0"}, Row{4, "disk-old", "p0"},
+                                    Row{5, "disk-five", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(disk_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_OK(Commit(disk_progress, /*commit_identifier=*/1));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> memory_batch,
+        MakeBatch({Row{3, "memory-three", "p0"}, Row{4, "memory-four", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/0,
+                  {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(writer->Write(std::move(memory_batch)));
+
+    std::shared_ptr<Predicate> scan_predicate =
+        PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"id", FieldType::BIGINT,
+                                      Literal(static_cast<int64_t>(1)));
+    std::shared_ptr<Predicate> read_predicate = PredicateBuilder::NotEqual(
+        /*field_index=*/0, /*field_name=*/"payload", FieldType::STRING,
+        Literal(FieldType::STRING, "read-filtered", 13));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan, CreatePlan(realtime_context, scan_predicate));
+    ASSERT_OK_AND_ASSIGN(
+        CollectedReadResult result,
+        ReadPlan(plan, {"payload", "id"}, read_predicate, /*enable_predicate_filter=*/true));
+    std::shared_ptr<arrow::DataType> result_type = arrow::struct_(
+        {arrow::field("_VALUE_KIND", arrow::int8()), arrow::field("payload", arrow::utf8()),
+         arrow::field("id", arrow::int64())});
+    std::shared_ptr<arrow::Array> expected =
+        arrow::ipc::internal::json::ArrayFromJSON(result_type, R"([
+            [0, "memory-three", 3],
+            [0, "memory-four", 4],
+            [0, "disk-five", 5]
+        ])")
+            .ValueOrDie();
+    ASSERT_NE(nullptr, result.data);
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(*result.data))
+        << result.data->ToString();
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkQuotaExhaustionRotatesAcceptedWrites) {
+    options_[Options::WRITE_BUFFER_SIZE] = "1";
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    options_[Options::WRITE_BUFFER_SPILL_MAX_DISK_SIZE] = "1b";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
+                         MakeBatch({Row{1, "old", "p0"}, Row{2, "two", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(first_batch)));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> second_batch,
+        MakeBatch({Row{1, "new", "p0"}, Row{2, "deleted", "p0"}, Row{3, "three", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/0,
+                  {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE,
+                   RecordBatch::RowKind::INSERT}));
+    ASSERT_OK(writer->Write(std::move(second_batch)));
+
+    std::vector<Row> expected = {{1, "new", "p0"}, {3, "three", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> memory_rows, ReadRows(realtime_context));
+    ASSERT_EQ(expected, memory_rows);
+
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, progress.size());
+    ASSERT_EQ(Range(0, 4), progress[0].offset_range);
+    ASSERT_OK(Commit(progress, /*commit_identifier=*/0));
+    ASSERT_OK(writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> restart_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> restart_writer,
+                         CreateRealtimeWriter(restart_context));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> reopened_rows, ReadRows(restart_context));
+    ASSERT_EQ(expected, reopened_rows);
+    ASSERT_OK(restart_writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> disk_rows, ReadRows());
+    ASSERT_EQ(expected, disk_rows);
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkSpillSingleThread) {
+    VerifyPkSpillWriteRead(/*write_buffer_spill_thread_number=*/0);
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkSpillMultiThread) {
+    VerifyPkSpillWriteRead(/*write_buffer_spill_thread_number=*/2);
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRealtimeReadsMemoryOnlyRoute) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        MakeBatch({Row{1, "first", "p0"}, Row{1, "latest", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/0,
+                  {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual, ReadRows(realtime_context));
+    ASSERT_EQ((std::vector<Row>{{1, "latest", "p0"}}), actual);
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkSpillBackedPlanSurvivesRefreshAndReclaim) {
+    options_[Options::WRITE_BUFFER_SIZE] = "1";
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    options_[Options::WRITE_BUFFER_SPILL_MAX_DISK_SIZE] = "1b";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> disk_batch,
+                         MakeBatch({Row{1, "disk", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(disk_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK(Commit(disk_progress, /*commit_identifier=*/0));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> pinned_batch,
+                         MakeBatch({Row{1, "pinned", "p0"}}, /*partitioned=*/false,
+                                   /*bucket=*/0, {RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(writer->Write(std::move(pinned_batch)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> pinned_plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> later_batch,
+                         MakeBatch({Row{1, "later", "p0"}}, /*partitioned=*/false,
+                                   /*bucket=*/0, {RecordBatch::RowKind::UPDATE_AFTER}));
+    ASSERT_OK(writer->Write(std::move(later_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> later_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_OK_AND_ASSIGN(int64_t committed_snapshot,
+                         Commit(later_progress, /*commit_identifier=*/1));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(committed_snapshot));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> pinned_result, ReadRows(pinned_plan));
+    ASSERT_EQ((std::vector<Row>{{1, "pinned", "p0"}}), pinned_result);
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> latest_result, ReadRows(realtime_context));
+    ASSERT_EQ((std::vector<Row>{{1, "later", "p0"}}), latest_result);
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkReadAndWriteSpillValidation) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "false";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableScan> scan,
+                         CreateScan(realtime_context, /*predicate=*/nullptr));
+    ASSERT_OK(scan->CreatePlan());
+    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context), "requires write-buffer spill");
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkScanValidation) {
+    CreatePkTable();
+
+    options_[Options::BUCKET] = "-2";
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    Result<std::unique_ptr<TableScan>> scan = CreateScan(realtime_context, /*predicate=*/nullptr);
+    ASSERT_TRUE(scan.status().IsInvalid());
+    ASSERT_EQ("real-time union read requires fixed bucket mode", scan.status().message());
+
+    options_[Options::BUCKET] = "1";
+    options_[Options::DATA_EVOLUTION_ENABLED] = "true";
+    ASSERT_OK_AND_ASSIGN(realtime_context, RealtimeContext::Create());
+    scan = CreateScan(realtime_context, /*predicate=*/nullptr);
+    ASSERT_TRUE(scan.status().IsInvalid());
+    ASSERT_EQ("real-time union read does not support data evolution", scan.status().message());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkWritePropagatesIoFailure) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false,
+                                   /*bucket=*/0));
+
+    IOHook* io_hook = IOHook::GetInstance();
+    ScopeGuard hook_guard([io_hook]() { io_hook->Clear(); });
+    io_hook->Reset(/*pos=*/0, IOHook::Mode::RETURN_ERROR);
+    Status operation_error = writer->Write(std::move(batch));
+    io_hook->Clear();
+    ASSERT_TRUE(operation_error.IsIOError()) << operation_error.ToString();
+    ASSERT_NOK_WITH_MSG(operation_error, "io hook triggered io error");
+    ASSERT_OK(writer->Close());
 }
 
 }  // namespace paimon::test

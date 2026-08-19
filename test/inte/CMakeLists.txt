@@ -42,6 +42,7 @@ if(PAIMON_BUILD_TESTS)
                     ${TEST_STATIC_LINK_LIBS}
                     test_utils_static
                     ${GTEST_LINK_TOOLCHAIN})
+    set_tests_properties(paimon-realtime-write-inte-test PROPERTIES TIMEOUT 180)
 
     add_paimon_test(global_index_test
                     STATIC_LINK_LIBS

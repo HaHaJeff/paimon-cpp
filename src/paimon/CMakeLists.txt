@@ -272,6 +272,7 @@ set(PAIMON_CORE_SRCS
     core/io/complete_row_tracking_fields_reader.cpp
     core/io/file_index_evaluator.cpp
     core/io/key_value_data_file_record_reader.cpp
+    core/io/key_value_batch_record_reader.cpp
     core/io/key_value_data_file_writer_factory.cpp
     core/io/key_value_data_file_writer.cpp
     core/io/key_value_in_memory_record_reader.cpp
@@ -368,7 +369,10 @@ set(PAIMON_CORE_SRCS
     core/operation/write_restore.cpp
     core/realtime/arrow_mem_indexer.cpp
     core/realtime/arrow_mem_indexer_factory.cpp
+    core/realtime/primary_key_mem_indexer.cpp
+    core/realtime/primary_key_realtime_options.cpp
     core/realtime/realtime_append_only_writer.cpp
+    core/realtime/realtime_primary_key_writer.cpp
     core/realtime/realtime_context.cpp
     core/postpone/postpone_bucket_writer.cpp
     core/schema/arrow_schema_validator.cpp
@@ -754,6 +758,8 @@ if(PAIMON_BUILD_TESTS)
                     core/manifest/index_manifest_file_handler_test.cpp
                     core/memory/writer_memory_manager_test.cpp
                     core/realtime/arrow_mem_indexer_test.cpp
+                    core/realtime/primary_key_mem_indexer_test.cpp
+                    core/realtime/primary_key_realtime_options_test.cpp
                     core/realtime/realtime_context_test.cpp
                     core/mergetree/levels_test.cpp
                     core/mergetree/lookup_file_test.cpp

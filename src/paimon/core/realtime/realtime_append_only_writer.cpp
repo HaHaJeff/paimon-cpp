@@ -52,9 +52,11 @@ Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Crea
     if (!realtime_context) {
         return Status::Invalid("real-time context is null");
     }
+    MemIndexerCreateRequest request{
+        std::move(write_schema),       options, memory_pool, partition, bucket,
+        AppendMemIndexerCreateConfig{}};
     PAIMON_ASSIGN_OR_RAISE(RealtimeMemIndexerState indexer_state,
-                           realtime_context->GetOrCreateMemIndexer(
-                               partition, bucket, std::move(write_schema), options, memory_pool));
+                           realtime_context->GetOrCreateMemIndexer(std::move(request)));
     return std::shared_ptr<RealtimeAppendOnlyWriter>(
         new RealtimeAppendOnlyWriter(indexer_state.indexer, file_writer, input_schema,
                                      indexer_state.initial_offset, memory_pool));
@@ -72,6 +74,9 @@ RealtimeAppendOnlyWriter::RealtimeAppendOnlyWriter(
       next_offset_(next_offset) {}
 
 Status RealtimeAppendOnlyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
+    if (!batch || !batch->GetData()) {
+        return Status::Invalid("real-time write batch is null");
+    }
     for (RecordBatch::RowKind row_kind : batch->GetRowKind()) {
         if (row_kind != RecordBatch::RowKind::INSERT) {
             PAIMON_ASSIGN_OR_RAISE(const RowKind* kind,
