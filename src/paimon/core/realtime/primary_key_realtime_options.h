@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -19,15 +19,13 @@
 
 #pragma once
 
-#include "paimon/realtime/realtime_store.h"
+#include "paimon/status.h"
 
 namespace paimon {
 
-/// Factory for Paimon's default Arrow-backed `RealtimeStore`.
-class PAIMON_EXPORT ArrowRealtimeStoreFactory : public RealtimeStoreFactory {
- public:
-    /// Creates the built-in append or in-memory primary-key store.
-    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override;
-};
+class CoreOptions;
+
+/// Validates the table options supported by the in-memory PK realtime V1 path.
+Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options);
 
 }  // namespace paimon
