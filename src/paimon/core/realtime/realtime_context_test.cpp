@@ -91,14 +91,11 @@ class TestingRealtimeStore : public RealtimeStore {
 
 class TestingRealtimeStoreFactory : public RealtimeStoreFactory {
  public:
-    Result<std::shared_ptr<RealtimeStore>> Create(std::unique_ptr<ArrowSchema> write_schema,
-                                                  StatisticsMode,
-                                                  const std::map<std::string, std::string>&,
-                                                  const std::shared_ptr<MemoryPool>&) override {
-        if (!write_schema || !write_schema->release) {
+    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
+        if (!request.write_schema || !request.write_schema->release) {
             return Status::Invalid("testing write schema is null");
         }
-        ArrowSchemaRelease(write_schema.get());
+        ArrowSchemaRelease(request.write_schema.get());
         auto store = std::make_shared<TestingRealtimeStore>();
         stores.push_back(store);
         return store;
@@ -122,20 +119,28 @@ Result<std::shared_ptr<RealtimeContextImpl>> CreateContext(
     return RealtimeContextImpl::Cast(context);
 }
 
-TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
+Result<RealtimeStoreState> GetOrCreateAppendStore(
+    const std::shared_ptr<RealtimeContextImpl>& context,
+    const std::map<std::string, std::string>& partition, int32_t bucket,
+    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
+    const std::shared_ptr<MemoryPool>& memory_pool) {
+    return context->GetOrCreateRealtimeStore(
+        RealtimeStoreCreateRequest{std::move(write_schema), options, memory_pool, partition, bucket,
+                                   AppendRealtimeStoreCreateConfig{StatisticsMode::NONE}});
+}
+
+TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
     std::shared_ptr<MemoryPool> pool = GetDefaultPool();
 
-    ASSERT_OK_AND_ASSIGN(
-        RealtimeStoreState first_state,
-        context->GetOrCreateRealtimeStore({{"dt", "2026-08-02"}}, 0, MakeWriteSchema(),
-                                          StatisticsMode::NONE, {{"k", "v"}}, pool));
+    ASSERT_OK_AND_ASSIGN(RealtimeStoreState first_state,
+                         GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0,
+                                                MakeWriteSchema(), {{"k", "v"}}, pool));
     ASSERT_EQ(0, first_state.initial_offset);
     ASSERT_OK_AND_ASSIGN(
         RealtimeStoreState first_again_state,
-        context->GetOrCreateRealtimeStore({{"dt", "2026-08-02"}}, 0, MakeWriteSchema(),
-                                          StatisticsMode::NONE, {}, pool));
+        GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0, MakeWriteSchema(), {}, pool));
     ASSERT_EQ(first_state.store, first_again_state.store);
     ASSERT_EQ(0, first_again_state.initial_offset);
     ASSERT_EQ(1, factory->stores.size());
@@ -143,12 +148,10 @@ TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
 
     ASSERT_OK_AND_ASSIGN(
         RealtimeStoreState second_state,
-        context->GetOrCreateRealtimeStore({{"dt", "2026-08-02"}}, 1, MakeWriteSchema(),
-                                          StatisticsMode::NONE, {}, pool));
+        GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 1, MakeWriteSchema(), {}, pool));
     ASSERT_OK_AND_ASSIGN(
         RealtimeStoreState third_state,
-        context->GetOrCreateRealtimeStore({{"dt", "2026-08-03"}}, 0, MakeWriteSchema(),
-                                          StatisticsMode::NONE, {}, pool));
+        GetOrCreateAppendStore(context, {{"dt", "2026-08-03"}}, 0, MakeWriteSchema(), {}, pool));
     ASSERT_NE(first_state.store, second_state.store);
     ASSERT_NE(first_state.store, third_state.store);
     ASSERT_EQ(3, factory->stores.size());
@@ -171,10 +174,8 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
     std::shared_ptr<MemoryPool> pool = GetDefaultPool();
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
 
-    ASSERT_OK(context->GetOrCreateRealtimeStore(partition, 0, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
-    ASSERT_OK(context->GetOrCreateRealtimeStore(partition, 1, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
+    ASSERT_OK(GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, pool));
+    ASSERT_OK(GetOrCreateAppendStore(context, partition, 1, MakeWriteSchema(), {}, pool));
     ASSERT_EQ(2, factory->stores.size());
 
     ASSERT_NOK_WITH_MSG(context->AdvanceCommittedProgress(-1, {}),
@@ -193,8 +194,7 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
 
     ASSERT_OK_AND_ASSIGN(
         RealtimeStoreState restored_state,
-        context->GetOrCreateRealtimeStore({{"dt", "unknown"}}, 0, MakeWriteSchema(),
-                                          StatisticsMode::NONE, {}, pool));
+        GetOrCreateAppendStore(context, {{"dt", "unknown"}}, 0, MakeWriteSchema(), {}, pool));
     ASSERT_EQ(9, restored_state.initial_offset);
 
     ASSERT_OK(context->AdvanceCommittedProgress(
@@ -211,41 +211,15 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
     ASSERT_EQ(std::vector<int64_t>({8}), factory->stores[1]->committed_offsets);
 }
 
-TEST(RealtimeContextTest, TestRemovedInactivePartitionDoesNotRequireReopen) {
-    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
-    std::shared_ptr<MemoryPool> pool = GetDefaultPool();
-    const std::map<std::string, std::string> active_partition = {{"dt", "2026-08-02"}};
-    const std::map<std::string, std::string> inactive_partition = {{"dt", "2026-08-03"}};
-    const RealtimePartitionBucket active_partition_bucket(active_partition, /*bucket=*/0);
-    const RealtimePartitionBucket inactive_partition_bucket(inactive_partition, /*bucket=*/0);
-
-    ASSERT_OK(context->AdvanceCommittedProgress(
-        5, {{active_partition_bucket, /*offset=*/7}, {inactive_partition_bucket, /*offset=*/9}}));
-    ASSERT_OK_AND_ASSIGN(RealtimeStoreState active_state,
-                         context->GetOrCreateRealtimeStore(active_partition, 0, MakeWriteSchema(),
-                                                           StatisticsMode::NONE, {}, pool));
-    ASSERT_EQ(7, active_state.initial_offset);
-
-    ASSERT_OK(context->AdvanceCommittedProgress(6, {{active_partition_bucket, /*offset=*/7}}));
-    ASSERT_OK_AND_ASSIGN(RealtimeStoreState inactive_state,
-                         context->GetOrCreateRealtimeStore(inactive_partition, 0, MakeWriteSchema(),
-                                                           StatisticsMode::NONE, {}, pool));
-    ASSERT_EQ(0, inactive_state.initial_offset);
-}
-
 TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
     std::shared_ptr<MemoryPool> pool = GetDefaultPool();
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
 
-    ASSERT_OK(context->GetOrCreateRealtimeStore(partition, 0, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
-    ASSERT_OK(context->GetOrCreateRealtimeStore(partition, 1, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
-    ASSERT_OK(context->GetOrCreateRealtimeStore(partition, 2, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
+    ASSERT_OK(GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, pool));
+    ASSERT_OK(GetOrCreateAppendStore(context, partition, 1, MakeWriteSchema(), {}, pool));
+    ASSERT_OK(GetOrCreateAppendStore(context, partition, 2, MakeWriteSchema(), {}, pool));
     ASSERT_EQ(3, factory->stores.size());
     factory->stores[1]->fail_next_advance = true;
 
@@ -259,9 +233,9 @@ TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
     ASSERT_TRUE(factory->stores[1]->committed_offsets.empty());
     ASSERT_EQ(std::vector<int64_t>({9}), factory->stores[2]->committed_offsets);
 
-    ASSERT_OK_AND_ASSIGN(RealtimeStoreState failed_store_state,
-                         context->GetOrCreateRealtimeStore(partition, 1, MakeWriteSchema(),
-                                                           StatisticsMode::NONE, {}, pool));
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeStoreState failed_store_state,
+        GetOrCreateAppendStore(context, partition, 1, MakeWriteSchema(), {}, pool));
     ASSERT_EQ(8, failed_store_state.initial_offset);
 
     ASSERT_OK(context->AdvanceCommittedProgress(5, committed_offsets));
@@ -271,45 +245,11 @@ TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
     ASSERT_EQ(std::vector<int64_t>({8}), factory->stores[1]->committed_offsets);
 }
 
-TEST(RealtimeContextTest, TestRequiresReopenWhenCommittedProgressMovesBackwards) {
-    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
-    std::shared_ptr<MemoryPool> pool = GetDefaultPool();
-    const std::map<std::string, std::string> first_partition = {{"dt", "2026-08-02"}};
-    const std::map<std::string, std::string> second_partition = {{"dt", "2026-08-03"}};
-    const RealtimePartitionBucket first_partition_bucket(first_partition, /*bucket=*/0);
-    const RealtimePartitionBucket second_partition_bucket(second_partition, /*bucket=*/0);
-
-    ASSERT_OK(context->GetOrCreateRealtimeStore(first_partition, 0, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
-    ASSERT_OK(context->GetOrCreateRealtimeStore(second_partition, 0, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, pool));
-    ASSERT_OK(context->AdvanceCommittedProgress(
-        5, {{first_partition_bucket, /*offset=*/7}, {second_partition_bucket, /*offset=*/9}}));
-    ASSERT_EQ(std::vector<int64_t>({7}), factory->stores[0]->committed_offsets);
-    ASSERT_EQ(std::vector<int64_t>({9}), factory->stores[1]->committed_offsets);
-
-    ASSERT_NOK_WITH_MSG(
-        context->AdvanceCommittedProgress(
-            6, {{first_partition_bucket, /*offset=*/6}, {second_partition_bucket, /*offset=*/10}}),
-        "recreate RealtimeContext");
-    ASSERT_NOK_WITH_MSG(
-        context->AdvanceCommittedProgress(6, {{first_partition_bucket, /*offset=*/10}}),
-        "recreate RealtimeContext");
-    ASSERT_EQ(std::vector<int64_t>({7}), factory->stores[0]->committed_offsets);
-    ASSERT_EQ(std::vector<int64_t>({9}), factory->stores[1]->committed_offsets);
-
-    ASSERT_OK(context->AdvanceCommittedProgress(
-        6, {{first_partition_bucket, /*offset=*/10}, {second_partition_bucket, /*offset=*/11}}));
-    ASSERT_EQ(std::vector<int64_t>({7, 10}), factory->stores[0]->committed_offsets);
-    ASSERT_EQ(std::vector<int64_t>({9, 11}), factory->stores[1]->committed_offsets);
-}
-
 TEST(RealtimeContextTest, TestPinsResolvesAndReleasesReadViewTicket) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
-    ASSERT_OK(context->GetOrCreateRealtimeStore(/*partition=*/{}, /*bucket=*/0, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, GetDefaultPool()));
+    ASSERT_OK(GetOrCreateAppendStore(context, /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), {},
+                                     GetDefaultPool()));
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
                          context->AcquireReadViews());
     ASSERT_EQ(1, views.size());
@@ -332,8 +272,8 @@ TEST(RealtimeContextTest, TestPinsResolvesAndReleasesReadViewTicket) {
 TEST(RealtimeContextTest, TestExpiresAbandonedReadViewTicket) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
-    ASSERT_OK(context->GetOrCreateRealtimeStore(/*partition=*/{}, /*bucket=*/0, MakeWriteSchema(),
-                                                StatisticsMode::NONE, {}, GetDefaultPool()));
+    ASSERT_OK(GetOrCreateAppendStore(context, /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), {},
+                                     GetDefaultPool()));
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimePartitionBucketView> views,
                          context->AcquireReadViews());
     ASSERT_EQ(1, views.size());

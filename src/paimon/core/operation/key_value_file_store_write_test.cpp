@@ -53,6 +53,7 @@
 #include "paimon/format/reader_builder.h"
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/reader/file_batch_reader.h"
+#include "paimon/realtime/realtime_context.h"
 #include "paimon/record_batch.h"
 #include "paimon/status.h"
 #include "paimon/testing/utils/test_helper.h"
@@ -301,6 +302,53 @@ TEST_F(KeyValueFileStoreWriteTest, TestPrepareCommitShouldSucceedWhenLookupEnabl
     ASSERT_OK_AND_ASSIGN(auto commit_messages,
                          file_store_write->PrepareCommit(/*wait_compaction=*/true));
     ASSERT_EQ(commit_messages.size(), 1);
+}
+
+TEST_F(KeyValueFileStoreWriteTest, TestRealtimeWrite) {
+    const std::map<std::string, std::string> options = {
+        {Options::BUCKET, "1"},
+        {Options::WRITE_BUFFER_SIZE, "1"},
+    };
+    const std::shared_ptr<arrow::Schema> schema = arrow::schema({
+        arrow::field("id", arrow::int64(), /*nullable=*/false),
+        arrow::field("value", arrow::utf8()),
+    });
+    std::unique_ptr<UniqueTestDirectory> dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    CreateTable(dir->Str(), schema, options);
+    const std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    WriteContextBuilder builder(table_path, "test");
+    builder.SetOptions(options)
+        .WithStreamingMode(true)
+        .WithRealtimeContext(realtime_context)
+        .WithTempDirectory(dir->Str());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> write_context, builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         FileStoreWrite::Create(std::move(write_context)));
+
+    ASSERT_OK(writer->Write(MakeBatch(schema, R"([
+        [1, "old"],
+        [2, "two"],
+        [1, "new"]
+    ])")));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progresses,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, progresses.size());
+    ASSERT_EQ(OffsetRange(0, 3), progresses[0].offset_range);
+    std::shared_ptr<CommitMessageImpl> commit_message =
+        std::dynamic_pointer_cast<CommitMessageImpl>(progresses[0].commit_message);
+    ASSERT_NE(nullptr, commit_message);
+    int64_t row_count = 0;
+    for (const std::shared_ptr<DataFileMeta>& file :
+         commit_message->GetNewFilesIncrement().NewFiles()) {
+        row_count += file->row_count;
+    }
+    ASSERT_EQ(2, row_count);
+    ASSERT_EQ(0, TestHelper::CountChannelFiles(dir->GetFileSystem(), dir->Str()));
+    ASSERT_OK(writer->Close());
 }
 
 TEST_F(KeyValueFileStoreWriteTest,
