@@ -90,20 +90,6 @@ KeyValueFileStoreWrite::KeyValueFileStoreWrite(
     }
 }
 
-Status KeyValueFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {
-    if (!realtime_context_) {
-        return Status::Invalid("refresh committed snapshot requires a real-time writer");
-    }
-    PAIMON_ASSIGN_OR_RAISE(Snapshot snapshot, snapshot_manager_->LoadSnapshot(snapshot_id));
-    PAIMON_ASSIGN_OR_RAISE(
-        RealtimeOffsetMap committed_offsets,
-        RealtimeCommitProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
-                                              options_.GetFileSystem()));
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
-                           RealtimeContextImpl::Cast(realtime_context_));
-    return realtime_context_impl->AdvanceCommittedProgress(snapshot_id, committed_offsets);
-}
-
 Result<std::unique_ptr<FileStoreScan>> KeyValueFileStoreWrite::CreateFileStoreScan(
     const std::shared_ptr<ScanFilter>& scan_filter) const {
     PAIMON_ASSIGN_OR_RAISE(
@@ -139,6 +125,7 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         Levels::Create(key_comparator_, restore_data_files, options_.GetNumLevels()));
     std::map<std::string, std::string> partition_map;
     int64_t materialized_max_sequence_number = restore_max_seq_number;
+    std::shared_ptr<CompactManager> compact_manager;
     if (realtime_context_) {
         std::vector<std::pair<std::string, std::string>> partition_values;
         PAIMON_ASSIGN_OR_RAISE(partition_values,
@@ -147,15 +134,11 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
             std::map<std::string, std::string>(partition_values.begin(), partition_values.end());
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
                                RealtimeContextImpl::Cast(realtime_context_));
-        const RealtimePartitionBucket partition_bucket(partition_map, bucket);
         materialized_max_sequence_number = realtime_context_impl->GetMaterializedMaxSequenceNumber(
-            partition_bucket, restore_max_seq_number);
+            RealtimePartitionBucket(partition_map, bucket), restore_max_seq_number);
         if (materialized_max_sequence_number == std::numeric_limits<int64_t>::max()) {
             return Status::Invalid("PK sequence number has reached INT64_MAX");
         }
-    }
-    std::shared_ptr<CompactManager> compact_manager;
-    if (realtime_context_) {
         compact_manager = std::make_shared<NoopCompactManager>();
     } else {
         auto compact_strategy = compact_manager_factory_->CreateCompactStrategy();
@@ -179,6 +162,20 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     return RealtimePrimaryKeyWriter::Create(
         partition_map, bucket, std::move(c_write_schema), trimmed_primary_keys, realtime_context_,
         writer, options_.ToMap(), pool_, materialized_max_sequence_number);
+}
+
+Status KeyValueFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {
+    if (!realtime_context_) {
+        return Status::Invalid("refresh committed snapshot requires a real-time writer");
+    }
+    PAIMON_ASSIGN_OR_RAISE(Snapshot snapshot, snapshot_manager_->LoadSnapshot(snapshot_id));
+    PAIMON_ASSIGN_OR_RAISE(
+        RealtimeOffsetMap committed_offsets,
+        RealtimeCommitProperties::ReadOffsets(std::optional<Snapshot>(std::move(snapshot)),
+                                              options_.GetFileSystem()));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
+                           RealtimeContextImpl::Cast(realtime_context_));
+    return realtime_context_impl->AdvanceCommittedProgress(snapshot_id, committed_offsets);
 }
 
 Status KeyValueFileStoreWrite::Close() {
