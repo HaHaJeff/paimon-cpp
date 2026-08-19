@@ -107,7 +107,7 @@ Result<std::vector<std::shared_ptr<Split>>> RealtimeTableScan::CreateRealtimeSpl
     for (const std::shared_ptr<Split>& split : disk_splits) {
         std::shared_ptr<DataSplitImpl> data_split = std::dynamic_pointer_cast<DataSplitImpl>(split);
         if (!data_split) {
-            return Status::Invalid("real-time append scan requires process-local data splits");
+            return Status::Invalid("real-time scan requires process-local data splits");
         }
         std::vector<std::pair<std::string, std::string>> partition_values;
         PAIMON_ASSIGN_OR_RAISE(partition_values,
