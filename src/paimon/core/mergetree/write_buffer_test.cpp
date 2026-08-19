@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "arrow/api.h"
@@ -36,6 +38,7 @@
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/fs/file_system.h"
+#include "paimon/fs/local/local_file_system.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/testing/utils/test_helper.h"
 #include "paimon/testing/utils/testharness.h"
@@ -46,6 +49,76 @@ class MergeFunctionWrapper;
 }  // namespace paimon
 
 namespace paimon::test {
+namespace {
+
+struct SpillCleanupState {
+    bool stream_alive = false;
+    bool delete_called = false;
+    bool stream_alive_at_delete = false;
+};
+
+class FailingCloseOutputStream : public OutputStream {
+ public:
+    FailingCloseOutputStream(std::unique_ptr<OutputStream>&& output,
+                             const std::shared_ptr<SpillCleanupState>& state)
+        : output_(std::move(output)), state_(state) {
+        state_->stream_alive = true;
+    }
+
+    ~FailingCloseOutputStream() override {
+        state_->stream_alive = false;
+    }
+
+    Result<int64_t> GetPos() const override {
+        return output_->GetPos();
+    }
+
+    Result<int64_t> Write(const char* buffer, int64_t size) override {
+        return output_->Write(buffer, size);
+    }
+
+    Status Flush() override {
+        return output_->Flush();
+    }
+
+    Status Close() override {
+        return Status::IOError("injected spill close failure");
+    }
+
+    Result<std::string> GetUri() const override {
+        return output_->GetUri();
+    }
+
+ private:
+    std::unique_ptr<OutputStream> output_;
+    std::shared_ptr<SpillCleanupState> state_;
+};
+
+class FailingDeleteFileSystem : public LocalFileSystem {
+ public:
+    explicit FailingDeleteFileSystem(const std::shared_ptr<SpillCleanupState>& state)
+        : state_(state) {}
+
+    Result<std::unique_ptr<OutputStream>> Create(const std::string& path,
+                                                 bool overwrite) const override {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<OutputStream> output,
+                               LocalFileSystem::Create(path, overwrite));
+        return std::unique_ptr<OutputStream>(
+            new FailingCloseOutputStream(std::move(output), state_));
+    }
+
+    Status Delete(const std::string& path, bool recursive = true) const override {
+        state_->delete_called = true;
+        state_->stream_alive_at_delete = state_->stream_alive;
+        return Status::IOError("injected spill delete failure");
+    }
+
+ private:
+    std::shared_ptr<SpillCleanupState> state_;
+};
+
+}  // namespace
+
 struct ReaderResult {
     std::vector<int64_t> sequence_numbers;
     std::vector<int8_t> row_kind_values;
@@ -327,6 +400,101 @@ TEST_F(WriteBufferTest, TestSpillDiskQuotaEnforcement) {
         std::sort(all_sequence_numbers.begin(), all_sequence_numbers.end());
         ASSERT_EQ(all_sequence_numbers, (std::vector<int64_t>{0, 2}));
     }
+}
+
+TEST_F(WriteBufferTest, TestPinnedSpillCountsAgainstQuota) {
+    std::shared_ptr<arrow::Array> first =
+        arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+        ["Alice", 10, 0, 13.1]
+    ])")
+            .ValueOrDie();
+    std::shared_ptr<arrow::Array> second =
+        arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+        ["Bob", 20, 1, 14.1]
+    ])")
+            .ValueOrDie();
+    const std::map<std::string, std::string> base_options = {
+        {Options::WRITE_BUFFER_SIZE, "1"},
+        {Options::WRITE_BUFFER_SPILLABLE, "true"},
+        {Options::LOCAL_SORT_MAX_NUM_FILE_HANDLES, "2"}};
+
+    ASSERT_OK_AND_ASSIGN(CoreOptions single_options, CoreOptions::FromMap(base_options));
+    std::unique_ptr<WriteBuffer> single =
+        CreateWriteBuffer(/*last_sequence_number=*/-1, single_options);
+    ASSERT_OK(single->Write(CreateBatch(first, /*row_kinds=*/{})));
+    ASSERT_OK_AND_ASSIGN(int64_t single_file_size, GetOnlySpillFileSize());
+    single->Clear();
+
+    std::unique_ptr<WriteBuffer> merged =
+        CreateWriteBuffer(/*last_sequence_number=*/-1, single_options);
+    ASSERT_OK(merged->Write(CreateBatch(first, /*row_kinds=*/{})));
+    ASSERT_OK(merged->Write(CreateBatch(second, /*row_kinds=*/{})));
+    ASSERT_OK_AND_ASSIGN(int64_t merged_file_size, GetOnlySpillFileSize());
+    merged->Clear();
+
+    std::map<std::string, std::string> quota_options = base_options;
+    quota_options[Options::WRITE_BUFFER_SPILL_MAX_DISK_SIZE] =
+        std::to_string(single_file_size + merged_file_size);
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(quota_options));
+    std::unique_ptr<WriteBuffer> write_buffer =
+        CreateWriteBuffer(/*last_sequence_number=*/-1, options);
+    ASSERT_OK_AND_ASSIGN(bool has_remaining_quota,
+                         write_buffer->Write(CreateBatch(first, /*row_kinds=*/{})));
+    ASSERT_TRUE(has_remaining_quota);
+    auto merge_factory = []() {
+        return std::make_shared<ReducerMergeFunctionWrapper>(
+            std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false));
+    };
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> pinned_readers,
+                         write_buffer->CreateReadersWithoutFinalMerge(merge_factory));
+
+    ASSERT_OK_AND_ASSIGN(has_remaining_quota,
+                         write_buffer->Write(CreateBatch(second, /*row_kinds=*/{})));
+    ASSERT_FALSE(has_remaining_quota);
+    ASSERT_EQ(2U, TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()));
+
+    pinned_readers.clear();
+    ASSERT_EQ(1U, TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()));
+    write_buffer->Clear();
+
+    quota_options[Options::WRITE_BUFFER_SPILL_MAX_DISK_SIZE] = std::to_string(single_file_size * 2);
+    ASSERT_OK_AND_ASSIGN(CoreOptions clear_options, CoreOptions::FromMap(quota_options));
+    write_buffer = CreateWriteBuffer(/*last_sequence_number=*/-1, clear_options);
+    ASSERT_OK(write_buffer->Write(CreateBatch(first, /*row_kinds=*/{})));
+    ASSERT_OK_AND_ASSIGN(pinned_readers,
+                         write_buffer->CreateReadersWithoutFinalMerge(merge_factory));
+    write_buffer->Clear();
+    ASSERT_EQ(1U, TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()));
+
+    ASSERT_OK_AND_ASSIGN(has_remaining_quota,
+                         write_buffer->Write(CreateBatch(first, /*row_kinds=*/{})));
+    ASSERT_FALSE(has_remaining_quota);
+    ASSERT_EQ(2U, TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()));
+    pinned_readers.clear();
+    ASSERT_EQ(1U, TestHelper::CountChannelFiles(tmp_dir_->GetFileSystem(), tmp_dir_->Str()));
+}
+
+TEST_F(WriteBufferTest, TestSpillCleanupClosesWriter) {
+    std::shared_ptr<SpillCleanupState> state = std::make_shared<SpillCleanupState>();
+    std::shared_ptr<FileSystem> file_system = std::make_shared<FailingDeleteFileSystem>(state);
+    io_manager_ = std::make_shared<IOManager>(tmp_dir_->Str(), file_system);
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap({{Options::WRITE_BUFFER_SIZE, "1"},
+                                               {Options::WRITE_BUFFER_SPILLABLE, "true"}},
+                                              file_system));
+    std::unique_ptr<WriteBuffer> write_buffer =
+        CreateWriteBuffer(/*last_sequence_number=*/-1, options);
+    std::shared_ptr<arrow::Array> array =
+        arrow::ipc::internal::json::ArrayFromJSON(value_type_, R"([
+        ["Alice", 10, 0, 13.1]
+    ])")
+            .ValueOrDie();
+
+    Result<bool> result = write_buffer->Write(CreateBatch(array, /*row_kinds=*/{}));
+
+    ASSERT_TRUE(result.status().IsIOError());
+    ASSERT_TRUE(state->delete_called);
+    ASSERT_FALSE(state->stream_alive_at_delete);
 }
 
 TEST_F(WriteBufferTest, TestCreateReadersMergesSingleInMemoryReaderLocally) {

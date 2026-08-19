@@ -272,6 +272,9 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
                 std::make_shared<BucketedDvMaintainer::Factory>(index_file_handler);
         }
 
+        if (ctx->GetRealtimeContext()) {
+            PAIMON_RETURN_NOT_OK(ctx->GetRealtimeContext()->BindPrimaryKeyWriter());
+        }
         return std::make_unique<KeyValueFileStoreWrite>(
             file_store_path_factory, snapshot_manager, schema_manager, ctx->GetCommitUser(),
             ctx->GetRootPath(), schema, arrow_schema, partition_schema, dv_maintainer_factory,

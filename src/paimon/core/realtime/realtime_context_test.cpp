@@ -243,20 +243,13 @@ TEST(RealtimeContextTest, TestCustomFactorySupportsAppendAndPrimaryKey) {
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
     ASSERT_OK(context->GetOrCreateMemIndexer(MakeRequest(partition, 2)));
     ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<RealtimePrimaryKeyWriter> first_writer,
+        std::shared_ptr<RealtimePrimaryKeyWriter> writer,
         RealtimePrimaryKeyWriter::Create(
             partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
             /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
             /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
             /*restore_max_seq_number=*/-1));
-    ASSERT_OK(first_writer->Write(MakeWriteBatch("[[1]]")));
-    ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<RealtimePrimaryKeyWriter> second_writer,
-        RealtimePrimaryKeyWriter::Create(
-            partition, 3, MakeWriteSchema(), /*trimmed_primary_keys=*/{"id"}, context,
-            /*merge_tree_writer=*/nullptr, /*options=*/{}, GetDefaultPool(),
-            /*file_system=*/nullptr, /*temp_directory=*/"", /*enable_multi_thread_spill=*/false,
-            /*restore_max_seq_number=*/17));
+    ASSERT_OK(writer->Write(MakeWriteBatch("[[1]]")));
     ASSERT_EQ(2, factory->requests.size());
     ASSERT_TRUE(
         std::holds_alternative<AppendMemIndexerCreateConfig>(factory->requests[0].mode_config));
@@ -268,8 +261,7 @@ TEST(RealtimeContextTest, TestCustomFactorySupportsAppendAndPrimaryKey) {
     ASSERT_EQ(partition, factory->requests[1].partition);
     ASSERT_EQ(3, factory->requests[1].bucket);
     ASSERT_EQ(-1, primary_key_config.restore_max_sequence_number);
-    ASSERT_OK(second_writer->Write(MakeWriteBatch("[[2]]")));
-    ASSERT_EQ(std::optional<Range>(Range(0, 1)), factory->indexers[1]->offset_range);
+    ASSERT_EQ(std::optional<Range>(Range(0, 0)), factory->indexers[1]->offset_range);
 }
 
 TEST(RealtimeContextTest, TestPrimaryKeyFactoryRejectsSequenceOverflow) {

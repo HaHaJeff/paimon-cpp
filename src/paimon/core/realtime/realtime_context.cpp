@@ -91,6 +91,15 @@ class RealtimeContext::Impl {
         return RealtimeMemIndexerState{std::move(indexer), initial_offset};
     }
 
+    Status BindPrimaryKeyWriter() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (primary_key_writer_bound_) {
+            return Status::Invalid("real-time context is already bound to a primary-key writer");
+        }
+        primary_key_writer_bound_ = true;
+        return Status::OK();
+    }
+
  public:
     Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -166,6 +175,7 @@ class RealtimeContext::Impl {
     std::mutex mutex_;
     std::mutex progress_mutex_;
     std::map<RealtimePartitionBucket, std::shared_ptr<MemIndexer>> indexers_;
+    bool primary_key_writer_bound_ = false;
     RealtimeOffsetMap committed_offsets_;
     RealtimeOffsetMap reclaimed_offsets_;
     std::optional<int64_t> last_refreshed_snapshot_id_;
@@ -199,6 +209,10 @@ Result<std::vector<RealtimePartitionBucketView>> RealtimeContext::AcquireReadVie
 Status RealtimeContext::AdvanceCommittedProgress(int64_t snapshot_id,
                                                  const RealtimeOffsetMap& committed_offsets) {
     return impl_->AdvanceCommittedProgress(snapshot_id, committed_offsets);
+}
+
+Status RealtimeContext::BindPrimaryKeyWriter() {
+    return impl_->BindPrimaryKeyWriter();
 }
 
 }  // namespace paimon

@@ -135,7 +135,6 @@ void ExternalSortBuffer::DoClear() {
     in_memory_buffer_->Clear();
 
     spill_channel_manager_->Reset();
-    total_spill_disk_bytes_ = 0;
     spill_merger_->Clear();
 }
 
@@ -181,7 +180,8 @@ Result<bool> ExternalSortBuffer::FlushMemory() {
                            in_memory_buffer_->CreateReaders());
     PAIMON_RETURN_NOT_OK(SpillMemoryBuffer(std::move(memory_buffer_readers)));
     in_memory_buffer_->Clear();
-    return total_spill_disk_bytes_ < options_.GetWriteBufferSpillMaxDiskSize();
+    return spill_channel_manager_->GetTotalSpillDiskBytes() <
+           options_.GetWriteBufferSpillMaxDiskSize();
 }
 
 Result<bool> ExternalSortBuffer::Write(std::unique_ptr<RecordBatch>&& batch) {
@@ -268,9 +268,11 @@ Result<FileChannelInfo> ExternalSortBuffer::SpillToDisk(
         SpillWriter::Create(options_.GetFileSystem(), write_schema_, spill_channel_enumerator_,
                             spill_channel_manager_, spill_compress_options.compress,
                             spill_compress_options.zstd_level, enable_multi_thread_spill_, pool_));
+    const FileIOChannel::ID channel_id = spill_writer->GetChannelId();
     auto cleanup_guard = ScopeGuard([&]() {
-        [[maybe_unused]] auto status =
-            spill_channel_manager_->DeleteChannel(spill_writer->GetChannelId());
+        [[maybe_unused]] Status close_status = spill_writer->Close();
+        spill_writer.reset();
+        [[maybe_unused]] Status delete_status = spill_channel_manager_->DeleteChannel(channel_id);
     });
 
     auto sorted_reader = std::make_unique<SortMergeReaderWithMinHeap>(
@@ -300,6 +302,8 @@ Result<FileChannelInfo> ExternalSortBuffer::SpillToDisk(
 
     PAIMON_RETURN_NOT_OK(spill_writer->Close());
     PAIMON_ASSIGN_OR_RAISE(int64_t spilled_file_size, spill_writer->GetFileSize());
+    PAIMON_RETURN_NOT_OK(spill_channel_manager_->SetChannelFileSize(spill_writer->GetChannelId(),
+                                                                    spilled_file_size));
     cleanup_guard.Release();
     return FileChannelInfo{spill_writer->GetChannelId(), spilled_file_size};
 }
@@ -308,7 +312,6 @@ Status ExternalSortBuffer::SpillMemoryBuffer(
     std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers) {
     PAIMON_ASSIGN_OR_RAISE(FileChannelInfo file_info,
                            SpillToDisk(std::move(readers), spill_batch_size_));
-    total_spill_disk_bytes_ += file_info.file_size;
     spill_merger_->AddFile(file_info);
     return spill_merger_->RunMergeIfNeeded(CreateSpillFileMergeFn());
 }
@@ -325,11 +328,8 @@ Result<FileChannelInfo> ExternalSortBuffer::MergeAndReplaceFiles(
                            CreateSpillReaders(files));
     PAIMON_ASSIGN_OR_RAISE(FileChannelInfo output,
                            SpillToDisk(std::move(readers), spill_batch_size_));
-    total_spill_disk_bytes_ += output.file_size;
-
     for (const auto& file : files) {
         [[maybe_unused]] auto status = spill_channel_manager_->DeleteChannel(file.channel_id);
-        total_spill_disk_bytes_ -= file.file_size;
     }
     return output;
 }

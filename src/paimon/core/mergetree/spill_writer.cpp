@@ -97,14 +97,24 @@ Status SpillWriter::Close() {
     if (closed_) {
         return Status::OK();
     }
+    Status status = Status::OK();
     if (arrow_writer_) {
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow_writer_->Close());
+        arrow::Status arrow_status = arrow_writer_->Close();
+        if (!arrow_status.ok()) {
+            status = ToPaimonStatus(arrow_status);
+        }
     }
+    arrow_writer_.reset();
+    arrow_output_stream_adapter_.reset();
     if (out_stream_) {
-        PAIMON_RETURN_NOT_OK(out_stream_->Close());
+        Status close_status = out_stream_->Close();
+        if (status.ok()) {
+            status = close_status;
+        }
     }
+    out_stream_.reset();
     closed_ = true;
-    return Status::OK();
+    return status;
 }
 
 Result<int64_t> SpillWriter::GetFileSize() const {

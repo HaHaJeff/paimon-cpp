@@ -800,6 +800,25 @@ TEST_F(RealtimeWriteInteTest, TestCloseWriterAllowsContextReuseByLaterWriter) {
     ASSERT_OK(second_writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkContextReuse) {
+    options_[Options::WRITE_BUFFER_SPILLABLE] = "true";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> rows = {{1, "one", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(rows, /*partitioned=*/false));
+    ASSERT_OK(first_writer->Write(std::move(batch)));
+    ASSERT_OK(first_writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
+    ASSERT_EQ(rows, actual_rows);
+
+    ASSERT_NOK_WITH_MSG(CreateRealtimeWriter(realtime_context),
+                        "already bound to a primary-key writer");
+}
+
 TEST_F(RealtimeWriteInteTest, TestReadCommittedDiskAndBuildingMemory) {
     CreateTable(/*partition_keys=*/{});
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,

@@ -63,8 +63,8 @@ class ExternalSortBuffer : public SortBuffer {
     Result<bool> FlushMemory() override;
     Result<bool> Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReaders() override;
-    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
-    CreateReadersWithoutFinalMerge() override;
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateReadersWithoutFinalMerge()
+        override;
     bool HasData() const override;
 
  private:
@@ -109,7 +109,6 @@ class ExternalSortBuffer : public SortBuffer {
 
     std::unique_ptr<SpillFileMerger> spill_merger_;
     std::shared_ptr<FileIOChannel::Enumerator> spill_channel_enumerator_;
-    int64_t total_spill_disk_bytes_ = 0;
     int32_t actual_max_fan_in_;
     int32_t spill_batch_size_;
 };
