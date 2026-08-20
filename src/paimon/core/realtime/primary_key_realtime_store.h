@@ -33,12 +33,15 @@ class Schema;
 
 namespace paimon {
 
+class CoreOptions;
 class FieldsComparator;
 struct KeyValue;
 class MemoryPool;
 class InternalRow;
 template <typename T>
 class MergeFunctionWrapper;
+
+Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options);
 
 /// Optional metadata exposed by PK query readers with a known inclusive key range.
 class PrimaryKeyRangeProvider {

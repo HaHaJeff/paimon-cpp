@@ -19,6 +19,7 @@
 
 #include "paimon/core/realtime/primary_key_realtime_store.h"
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,12 +31,37 @@
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/fields_comparator.h"
+#include "paimon/core/core_options.h"
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/testing/utils/testharness.h"
 
 namespace paimon::test {
+
+TEST(PrimaryKeyRealtimeStoreOptionsTest, TestSupportedOptions) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
+    ASSERT_OK(ValidatePrimaryKeyRealtimeOptions(options));
+}
+
+TEST(PrimaryKeyRealtimeStoreOptionsTest, TestUnsupportedOptions) {
+    const std::string sequence_group =
+        std::string(Options::FIELDS_PREFIX) + ".value." + Options::SEQUENCE_GROUP;
+    const std::vector<std::map<std::string, std::string>> unsupported_options = {
+        {{Options::BUCKET, "0"}},
+        {{Options::BUCKET, "1"}, {Options::MERGE_ENGINE, "partial-update"}},
+        {{Options::BUCKET, "1"}, {Options::DATA_EVOLUTION_ENABLED, "true"}},
+        {{Options::BUCKET, "1"}, {sequence_group, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
+        {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
+        {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
+    };
+    for (const std::map<std::string, std::string>& option_map : unsupported_options) {
+        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+        ASSERT_NOK(ValidatePrimaryKeyRealtimeOptions(options));
+    }
+}
 
 class PrimaryKeyRealtimeStoreTest : public testing::Test {
  public:
