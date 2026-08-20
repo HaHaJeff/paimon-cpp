@@ -117,6 +117,13 @@ Status RealtimePrimaryKeyWriter::FlushSegment(
     const std::shared_ptr<RealtimeSegmentHandle>& segment) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                            realtime_store_->CreateCommitReaders(segment));
+    ScopeGuard readers_guard([&readers]() {
+        for (const std::unique_ptr<BatchReader>& reader : readers) {
+            if (reader) {
+                reader->Close();
+            }
+        }
+    });
     for (const std::unique_ptr<BatchReader>& reader : readers) {
         if (!reader) {
             return Status::Invalid("PK real-time store returned a null commit reader");
