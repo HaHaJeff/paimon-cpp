@@ -85,6 +85,7 @@ class QueryBatchKeyValueReader final : public KeyValueRecordReader {
     std::shared_ptr<arrow::Int8Array> row_kinds_;
     std::shared_ptr<ColumnarBatchContext> key_context_;
     std::shared_ptr<ColumnarBatchContext> value_context_;
+    bool closed_ = false;
 };
 
 class QueryBatchKeyValueReader::Iterator final : public KeyValueRecordReader::Iterator {
@@ -160,6 +161,10 @@ std::shared_ptr<Metrics> QueryBatchKeyValueReader::GetReaderMetrics() const {
 }
 
 void QueryBatchKeyValueReader::Close() {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
     values_.reset();
     sequences_.reset();
     row_kinds_.reset();
@@ -167,7 +172,6 @@ void QueryBatchKeyValueReader::Close() {
     value_context_.reset();
     if (reader_) {
         reader_->Close();
-        reader_.reset();
     }
 }
 
