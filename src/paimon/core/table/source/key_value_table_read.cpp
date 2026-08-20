@@ -190,6 +190,13 @@ Result<std::vector<AdditionalKeyValueReader>> CreateMemoryReaders(
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> batch_readers,
                            memory.store->CreateQueryReaders(
                                memory.read_view, split->CommittedEndOffset(), query_context));
+    ScopeGuard reader_guard([&batch_readers]() {
+        for (const std::unique_ptr<BatchReader>& reader : batch_readers) {
+            if (reader) {
+                reader->Close();
+            }
+        }
+    });
     if (batch_readers.empty()) {
         return Status::Invalid("PK real-time store returned no query readers for active memory");
     }

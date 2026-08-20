@@ -348,12 +348,20 @@ class CloseTrackingBatchReader final : public BatchReader {
     std::shared_ptr<std::atomic<int32_t>> close_count_;
 };
 
+struct CloseTrackingReaderState {
+    std::shared_ptr<std::atomic<int32_t>> query_close_count =
+        std::make_shared<std::atomic<int32_t>>(0);
+    std::shared_ptr<std::atomic<int32_t>> commit_close_count =
+        std::make_shared<std::atomic<int32_t>>(0);
+    int32_t query_null_index = -1;
+    int32_t commit_null_index = -1;
+};
+
 class CloseTrackingRealtimeStore final : public RealtimeStore {
  public:
     CloseTrackingRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
-                               const std::shared_ptr<std::atomic<int32_t>>& close_count,
-                               const std::shared_ptr<std::atomic<bool>>& append_null_reader)
-        : delegate_(delegate), close_count_(close_count), append_null_reader_(append_null_reader) {}
+                               const std::shared_ptr<CloseTrackingReaderState>& state)
+        : delegate_(delegate), state_(state) {}
 
     Status Write(RealtimeWriteBatch&& batch) override {
         return delegate_->Write(std::move(batch));
@@ -365,7 +373,14 @@ class CloseTrackingRealtimeStore final : public RealtimeStore {
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
-        return delegate_->CreateCommitReaders(segment);
+        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
+                               delegate_->CreateCommitReaders(segment));
+        for (std::unique_ptr<BatchReader>& reader : readers) {
+            reader = std::make_unique<CloseTrackingBatchReader>(std::move(reader),
+                                                                state_->commit_close_count);
+        }
+        PAIMON_RETURN_NOT_OK(InsertNullReader(state_->commit_null_index, &readers));
+        return readers;
     }
 
     Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
@@ -378,11 +393,10 @@ class CloseTrackingRealtimeStore final : public RealtimeStore {
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                                delegate_->CreateQueryReaders(view, offset_begin, context));
         for (std::unique_ptr<BatchReader>& reader : readers) {
-            reader = std::make_unique<CloseTrackingBatchReader>(std::move(reader), close_count_);
+            reader = std::make_unique<CloseTrackingBatchReader>(std::move(reader),
+                                                                state_->query_close_count);
         }
-        if (append_null_reader_->load(std::memory_order_acquire)) {
-            readers.push_back(nullptr);
-        }
+        PAIMON_RETURN_NOT_OK(InsertNullReader(state_->query_null_index, &readers));
         return readers;
     }
 
@@ -395,28 +409,38 @@ class CloseTrackingRealtimeStore final : public RealtimeStore {
     }
 
  private:
+    static Status InsertNullReader(int32_t index,
+                                   std::vector<std::unique_ptr<BatchReader>>* readers) {
+        if (index < 0) {
+            return Status::OK();
+        }
+        if (index > static_cast<int32_t>(readers->size())) {
+            return Status::Invalid("null reader index exceeds reader count");
+        }
+        readers->insert(readers->begin() + index, nullptr);
+        return Status::OK();
+    }
+
     std::shared_ptr<RealtimeStore> delegate_;
-    std::shared_ptr<std::atomic<int32_t>> close_count_;
-    std::shared_ptr<std::atomic<bool>> append_null_reader_;
+    std::shared_ptr<CloseTrackingReaderState> state_;
 };
 
 class CloseTrackingRealtimeStoreFactory final : public RealtimeStoreFactory {
  public:
-    CloseTrackingRealtimeStoreFactory(const std::shared_ptr<std::atomic<int32_t>>& close_count,
-                                      const std::shared_ptr<std::atomic<bool>>& append_null_reader)
-        : close_count_(close_count), append_null_reader_(append_null_reader) {}
+    explicit CloseTrackingRealtimeStoreFactory(
+        const std::shared_ptr<CloseTrackingReaderState>& state)
+        : state_(state) {}
 
     Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
                                delegate_.Create(std::move(request)));
-        return std::shared_ptr<RealtimeStore>(std::make_shared<CloseTrackingRealtimeStore>(
-            delegate, close_count_, append_null_reader_));
+        return std::shared_ptr<RealtimeStore>(
+            std::make_shared<CloseTrackingRealtimeStore>(delegate, state_));
     }
 
  private:
     ArrowRealtimeStoreFactory delegate_;
-    std::shared_ptr<std::atomic<int32_t>> close_count_;
-    std::shared_ptr<std::atomic<bool>> append_null_reader_;
+    std::shared_ptr<CloseTrackingReaderState> state_;
 };
 
 class InvalidReaderRealtimeStore final : public RealtimeStore {
@@ -1727,12 +1751,10 @@ TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkPluginQueryReaderCloseLifecycle) {
+TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
     CreatePkTable();
-    auto close_count = std::make_shared<std::atomic<int32_t>>(0);
-    auto append_null_reader = std::make_shared<std::atomic<bool>>(false);
-    auto factory =
-        std::make_shared<CloseTrackingRealtimeStoreFactory>(close_count, append_null_reader);
+    auto state = std::make_shared<CloseTrackingReaderState>();
+    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -1758,15 +1780,71 @@ TEST_F(RealtimeWriteInteTest, TestPkPluginQueryReaderCloseLifecycle) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> explicitly_closed_reader, create_reader());
     explicitly_closed_reader->Close();
     explicitly_closed_reader.reset();
-    ASSERT_EQ(1, close_count->load(std::memory_order_acquire));
+    ASSERT_EQ(1, state->query_close_count->load(std::memory_order_acquire));
 
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> destroyed_reader, create_reader());
     destroyed_reader.reset();
-    ASSERT_EQ(2, close_count->load(std::memory_order_acquire));
+    ASSERT_EQ(2, state->query_close_count->load(std::memory_order_acquire));
 
-    append_null_reader->store(true, std::memory_order_release);
-    ASSERT_NOK_WITH_MSG(create_reader(), "PK real-time store returned a null query reader");
-    ASSERT_EQ(3, close_count->load(std::memory_order_acquire));
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkQueryReaderCloseFailure) {
+    CreatePkTable();
+    auto state = std::make_shared<CloseTrackingReaderState>();
+    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
+                         MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(first_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, progress.size());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
+                         MakeBatch({Row{2, "two", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(second_batch)));
+
+    auto create_reader = [&]() -> Result<std::unique_ptr<BatchReader>> {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Plan> plan,
+                               CreatePlan(realtime_context, /*predicate=*/nullptr));
+        ReadContextBuilder read_builder(table_path_);
+        read_builder.SetOptions(options_)
+            .SetReadFieldNames({"id", "payload", "pt"})
+            .WithRealtimeContext(realtime_context)
+            .WithMemoryPool(pool_);
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableRead> table_read,
+                               TableRead::Create(std::move(read_context)));
+        return table_read->CreateReader(plan->Splits());
+    };
+
+    for (int32_t null_index = 0; null_index <= 2; ++null_index) {
+        state->query_null_index = null_index;
+        ASSERT_NOK_WITH_MSG(create_reader(), "PK real-time store returned a null query reader");
+        ASSERT_EQ(2 * (null_index + 1), state->query_close_count->load(std::memory_order_acquire));
+    }
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkCommitReaderCloseFailure) {
+    CreatePkTable();
+    auto state = std::make_shared<CloseTrackingReaderState>();
+    state->commit_null_index = 1;
+    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+
+    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
+                        "PK real-time store returned a null commit reader");
+    ASSERT_EQ(1, state->commit_close_count->load(std::memory_order_acquire));
     ASSERT_OK(writer->Close());
 }
 
