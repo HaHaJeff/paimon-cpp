@@ -47,6 +47,7 @@ class MemoryPool;
 struct RealtimeStoreState {
     std::shared_ptr<RealtimeStore> store;
     int64_t initial_offset;
+    std::optional<int64_t> initial_max_sequence_number;
 };
 
 struct RealtimePartitionBucketView {
@@ -66,9 +67,6 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
         const std::shared_ptr<RealtimeContext>& context);
 
     Result<RealtimeStoreState> GetOrCreateRealtimeStore(RealtimeStoreCreateRequest&& request);
-
-    int64_t GetMaterializedMaxSequenceNumber(const RealtimePartitionBucket& partition_bucket,
-                                             int64_t restored_max_sequence_number);
 
     void AdvanceMaterializedMaxSequenceNumber(const RealtimePartitionBucket& partition_bucket,
                                               int64_t max_sequence_number);

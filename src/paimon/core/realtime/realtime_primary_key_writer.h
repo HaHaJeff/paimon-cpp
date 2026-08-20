@@ -24,13 +24,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "paimon/core/utils/batch_writer.h"
 #include "paimon/realtime/realtime_context.h"
 #include "paimon/realtime/realtime_store.h"
-
-struct ArrowSchema;
 
 namespace arrow {
 class Schema;
@@ -40,20 +37,18 @@ namespace paimon {
 
 class MemoryPool;
 class MergeTreeWriter;
-class RealtimeContext;
 class RealtimeContextImpl;
+struct RealtimeStoreState;
 
 /// Primary-key real-time writer backed by an in-memory mutation indexer.
 class RealtimePrimaryKeyWriter final : public BatchWriter {
  public:
     static Result<std::shared_ptr<RealtimePrimaryKeyWriter>> Create(
         const std::map<std::string, std::string>& partition, int32_t bucket,
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::vector<std::string>& trimmed_primary_keys,
-        const std::shared_ptr<RealtimeContext>& realtime_context,
+        const std::shared_ptr<arrow::Schema>& write_schema,
+        const std::shared_ptr<RealtimeContextImpl>& realtime_context,
         const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool, int64_t restore_max_sequence_number);
+        const std::shared_ptr<MemoryPool>& memory_pool, const RealtimeStoreState& store_state);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<CommitIncrement> PrepareCommit(bool wait_compaction) override;

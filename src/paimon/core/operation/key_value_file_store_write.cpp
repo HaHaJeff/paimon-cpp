@@ -124,19 +124,28 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         std::shared_ptr<Levels> levels,
         Levels::Create(key_comparator_, restore_data_files, options_.GetNumLevels()));
     std::map<std::string, std::string> partition_map;
-    int64_t materialized_max_sequence_number = restore_max_seq_number;
+    int64_t initial_max_sequence_number = restore_max_seq_number;
     std::shared_ptr<CompactManager> compact_manager;
+    std::shared_ptr<RealtimeContextImpl> realtime_context_impl;
+    std::optional<RealtimeStoreState> realtime_store_state;
     if (realtime_context_) {
         std::vector<std::pair<std::string, std::string>> partition_values;
         PAIMON_ASSIGN_OR_RAISE(partition_values,
                                file_store_path_factory_->GeneratePartitionVector(partition));
         partition_map =
             std::map<std::string, std::string>(partition_values.begin(), partition_values.end());
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
-                               RealtimeContextImpl::Cast(realtime_context_));
-        materialized_max_sequence_number = realtime_context_impl->GetMaterializedMaxSequenceNumber(
-            RealtimePartitionBucket(partition_map, bucket), restore_max_seq_number);
-        if (materialized_max_sequence_number == std::numeric_limits<int64_t>::max()) {
+        PAIMON_ASSIGN_OR_RAISE(realtime_context_impl, RealtimeContextImpl::Cast(realtime_context_));
+        auto c_write_schema = std::make_unique<ArrowSchema>();
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, c_write_schema.get()));
+        PAIMON_ASSIGN_OR_RAISE(
+            RealtimeStoreState store_state,
+            realtime_context_impl->GetOrCreateRealtimeStore(RealtimeStoreCreateRequest{
+                std::move(c_write_schema), options_.ToMap(), pool_, partition_map, bucket,
+                PrimaryKeyRealtimeStoreCreateConfig{trimmed_primary_keys,
+                                                    restore_max_seq_number}}));
+        realtime_store_state = std::move(store_state);
+        initial_max_sequence_number = realtime_store_state->initial_max_sequence_number.value();
+        if (initial_max_sequence_number == std::numeric_limits<int64_t>::max()) {
             return Status::Invalid("PK sequence number has reached INT64_MAX");
         }
         compact_manager = std::make_shared<NoopCompactManager>();
@@ -150,18 +159,15 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     PAIMON_ASSIGN_OR_RAISE(
         std::shared_ptr<MergeTreeWriter> writer,
         MergeTreeWriter::Create(
-            materialized_max_sequence_number, trimmed_primary_keys, data_file_path_factory,
+            initial_max_sequence_number, trimmed_primary_keys, data_file_path_factory,
             key_comparator_, user_defined_seq_comparator_, merge_function_wrapper_,
             table_schema_->Id(), schema_, options_, compact_manager,
             realtime_context_ ? nullptr : io_manager_, enable_multi_thread_spill_, pool_));
     if (!realtime_context_) {
         return std::shared_ptr<BatchWriter>(std::move(writer));
     }
-    auto c_write_schema = std::make_unique<ArrowSchema>();
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, c_write_schema.get()));
-    return RealtimePrimaryKeyWriter::Create(
-        partition_map, bucket, std::move(c_write_schema), trimmed_primary_keys, realtime_context_,
-        writer, options_.ToMap(), pool_, materialized_max_sequence_number);
+    return RealtimePrimaryKeyWriter::Create(partition_map, bucket, schema_, realtime_context_impl,
+                                            writer, pool_, realtime_store_state.value());
 }
 
 Status KeyValueFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {

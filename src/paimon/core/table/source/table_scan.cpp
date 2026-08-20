@@ -41,7 +41,6 @@
 #include "paimon/core/operation/data_evolution_file_store_scan.h"
 #include "paimon/core/operation/file_store_scan.h"
 #include "paimon/core/operation/key_value_file_store_scan.h"
-#include "paimon/core/realtime/primary_key_realtime_options.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/schema_validation.h"
@@ -64,6 +63,7 @@
 #include "paimon/core/utils/field_mapping.h"
 #include "paimon/core/utils/file_store_path_factory.h"
 #include "paimon/core/utils/index_file_path_factories.h"
+#include "paimon/core/utils/primary_key_table_utils.h"
 #include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/format/file_format.h"
 #include "paimon/realtime/realtime_context.h"
@@ -230,7 +230,7 @@ Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& 
         return Status::Invalid("real-time union read does not support data evolution");
     }
     if (!table_schema.PrimaryKeys().empty()) {
-        PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options));
+        PAIMON_RETURN_NOT_OK(PrimaryKeyTableUtils::ValidateRealtimeOptions(core_options));
     }
     if (context.IsStreamingMode()) {
         return Status::Invalid("real-time union read currently supports batch scans only");

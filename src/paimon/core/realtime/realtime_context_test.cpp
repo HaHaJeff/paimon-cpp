@@ -129,6 +129,15 @@ Result<RealtimeStoreState> GetOrCreateAppendStore(
                                    AppendRealtimeStoreCreateConfig{}});
 }
 
+Result<RealtimeStoreState> GetOrCreatePrimaryKeyStore(
+    const std::shared_ptr<RealtimeContextImpl>& context,
+    const std::map<std::string, std::string>& partition, int32_t bucket,
+    int64_t restore_max_sequence_number, const std::shared_ptr<MemoryPool>& memory_pool) {
+    return context->GetOrCreateRealtimeStore(RealtimeStoreCreateRequest{
+        MakeWriteSchema(), /*options=*/{}, memory_pool, partition, bucket,
+        PrimaryKeyRealtimeStoreCreateConfig{{"id"}, restore_max_sequence_number}});
+}
+
 TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
@@ -138,6 +147,7 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
                          GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0,
                                                 MakeWriteSchema(), {{"k", "v"}}, pool));
     ASSERT_EQ(0, first_state.initial_offset);
+    ASSERT_FALSE(first_state.initial_max_sequence_number);
     ASSERT_OK_AND_ASSIGN(
         RealtimeStoreState first_again_state,
         GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0, MakeWriteSchema(), {}, pool));
@@ -166,6 +176,34 @@ TEST(RealtimeContextTest, TestReusesIndexerAndCapturesRegisteredViews) {
     ASSERT_EQ(2, factory->stores[0]->acquire_count);
     ASSERT_EQ(1, factory->stores[1]->acquire_count);
     ASSERT_EQ(1, factory->stores[2]->acquire_count);
+}
+
+TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeStoreState first_state,
+        GetOrCreatePrimaryKeyStore(context, partition, /*bucket=*/0,
+                                   /*restore_max_sequence_number=*/4, GetDefaultPool()));
+    ASSERT_EQ(4, first_state.initial_max_sequence_number);
+
+    const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/0);
+    context->AdvanceMaterializedMaxSequenceNumber(partition_bucket, /*max_sequence_number=*/8);
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeStoreState retained_state,
+        GetOrCreatePrimaryKeyStore(context, partition, /*bucket=*/0,
+                                   /*restore_max_sequence_number=*/6, GetDefaultPool()));
+    ASSERT_EQ(first_state.store, retained_state.store);
+    ASSERT_EQ(8, retained_state.initial_max_sequence_number);
+
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeStoreState restored_state,
+        GetOrCreatePrimaryKeyStore(context, partition, /*bucket=*/0,
+                                   /*restore_max_sequence_number=*/10, GetDefaultPool()));
+    ASSERT_EQ(first_state.store, restored_state.store);
+    ASSERT_EQ(10, restored_state.initial_max_sequence_number);
 }
 
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
