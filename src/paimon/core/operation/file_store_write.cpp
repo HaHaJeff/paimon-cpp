@@ -36,6 +36,7 @@
 #include "paimon/core/operation/key_value_file_store_write.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/postpone/postpone_bucket_file_store_write.h"
+#include "paimon/core/realtime/primary_key_realtime_store.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/table_schema.h"
@@ -194,7 +195,7 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            PAIMON_RETURN_NOT_OK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options));
+            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(options));
             if (ignore_previous_files) {
                 return Status::NotImplemented(
                     "PK realtime v1 requires restore from the latest snapshot");
