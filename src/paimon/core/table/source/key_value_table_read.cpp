@@ -65,6 +65,10 @@ class QueryBatchKeyValueReader final : public KeyValueRecordReader {
           value_schema_(value_schema),
           pool_(pool) {}
 
+    ~QueryBatchKeyValueReader() override {
+        Close();
+    }
+
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override;
     std::shared_ptr<Metrics> GetReaderMetrics() const override;
     void Close() override;
@@ -161,7 +165,10 @@ void QueryBatchKeyValueReader::Close() {
     row_kinds_.reset();
     key_context_.reset();
     value_context_.reset();
-    reader_->Close();
+    if (reader_) {
+        reader_->Close();
+        reader_.reset();
+    }
 }
 
 Result<std::vector<AdditionalKeyValueReader>> CreateMemoryReaders(
