@@ -24,6 +24,7 @@
 
 #include "arrow/type.h"
 #include "paimon/result.h"
+#include "paimon/status.h"
 
 namespace arrow {
 class Schema;
@@ -57,6 +58,8 @@ class PrimaryKeyTableUtils {
 
     static Result<std::unique_ptr<FieldsComparator>> CreateSequenceFieldsComparator(
         const std::vector<DataField>& value_fields, const CoreOptions& options);
+
+    static Status ValidateRealtimeOptions(const CoreOptions& options);
 };
 
 }  // namespace paimon

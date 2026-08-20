@@ -44,44 +44,13 @@ namespace paimon {
 
 Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Create(
     const std::map<std::string, std::string>& partition, int32_t bucket,
-    std::unique_ptr<::ArrowSchema> write_schema,
-    const std::vector<std::string>& trimmed_primary_keys,
-    const std::shared_ptr<RealtimeContext>& realtime_context,
+    const std::shared_ptr<arrow::Schema>& write_schema,
+    const std::shared_ptr<RealtimeContextImpl>& realtime_context,
     const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
-    const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool, int64_t restore_max_sequence_number) {
-    ScopeGuard schema_guard([schema = write_schema.get()]() {
-        if (schema && schema->release) {
-            ArrowSchemaRelease(schema);
-        }
-    });
-    if (!realtime_context) {
-        return Status::Invalid("PK real-time context is null");
-    }
-    if (!merge_tree_writer) {
-        return Status::Invalid("PK real-time merge-tree writer is null");
-    }
-    if (!write_schema || !write_schema->release) {
-        return Status::Invalid("PK real-time write schema is null");
-    }
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> imported_schema,
-                                      arrow::ImportSchema(write_schema.get()));
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*imported_schema, write_schema.get()));
-    RealtimeStoreCreateRequest request{
-        std::move(write_schema),
-        options,
-        memory_pool,
-        partition,
-        bucket,
-        PrimaryKeyRealtimeStoreCreateConfig{trimmed_primary_keys, restore_max_sequence_number}};
-    schema_guard.Release();
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
-                           RealtimeContextImpl::Cast(realtime_context));
-    PAIMON_ASSIGN_OR_RAISE(RealtimeStoreState store_state,
-                           realtime_context_impl->GetOrCreateRealtimeStore(std::move(request)));
+    const std::shared_ptr<MemoryPool>& memory_pool, const RealtimeStoreState& store_state) {
     return std::shared_ptr<RealtimePrimaryKeyWriter>(
-        new RealtimePrimaryKeyWriter(store_state.store, merge_tree_writer, realtime_context_impl,
-                                     RealtimePartitionBucket(partition, bucket), imported_schema,
+        new RealtimePrimaryKeyWriter(store_state.store, merge_tree_writer, realtime_context,
+                                     RealtimePartitionBucket(partition, bucket), write_schema,
                                      store_state.initial_offset, memory_pool));
 }
 

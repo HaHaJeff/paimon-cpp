@@ -22,7 +22,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "arrow/type.h"
 #include "gtest/gtest.h"
@@ -110,6 +112,30 @@ TEST(PrimaryKeyTableUtilsTest, TestCreateFirstRowMergeFunctionWithIgnoreDelete) 
                        /*value=*/BinaryRowGenerator::GenerateRowPtr({100}, pool.get()));
     ASSERT_NOK_WITH_MSG(merge_function->Add(std::move(delete_kv)),
                         "First row merge engine can not accept DELETE/UPDATE_BEFORE records");
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestSupportedRealtimeOptions) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
+    ASSERT_OK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options));
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestUnsupportedRealtimeOptions) {
+    const std::string sequence_group =
+        std::string(Options::FIELDS_PREFIX) + ".value." + Options::SEQUENCE_GROUP;
+    const std::vector<std::map<std::string, std::string>> unsupported_options = {
+        {{Options::BUCKET, "0"}},
+        {{Options::BUCKET, "1"}, {Options::MERGE_ENGINE, "partial-update"}},
+        {{Options::BUCKET, "1"}, {Options::DATA_EVOLUTION_ENABLED, "true"}},
+        {{Options::BUCKET, "1"}, {sequence_group, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
+        {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
+        {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
+    };
+    for (const std::map<std::string, std::string>& option_map : unsupported_options) {
+        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+        ASSERT_NOK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options));
+    }
 }
 
 }  // namespace paimon::test

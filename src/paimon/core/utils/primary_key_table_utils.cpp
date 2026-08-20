@@ -96,4 +96,36 @@ Result<std::unique_ptr<FieldsComparator>> PrimaryKeyTableUtils::CreateSequenceFi
                                     options.SequenceFieldSortOrderIsAscending());
 }
 
+Status PrimaryKeyTableUtils::ValidateRealtimeOptions(const CoreOptions& options) {
+    if (options.GetBucket() <= 0) {
+        return Status::NotImplemented("PK realtime v1 requires fixed buckets");
+    }
+    if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
+        return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
+    }
+    if (options.DataEvolutionEnabled()) {
+        return Status::NotImplemented("PK realtime v1 does not support data evolution");
+    }
+    if (!options.GetFieldsSequenceGroups().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support sequence groups");
+    }
+    if (options.IgnoreDelete() || options.PartialUpdateRemoveRecordOnDelete() ||
+        options.AggregationRemoveRecordOnDelete() ||
+        !options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
+        return Status::NotImplemented("PK realtime v1 requires default delete behavior");
+    }
+    if (!options.GetSequenceField().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support sequence.field");
+    }
+    if (!options.SequenceFieldSortOrderIsAscending()) {
+        return Status::NotImplemented(
+            "PK realtime v1 supports only ascending sequence.field.sort-order");
+    }
+    if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
+        options.GetChangelogProducer() != ChangelogProducer::NONE) {
+        return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
+    }
+    return Status::OK();
+}
+
 }  // namespace paimon
