@@ -392,6 +392,40 @@ TEST_F(PrimaryKeyRealtimeStoreTest, TestQueryProjection) {
                         "query field is missing from write schema: unknown");
 }
 
+TEST_F(PrimaryKeyRealtimeStoreTest, TestQueryProjectionMatchesRenamedFieldsById) {
+    const std::shared_ptr<arrow::Field> id =
+        DataField::ConvertDataFieldToArrowField(DataField(0, arrow::field("id", arrow::int64())));
+    const std::shared_ptr<arrow::Field> value =
+        DataField::ConvertDataFieldToArrowField(DataField(1, arrow::field("value", arrow::utf8())));
+    const std::shared_ptr<arrow::Schema> write_schema = arrow::schema({id, value});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                         CreateStore(write_schema, {"id"}, /*restore_max_sequence=*/4));
+    ASSERT_OK(store->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[1, "kept"]])", {}, write_schema), OffsetRange(0, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
+
+    const std::shared_ptr<arrow::Field> renamed_value = DataField::ConvertDataFieldToArrowField(
+        DataField(1, arrow::field("renamed", arrow::utf8())));
+    const std::shared_ptr<arrow::Field> renamed_id = DataField::ConvertDataFieldToArrowField(
+        DataField(0, arrow::field("renamed_id", arrow::int64())));
+    const std::shared_ptr<arrow::Field> replaced =
+        DataField::ConvertDataFieldToArrowField(DataField(2, arrow::field("value", arrow::utf8())));
+    const std::shared_ptr<arrow::Field> replaced_id =
+        DataField::ConvertDataFieldToArrowField(DataField(4, arrow::field("id", arrow::int64())));
+    const std::shared_ptr<arrow::Field> added =
+        DataField::ConvertDataFieldToArrowField(DataField(3, arrow::field("added", arrow::utf8())));
+    std::unique_ptr<ArrowSchema> read_schema =
+        MakeReadSchema({renamed_value, renamed_id, replaced, replaced_id, added});
+    RealtimeQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                                 /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         store->CreateQueryReaders(view, /*offset_begin=*/0, context));
+    const std::shared_ptr<arrow::DataType> result_type =
+        arrow::struct_({DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind()),
+                        renamed_value, renamed_id, replaced, replaced_id, added});
+    AssertReaderOutput(readers, result_type, R"([[0, "kept", 1, null, null, null]])");
+}
+
 TEST_F(PrimaryKeyRealtimeStoreTest, TestNestedProjection) {
     const std::shared_ptr<arrow::Field> id =
         DataField::ConvertDataFieldToArrowField(DataField(0, arrow::field("id", arrow::int64())));
@@ -433,7 +467,10 @@ TEST_F(PrimaryKeyRealtimeStoreTest, TestCompositeKeyClipping) {
                                      {}, composite_schema),
                            OffsetRange(20, 24)}));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema(FullQueryFields(composite_schema));
+    const std::shared_ptr<arrow::Field> sequence =
+        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber());
+    std::unique_ptr<ArrowSchema> read_schema =
+        MakeReadSchema({sequence, composite_schema->field(0), composite_schema->field(2)});
     RealtimeQueryContext context{read_schema.get(), /*predicate=*/nullptr,
                                  /*enable_predicate_pushdown=*/false};
     ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
@@ -445,13 +482,12 @@ TEST_F(PrimaryKeyRealtimeStoreTest, TestCompositeKeyClipping) {
     ASSERT_EQ("c", range->GetMinKey()->GetString(1).ToString());
     ASSERT_EQ(2, range->GetMaxKey()->GetLong(0));
     ASSERT_EQ("b", range->GetMaxKey()->GetString(1).ToString());
-    std::shared_ptr<arrow::DataType> query_type = arrow::struct_(
-        {DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind()),
-         DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber()),
-         composite_schema->field(0), composite_schema->field(1), composite_schema->field(2)});
+    std::shared_ptr<arrow::DataType> query_type =
+        arrow::struct_({DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind()),
+                        sequence, composite_schema->field(0), composite_schema->field(2)});
     AssertReaderOutput(readers, query_type,
-                       R"([[0, 7, 1, "c", "one-c"], [0, 8, 2, "a", "two-a"],
-                            [0, 6, 2, "b", "two-b"]])");
+                       R"([[0, 7, 1, "one-c"], [0, 8, 2, "two-a"],
+                            [0, 6, 2, "two-b"]])");
 }
 
 }  // namespace paimon::test
