@@ -98,6 +98,30 @@ uint64_t GetArrayMemoryUsage(const std::shared_ptr<arrow::ArrayData>& data) {
     return result;
 }
 
+int32_t FindPkQueryFieldIndex(const std::shared_ptr<arrow::Schema>& write_schema,
+                              const std::shared_ptr<arrow::Field>& read_field) {
+    Result<int32_t> read_id = NestedProjectionUtils::GetPaimonFieldId(read_field);
+    if (read_id.ok()) {
+        Result<std::shared_ptr<arrow::Field>> write_field =
+            NestedProjectionUtils::FindFieldByPaimonId(arrow::struct_(write_schema->fields()),
+                                                       read_id.value());
+        if (write_field.ok()) {
+            return write_schema->GetFieldIndex(write_field.value()->name());
+        }
+    }
+
+    const int32_t name_index = write_schema->GetFieldIndex(read_field->name());
+    if (name_index < 0) {
+        return -1;
+    }
+    Result<int32_t> write_id =
+        NestedProjectionUtils::GetPaimonFieldId(write_schema->field(name_index));
+    if (read_id.ok() && write_id.ok() && read_id.value() != write_id.value()) {
+        return -1;
+    }
+    return name_index;
+}
+
 struct StoredBatch {
     std::shared_ptr<arrow::StructArray> data;
     std::vector<RecordBatch::RowKind> row_kinds;
@@ -423,17 +447,23 @@ class PrimaryKeyRealtimeStore::Impl {
                 projection.push_back(KeyValueProjectionConsumer::kSequenceNumberProjection);
                 continue;
             }
-            int32_t index = write_schema_->GetFieldIndex(field->name());
+            int32_t index = FindPkQueryFieldIndex(write_schema_, field);
             if (index < 0) {
                 Result<int32_t> field_id = NestedProjectionUtils::GetPaimonFieldId(field);
                 if (!field_id.ok()) {
                     return Status::Invalid(
                         "PK real-time query field is missing from write schema: ", field->name());
                 }
+                std::string internal_name =
+                    "__paimon_pk_realtime_null_" + std::to_string(field_id.value());
+                while (
+                    NestedProjectionUtils::FindFieldByName(aligned_value_fields, internal_name)) {
+                    internal_name.push_back('_');
+                }
                 index = static_cast<int32_t>(aligned_value_fields.size());
-                aligned_value_fields.push_back(field);
+                aligned_value_fields.push_back(field->WithName(internal_name));
             } else {
-                aligned_value_fields[index] = field;
+                aligned_value_fields[index] = write_schema_->field(index)->WithType(field->type());
             }
             projection.push_back(index);
         }
