@@ -423,12 +423,18 @@ class PrimaryKeyRealtimeStore::Impl {
                 projection.push_back(KeyValueProjectionConsumer::kSequenceNumberProjection);
                 continue;
             }
-            const int32_t index = write_schema_->GetFieldIndex(field->name());
+            int32_t index = write_schema_->GetFieldIndex(field->name());
             if (index < 0) {
-                return Status::Invalid("PK real-time query field is missing from write schema: ",
-                                       field->name());
+                Result<int32_t> field_id = NestedProjectionUtils::GetPaimonFieldId(field);
+                if (!field_id.ok()) {
+                    return Status::Invalid(
+                        "PK real-time query field is missing from write schema: ", field->name());
+                }
+                index = static_cast<int32_t>(aligned_value_fields.size());
+                aligned_value_fields.push_back(field);
+            } else {
+                aligned_value_fields[index] = field;
             }
-            aligned_value_fields[index] = field;
             projection.push_back(index);
         }
         const std::shared_ptr<arrow::DataType> aligned_value_type =
@@ -446,8 +452,16 @@ class PrimaryKeyRealtimeStore::Impl {
                 const int64_t offset = std::max<int64_t>(0, lower - batch->offset_range.begin);
                 const int64_t length = batch->data->length() - offset;
                 std::shared_ptr<arrow::Array> sliced = batch->data->Slice(offset, length);
+                PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> aligned,
+                                       NestedProjectionUtils::AlignArrayToReadType(
+                                           sliced, aligned_value_type, arrow_pool_.get()));
+                if (!aligned || aligned->type_id() != arrow::Type::STRUCT) {
+                    return Status::Invalid(
+                        "PK real-time query projection did not produce a "
+                        "StructArray");
+                }
                 std::shared_ptr<arrow::StructArray> selected =
-                    checked_pointer_cast<arrow::StructArray>(sliced);
+                    checked_pointer_cast<arrow::StructArray>(aligned);
                 using KeyRange =
                     std::pair<std::shared_ptr<InternalRow>, std::shared_ptr<InternalRow>>;
                 PAIMON_ASSIGN_OR_RAISE(KeyRange key_range, GetKeyRange(selected));
@@ -457,10 +471,6 @@ class PrimaryKeyRealtimeStore::Impl {
                 if (!max_key || key_comparator_->CompareTo(*key_range.second, *max_key) > 0) {
                     max_key = key_range.second;
                 }
-                PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> aligned,
-                                       NestedProjectionUtils::AlignArrayToReadType(
-                                           selected, aligned_value_type, arrow_pool_.get()));
-                selected = checked_pointer_cast<arrow::StructArray>(aligned);
                 std::vector<RecordBatch::RowKind> selected_kinds;
                 if (!batch->row_kinds.empty()) {
                     selected_kinds.assign(batch->row_kinds.begin() + offset,
