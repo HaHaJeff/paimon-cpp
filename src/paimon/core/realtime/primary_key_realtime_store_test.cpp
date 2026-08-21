@@ -392,6 +392,34 @@ TEST_F(PrimaryKeyRealtimeStoreTest, TestQueryProjection) {
                         "query field is missing from write schema: unknown");
 }
 
+TEST_F(PrimaryKeyRealtimeStoreTest, TestNestedProjection) {
+    const std::shared_ptr<arrow::Field> id =
+        DataField::ConvertDataFieldToArrowField(DataField(0, arrow::field("id", arrow::int64())));
+    const std::shared_ptr<arrow::Field> a =
+        DataField::ConvertDataFieldToArrowField(DataField(10, arrow::field("a", arrow::int64())));
+    const std::shared_ptr<arrow::Field> b =
+        DataField::ConvertDataFieldToArrowField(DataField(11, arrow::field("b", arrow::int64())));
+    const std::shared_ptr<arrow::Field> payload = DataField::ConvertDataFieldToArrowField(
+        DataField(1, arrow::field("payload", arrow::struct_({a, b}))));
+    const std::shared_ptr<arrow::Schema> nested_schema = arrow::schema({id, payload});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                         CreateStore(nested_schema, {"id"}, /*restore_max_sequence=*/4));
+    ASSERT_OK(store->Write(RealtimeWriteBatch{
+        MakeBatch(R"([[2, [200, 2000]], [1, [100, null]], [3, [300, 3000]]])", {}, nested_schema),
+        OffsetRange(0, 3)}));
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
+    const std::shared_ptr<arrow::Field> projected_payload = payload->WithType(arrow::struct_({b}));
+    std::unique_ptr<ArrowSchema> read_schema = MakeReadSchema({projected_payload});
+    RealtimeQueryContext context{read_schema.get(), /*predicate=*/nullptr,
+                                 /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         store->CreateQueryReaders(view, /*offset_begin=*/0, context));
+    const std::shared_ptr<arrow::DataType> result_type = arrow::struct_(
+        {DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind()), projected_payload});
+    AssertReaderOutput(readers, result_type, R"([[0, [null]], [0, [2000]], [0, [3000]]])");
+}
+
 TEST_F(PrimaryKeyRealtimeStoreTest, TestCompositeKeyClipping) {
     std::shared_ptr<arrow::Schema> composite_schema =
         arrow::schema({arrow::field("id", arrow::int64()), arrow::field("region", arrow::utf8()),

@@ -1458,6 +1458,87 @@ TEST_F(RealtimeWriteInteTest, TestPkMergeDiskSealedAndActive) {
     ASSERT_OK(writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkNestedProjectionAcrossDiskAndMemory) {
+    const std::shared_ptr<arrow::Field> projected_b = arrow::field("b", arrow::int64());
+    fields_ = {
+        arrow::field("id", arrow::int64()),
+        arrow::field("payload", arrow::struct_({arrow::field("a", arrow::int64()), projected_b})),
+        arrow::field("pt", arrow::utf8()),
+    };
+    schema_ = arrow::schema(fields_);
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    auto make_batch = [&](const std::string& json) -> Result<std::unique_ptr<RecordBatch>> {
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            std::shared_ptr<arrow::Array> array,
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_), json));
+        ArrowArray c_array;
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*array, &c_array));
+        RecordBatchBuilder builder(&c_array);
+        return builder.SetBucket(0).Finish();
+    };
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> disk_batch,
+                         make_batch(R"([[1, [101, 1001], "p0"], [2, [102, 1002], "p0"]])"));
+    ASSERT_OK(writer->Write(std::move(disk_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> disk_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_OK_AND_ASSIGN(int64_t snapshot_id, Commit(disk_progress, /*commit_identifier=*/0));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(snapshot_id));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> sealed_batch,
+                         make_batch(R"([[1, [201, 2001], "p0"], [3, [203, 2003], "p0"]])"));
+    ASSERT_OK(writer->Write(std::move(sealed_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> sealed_progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_EQ(1, sealed_progress.size());
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> active_batch,
+                         make_batch(R"([[1, [301, 3001], "p0"], [4, [304, null], "p0"]])"));
+    ASSERT_OK(writer->Write(std::move(active_batch)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+
+    auto projected_schema = arrow::schema({
+        arrow::field("payload", arrow::struct_({projected_b})),
+        arrow::field("id", arrow::int64()),
+    });
+    auto c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*projected_schema, c_schema.get()).ok());
+    ReadContextBuilder read_builder(table_path_);
+    read_builder.SetOptions(options_)
+        .SetReadSchema(std::move(c_schema))
+        .WithRealtimeContext(realtime_context)
+        .WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
+                         TableRead::Create(std::move(read_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> reader,
+                         table_read->CreateReader(plan->Splits()));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                         ReadResultCollector::CollectResult(reader.get()));
+    const std::shared_ptr<arrow::DataType> result_type = arrow::struct_({
+        arrow::field("_VALUE_KIND", arrow::int8()),
+        arrow::field("payload", arrow::struct_({projected_b})),
+        arrow::field("id", arrow::int64()),
+    });
+    const std::shared_ptr<arrow::Array> expected =
+        arrow::ipc::internal::json::ArrayFromJSON(result_type, R"([
+            [0, [3001], 1],
+            [0, [1002], 2],
+            [0, [2003], 3],
+            [0, [null], 4]
+        ])")
+            .ValueOrDie();
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(*actual))
+        << actual->ToString();
+    reader->Close();
+    ASSERT_OK(writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkCompositeMerge) {
     CreatePkTable(/*partition_keys=*/{}, /*primary_keys=*/{"id", "payload"});
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,

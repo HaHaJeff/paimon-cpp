@@ -43,6 +43,7 @@
 #include "paimon/core/io/merged_key_value_record_reader.h"
 #include "paimon/core/key_value.h"
 #include "paimon/core/mergetree/compact/sort_merge_reader_with_loser_tree.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"
 
 namespace paimon {
@@ -411,6 +412,7 @@ class PrimaryKeyRealtimeStore::Impl {
                                           arrow::ImportSchema(context.read_schema));
         arrow::FieldVector output_fields = {
             DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())};
+        arrow::FieldVector aligned_value_fields = write_schema_->fields();
         std::vector<int32_t> projection = {KeyValueProjectionConsumer::kValueKindProjection};
         for (const std::shared_ptr<arrow::Field>& field : requested->fields()) {
             if (field->name() == SpecialFields::ValueKind().Name()) {
@@ -426,8 +428,11 @@ class PrimaryKeyRealtimeStore::Impl {
                 return Status::Invalid("PK real-time query field is missing from write schema: ",
                                        field->name());
             }
+            aligned_value_fields[index] = field;
             projection.push_back(index);
         }
+        const std::shared_ptr<arrow::DataType> aligned_value_type =
+            arrow::struct_(aligned_value_fields);
 
         std::vector<std::unique_ptr<BatchReader>> result;
         for (const BatchGroup& group : typed->Groups()) {
@@ -452,6 +457,10 @@ class PrimaryKeyRealtimeStore::Impl {
                 if (!max_key || key_comparator_->CompareTo(*key_range.second, *max_key) > 0) {
                     max_key = key_range.second;
                 }
+                PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> aligned,
+                                       NestedProjectionUtils::AlignArrayToReadType(
+                                           selected, aligned_value_type, arrow_pool_.get()));
+                selected = checked_pointer_cast<arrow::StructArray>(aligned);
                 std::vector<RecordBatch::RowKind> selected_kinds;
                 if (!batch->row_kinds.empty()) {
                     selected_kinds.assign(batch->row_kinds.begin() + offset,
