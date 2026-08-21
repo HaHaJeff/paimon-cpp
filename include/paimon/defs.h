@@ -50,6 +50,8 @@ enum class FieldType {
     STRUCT = 15,
     BLOB = 16,
     VARIANT = 17,
+    /// Fixed-length dense vector represented by Arrow FixedSizeList.
+    VECTOR = 18,
     UNKNOWN = 128,
 };
 
@@ -402,6 +404,10 @@ struct PAIMON_EXPORT Options {
 
     /// "file-index.read.enabled" - Whether enabled read file index. Default value is "true".
     static const char FILE_INDEX_READ_ENABLED[];
+
+    /// "file-index.in-manifest-threshold" - The threshold to store file index bytes in the
+    /// manifest. Default value is 500B.
+    static const char FILE_INDEX_IN_MANIFEST_THRESHOLD[];
 
     /// "data-file.external-paths" - The external paths where the data of this table will be
     /// written, multiple elements separated by commas.

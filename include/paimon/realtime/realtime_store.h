@@ -25,8 +25,10 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "arrow/c/abi.h"
 #include "paimon/reader/batch_reader.h"
 #include "paimon/realtime/offset_range.h"
 #include "paimon/record_batch.h"
@@ -39,6 +41,29 @@ namespace paimon {
 
 class MemoryPool;
 class Predicate;
+
+struct PAIMON_EXPORT AppendRealtimeStoreCreateConfig {};
+
+struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {
+    std::vector<std::string> primary_keys;
+    /// Largest sequence restored from the committed snapshot. A PK store assigns one contiguous
+    /// sequence to every mutation in `Write` order, starting at the next value, and rejects
+    /// `Write` before the assigned sequence would exceed `INT64_MAX - 1`.
+    int64_t restore_max_sequence_number;
+};
+
+using RealtimeStoreCreateConfig =
+    std::variant<AppendRealtimeStoreCreateConfig, PrimaryKeyRealtimeStoreCreateConfig>;
+
+struct PAIMON_EXPORT RealtimeStoreCreateRequest {
+    /// Complete table write schema whose ownership is transferred to the factory.
+    std::unique_ptr<::ArrowSchema> write_schema;
+    std::map<std::string, std::string> options;
+    std::shared_ptr<MemoryPool> memory_pool;
+    std::map<std::string, std::string> partition;
+    int32_t bucket = -1;
+    RealtimeStoreCreateConfig mode_config;
+};
 
 /// A table record batch and its framework-assigned contiguous offset range.
 ///
@@ -132,8 +157,11 @@ class PAIMON_EXPORT RealtimeStore {
     ///
     /// Each output batch contains `_VALUE_KIND` first, followed by the fields requested by
     /// `context.read_schema` except a duplicate `_VALUE_KIND`. Concatenating all returned readers
-    /// must produce every matching row once. Paimon retains `view` for the lifetime of the
-    /// resulting framework reader.
+    /// must produce every matching row once. Primary-key readers additionally provide a non-null
+    /// `_SEQUENCE_NUMBER` when requested, are individually sorted by primary key, and contain at
+    /// most one mutation per key. Assigned sequences remain stable across views and queries;
+    /// readers need not be globally sorted with one another. Paimon retains `view` for the lifetime
+    /// of the resulting framework reader.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
         const RealtimeQueryContext& context) = 0;
@@ -156,15 +184,9 @@ class PAIMON_EXPORT RealtimeStoreFactory {
  public:
     virtual ~RealtimeStoreFactory() = default;
 
-    /// Creates a store configured with the supplied schema, options, and memory pool.
-    /// @param write_schema Complete table write schema whose ownership is transferred to the
-    /// factory. The factory may consume it or retain it in the created store.
-    /// @param options Effective table options available to the store.
-    /// @param memory_pool Memory pool provided by the write context.
-    virtual Result<std::shared_ptr<RealtimeStore>> Create(
-        std::unique_ptr<::ArrowSchema> write_schema,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool) = 0;
+    /// Creates a store for the requested table mode and partition-bucket.
+    /// The factory consumes `request`, including ownership of `request.write_schema`.
+    virtual Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) = 0;
 };
 
 }  // namespace paimon

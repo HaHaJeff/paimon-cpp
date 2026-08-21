@@ -78,27 +78,45 @@ Status RealtimeContextImpl::Start() {
 }
 
 Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
-    const std::map<std::string, std::string>& partition, int32_t bucket,
-    std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
+    RealtimeStoreCreateRequest&& request) {
     std::lock_guard<std::mutex> progress_lock(progress_mutex_);
     std::lock_guard<std::mutex> registry_lock(mutex_);
-    const RealtimePartitionBucket key(partition, bucket);
+    const RealtimePartitionBucket key(request.partition, request.bucket);
+    auto iter = stores_.find(key);
+    std::optional<int64_t> initial_max_sequence_number;
+    PrimaryKeyRealtimeStoreCreateConfig* primary_key_config =
+        std::get_if<PrimaryKeyRealtimeStoreCreateConfig>(&request.mode_config);
+    if (primary_key_config) {
+        auto [sequence_iter, inserted] = materialized_max_sequence_numbers_.emplace(
+            key, primary_key_config->restore_max_sequence_number);
+        if (!inserted && primary_key_config->restore_max_sequence_number > sequence_iter->second) {
+            if (iter != stores_.end()) {
+                if (request.write_schema) {
+                    ArrowSchemaRelease(request.write_schema.get());
+                }
+                return Status::Invalid(
+                    "restore max sequence number exceeds the materialized watermark of an "
+                    "existing PK real-time store");
+            }
+            sequence_iter->second = primary_key_config->restore_max_sequence_number;
+        }
+        initial_max_sequence_number = sequence_iter->second;
+        primary_key_config->restore_max_sequence_number = sequence_iter->second;
+    }
     int64_t initial_offset = 0;
     auto offset_iter = committed_offsets_.find(key);
     if (offset_iter != committed_offsets_.end()) {
         if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
-            if (write_schema) {
-                ArrowSchemaRelease(write_schema.get());
+            if (request.write_schema) {
+                ArrowSchemaRelease(request.write_schema.get());
             }
             return Status::Invalid("real-time offset has reached INT64_MAX");
         }
         initial_offset = offset_iter->second;
     }
-    auto iter = stores_.find(key);
     if (iter != stores_.end()) {
-        if (write_schema) {
-            ArrowSchemaRelease(write_schema.get());
+        if (request.write_schema) {
+            ArrowSchemaRelease(request.write_schema.get());
         }
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeReadView> read_view,
                                iter->second->AcquireReadView());
@@ -116,16 +134,25 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
                 initial_offset = memory_range->end;
             }
         }
-        return RealtimeStoreState{iter->second, initial_offset};
+        return RealtimeStoreState{iter->second, initial_offset, initial_max_sequence_number};
     }
-    Result<std::shared_ptr<RealtimeStore>> store_result =
-        factory_->Create(std::move(write_schema), options, memory_pool);
+    Result<std::shared_ptr<RealtimeStore>> store_result = factory_->Create(std::move(request));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store, std::move(store_result));
     stores_.emplace(key, store);
     if (offset_iter != committed_offsets_.end()) {
         reclaimed_offsets_.emplace(key, offset_iter->second);
     }
-    return RealtimeStoreState{std::move(store), initial_offset};
+    return RealtimeStoreState{std::move(store), initial_offset, initial_max_sequence_number};
+}
+
+void RealtimeContextImpl::AdvanceMaterializedMaxSequenceNumber(
+    const RealtimePartitionBucket& partition_bucket, int64_t max_sequence_number) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto [iter, inserted] =
+        materialized_max_sequence_numbers_.emplace(partition_bucket, max_sequence_number);
+    if (!inserted && max_sequence_number > iter->second) {
+        iter->second = max_sequence_number;
+    }
 }
 
 Result<std::vector<RealtimePartitionBucketView>> RealtimeContextImpl::AcquireReadViews() {

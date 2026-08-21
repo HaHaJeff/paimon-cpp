@@ -35,6 +35,7 @@ class Executor;
 class FileStorePathFactory;
 class InternalReadContext;
 class MemoryPool;
+class RealtimeSplit;
 
 class KeyValueTableRead : public TableRead {
  public:
@@ -44,6 +45,9 @@ class KeyValueTableRead : public TableRead {
         const std::shared_ptr<MemoryPool>& memory_pool, const std::shared_ptr<Executor>& executor);
 
     Result<std::unique_ptr<BatchReader>> CreateReader(const std::shared_ptr<Split>& split) override;
+
+    Result<std::unique_ptr<BatchReader>> CreateReader(
+        const std::vector<std::shared_ptr<Split>>& splits) override;
 
     Result<std::unique_ptr<CountReader>> CreateCountReader(
         const std::vector<std::shared_ptr<Split>>& splits) override;
@@ -56,6 +60,9 @@ class KeyValueTableRead : public TableRead {
                       const std::shared_ptr<InternalReadContext>& context,
                       const std::shared_ptr<MemoryPool>& memory_pool,
                       const std::shared_ptr<Executor>& executor);
+
+    Result<std::unique_ptr<BatchReader>> CreateRealtimeReader(
+        const std::shared_ptr<RealtimeSplit>& realtime_split, bool release_ticket);
 
     std::vector<std::unique_ptr<SplitRead>> split_reads_;
     std::shared_ptr<FileStorePathFactory> path_factory_;

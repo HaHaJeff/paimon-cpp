@@ -19,10 +19,11 @@
 #include "paimon/core/utils/primary_key_table_utils.h"
 
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "arrow/type.h"
 #include "gtest/gtest.h"

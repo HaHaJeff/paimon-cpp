@@ -36,6 +36,7 @@
 #include "paimon/core/operation/key_value_file_store_write.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/postpone/postpone_bucket_file_store_write.h"
+#include "paimon/core/realtime/primary_key_realtime_store.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/table_schema.h"
@@ -194,7 +195,26 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            return Status::Invalid("real-time write currently supports append tables only");
+            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(options));
+            if (ignore_previous_files) {
+                return Status::NotImplemented(
+                    "PK realtime v1 requires restore from the latest snapshot");
+            }
+            if (!ctx->GetWriteSchema().empty()) {
+                return Status::NotImplemented(
+                    "PK realtime v1 does not support a custom write schema");
+            }
+            PAIMON_ASSIGN_OR_RAISE(std::optional<Snapshot> latest_snapshot,
+                                   snapshot_manager->LatestSnapshot());
+            if (latest_snapshot) {
+                PAIMON_ASSIGN_OR_RAISE(RealtimeOffsetMap realtime_committed_offsets,
+                                       RealtimeCommitProperties::ReadOffsets(
+                                           latest_snapshot, options.GetFileSystem()));
+                PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
+                                       RealtimeContextImpl::Cast(ctx->GetRealtimeContext()));
+                PAIMON_RETURN_NOT_OK(realtime_context_impl->AdvanceCommittedProgress(
+                    latest_snapshot->Id(), realtime_committed_offsets));
+            }
         }
         if (options.GetBucket() == BucketModeDefine::POSTPONE_BUCKET) {
             return PostponeBucketFileStoreWrite::Create(
@@ -250,7 +270,8 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
             ctx->GetRootPath(), schema, arrow_schema, partition_schema, dv_maintainer_factory,
             io_manager, key_comparator, sequence_fields_comparator, merge_function_wrapper, options,
             ignore_previous_files, ctx->IsStreamingMode(), ctx->IgnoreNumBucketCheck(),
-            ctx->EnableMultiThreadSpill(), ctx->GetExecutor(), ctx->GetMemoryPool());
+            ctx->EnableMultiThreadSpill(), ctx->GetRealtimeContext(), ctx->GetExecutor(),
+            ctx->GetMemoryPool());
     }
 }
 
