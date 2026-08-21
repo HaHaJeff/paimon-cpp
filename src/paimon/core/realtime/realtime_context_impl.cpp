@@ -82,6 +82,7 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     std::lock_guard<std::mutex> progress_lock(progress_mutex_);
     std::lock_guard<std::mutex> registry_lock(mutex_);
     const RealtimePartitionBucket key(request.partition, request.bucket);
+    auto iter = stores_.find(key);
     std::optional<int64_t> initial_max_sequence_number;
     PrimaryKeyRealtimeStoreCreateConfig* primary_key_config =
         std::get_if<PrimaryKeyRealtimeStoreCreateConfig>(&request.mode_config);
@@ -89,6 +90,14 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
         auto [sequence_iter, inserted] = materialized_max_sequence_numbers_.emplace(
             key, primary_key_config->restore_max_sequence_number);
         if (!inserted && primary_key_config->restore_max_sequence_number > sequence_iter->second) {
+            if (iter != stores_.end()) {
+                if (request.write_schema) {
+                    ArrowSchemaRelease(request.write_schema.get());
+                }
+                return Status::Invalid(
+                    "restore max sequence number exceeds the materialized watermark of an "
+                    "existing PK real-time store");
+            }
             sequence_iter->second = primary_key_config->restore_max_sequence_number;
         }
         initial_max_sequence_number = sequence_iter->second;
@@ -105,7 +114,6 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
         }
         initial_offset = offset_iter->second;
     }
-    auto iter = stores_.find(key);
     if (iter != stores_.end()) {
         if (request.write_schema) {
             ArrowSchemaRelease(request.write_schema.get());

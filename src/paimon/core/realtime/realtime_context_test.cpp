@@ -198,12 +198,20 @@ TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
     ASSERT_EQ(first_state.store, retained_state.store);
     ASSERT_EQ(8, retained_state.initial_max_sequence_number);
 
-    ASSERT_OK_AND_ASSIGN(
-        RealtimeStoreState restored_state,
+    ASSERT_NOK_WITH_MSG(
         GetOrCreatePrimaryKeyStore(context, partition, /*bucket=*/0,
+                                   /*restore_max_sequence_number=*/10, GetDefaultPool()),
+        "restore max sequence number exceeds the materialized watermark of an "
+        "existing PK real-time store");
+
+    const RealtimePartitionBucket new_partition_bucket(partition, /*bucket=*/1);
+    context->AdvanceMaterializedMaxSequenceNumber(new_partition_bucket,
+                                                  /*max_sequence_number=*/8);
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeStoreState new_state,
+        GetOrCreatePrimaryKeyStore(context, partition, /*bucket=*/1,
                                    /*restore_max_sequence_number=*/10, GetDefaultPool()));
-    ASSERT_EQ(first_state.store, restored_state.store);
-    ASSERT_EQ(10, restored_state.initial_max_sequence_number);
+    ASSERT_EQ(10, new_state.initial_max_sequence_number);
 }
 
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
