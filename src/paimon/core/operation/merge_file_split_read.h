@@ -55,7 +55,6 @@ class FieldsComparator;
 class FileBatchReader;
 class FileStorePathFactory;
 class InternalReadContext;
-class InternalRow;
 class MemoryPool;
 class SchemaManager;
 class SortedRun;
@@ -65,12 +64,6 @@ struct DeletionFile;
 struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
-
-struct AdditionalKeyValueReader {
-    std::unique_ptr<KeyValueRecordReader> reader;
-    std::shared_ptr<InternalRow> min_key;
-    std::shared_ptr<InternalRow> max_key;
-};
 
 /// If the class name below is enclosed in parentheses, it might be present in the read path;
 /// otherwise, it must be present in the read path.
@@ -129,7 +122,7 @@ class MergeFileSplitRead : public AbstractSplitRead {
 
     Result<std::unique_ptr<BatchReader>> CreateRealtimeReader(
         const std::vector<std::shared_ptr<Split>>& disk_splits,
-        std::vector<AdditionalKeyValueReader>&& additional_readers);
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers);
 
     void SetMergeFunctionWrapper(
         const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper);

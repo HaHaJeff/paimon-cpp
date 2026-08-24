@@ -55,7 +55,7 @@ struct ColumnarBatchContext;
 
 namespace {
 
-Result<std::vector<AdditionalKeyValueReader>> CreateMemoryReaders(
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
     const std::shared_ptr<RealtimeSplit>& split, const RealtimePartitionBucketView& memory,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
@@ -76,9 +76,8 @@ Result<std::vector<AdditionalKeyValueReader>> CreateMemoryReaders(
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*prepared_schema, c_schema.get()));
     ScopeGuard schema_guard([schema = c_schema.get()]() { ArrowSchemaRelease(schema); });
     RealtimeQueryContext query_context{c_schema.get(), nullptr, false};
-    PAIMON_ASSIGN_OR_RAISE(
-        std::vector<std::unique_ptr<BatchReader>> batch_readers,
-        memory.store->CreateQueryReaders(memory.read_view, 0, query_context));
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> batch_readers,
+                           memory.store->CreateQueryReaders(memory.read_view, 0, query_context));
     ScopeGuard batch_readers_guard([&batch_readers]() {
         for (const std::unique_ptr<BatchReader>& reader : batch_readers) {
             if (reader) {
@@ -86,7 +85,7 @@ Result<std::vector<AdditionalKeyValueReader>> CreateMemoryReaders(
             }
         }
     });
-    std::vector<AdditionalKeyValueReader> result;
+    std::vector<std::unique_ptr<KeyValueRecordReader>> result;
     result.reserve(batch_readers.size());
     for (std::unique_ptr<BatchReader>& reader : batch_readers) {
         if (!reader) {
@@ -98,17 +97,15 @@ Result<std::vector<AdditionalKeyValueReader>> CreateMemoryReaders(
                                                                     split->MemoryEndOffset()),
                                                         key_schema, value_schema, memory_pool));
         auto merge = std::make_unique<DeduplicateMergeFunction>(false);
-        result.push_back(AdditionalKeyValueReader{
-            std::make_unique<MergedKeyValueRecordReader>(
-                std::move(prepared_reader), key_comparator,
-                std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge))),
-            nullptr, nullptr});
+        result.push_back(std::make_unique<MergedKeyValueRecordReader>(
+            std::move(prepared_reader), key_comparator,
+            std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge))));
     }
     batch_readers_guard.Release();
     return result;
 }
 
-}
+}  // namespace
 
 KeyValueTableRead::KeyValueTableRead(std::vector<std::unique_ptr<SplitRead>>&& split_reads,
                                      const std::shared_ptr<FileStorePathFactory>& path_factory,
@@ -268,7 +265,7 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateRealtimeReader(
         auto* merge_read = dynamic_cast<MergeFileSplitRead*>(read.get());
         if (merge_read) {
             PAIMON_ASSIGN_OR_RAISE(
-                std::vector<AdditionalKeyValueReader> memory_readers,
+                std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
                 CreateMemoryReaders(realtime_split, memory, merge_read->GetKeySchema(),
                                     merge_read->GetValueSchema(), merge_read->GetKeyComparator(),
                                     context_, GetMemoryPool()));

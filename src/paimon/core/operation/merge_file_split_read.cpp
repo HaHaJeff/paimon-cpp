@@ -30,7 +30,6 @@
 #include "arrow/c/bridge.h"
 #include "arrow/type.h"
 #include "fmt/format.h"
-#include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/reader/complete_row_kind_batch_reader.h"
 #include "paimon/common/reader/concat_batch_reader.h"
 #include "paimon/common/table/special_fields.h"
@@ -79,82 +78,36 @@ struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
 
-namespace {
-
-class ConcatNonOverlappingMergeReaders final : public SortMergeReader {
- public:
-    explicit ConcatNonOverlappingMergeReaders(
-        std::vector<std::unique_ptr<SortMergeReader>>&& readers)
-        : readers_(std::move(readers)) {}
-
-    Result<std::unique_ptr<SortMergeReader::Iterator>> NextBatch() override {
-        while (current_ < readers_.size()) {
-            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader::Iterator> iterator,
-                                   readers_[current_]->NextBatch());
-            if (iterator) {
-                return iterator;
-            }
-            readers_[current_]->Close();
-            ++current_;
-        }
-        return std::unique_ptr<SortMergeReader::Iterator>();
-    }
-
-    void Close() override {
-        while (current_ < readers_.size()) {
-            readers_[current_++]->Close();
-        }
-    }
-
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return MetricsImpl::CollectReadMetrics(readers_);
-    }
-
- private:
-    std::vector<std::unique_ptr<SortMergeReader>> readers_;
-    size_t current_ = 0;
-};
-
-}
-
 class MergeFileSplitRead::RealtimeReaderBuilder {
  public:
     static Result<std::unique_ptr<BatchReader>> Create(
         MergeFileSplitRead* owner, const std::vector<std::shared_ptr<Split>>& disk_splits,
-        std::vector<AdditionalKeyValueReader>&& additional_readers) {
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers) {
         RealtimeReaderBuilder builder(owner);
-        if (disk_splits.empty()) {
-            std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
-            readers.reserve(additional_readers.size());
-            for (AdditionalKeyValueReader& additional : additional_readers) {
-                readers.push_back(std::move(additional.reader));
-            }
-            return builder.CreateMergedReader(std::move(readers));
+        std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
+        if (!disk_splits.empty()) {
+            PAIMON_RETURN_NOT_OK(builder.CollectDiskReaders(disk_splits, &readers));
         }
-
-        PAIMON_RETURN_NOT_OK(builder.CollectDiskInputs(disk_splits));
-        builder.AddRangeInputs(std::move(additional_readers));
-        return builder.CreateReader();
+        readers.reserve(readers.size() + additional_readers.size());
+        for (std::unique_ptr<KeyValueRecordReader>& additional_reader : additional_readers) {
+            readers.push_back(std::move(additional_reader));
+        }
+        return builder.CreateMergedReader(std::move(readers));
     }
 
  private:
-    struct RangeInput {
-        std::shared_ptr<InternalRow> min_key;
-        std::shared_ptr<InternalRow> max_key;
-        std::vector<SortedRun> disk_runs;
-        std::unique_ptr<KeyValueRecordReader> additional_reader;
-    };
-
     explicit RealtimeReaderBuilder(MergeFileSplitRead* owner) : owner_(owner) {}
 
-    Status CollectDiskInputs(const std::vector<std::shared_ptr<Split>>& disk_splits) {
-        first_split_ = std::dynamic_pointer_cast<DataSplitImpl>(disk_splits.front());
-        if (!first_split_) {
+    Status CollectDiskReaders(const std::vector<std::shared_ptr<Split>>& disk_splits,
+                              std::vector<std::unique_ptr<KeyValueRecordReader>>* readers) {
+        std::shared_ptr<DataSplitImpl> first_split =
+            std::dynamic_pointer_cast<DataSplitImpl>(disk_splits.front());
+        if (!first_split) {
             return Status::Invalid("merge input disk split is not a data split");
         }
-        const BinaryRow& partition = first_split_->Partition();
-        const int32_t bucket = first_split_->Bucket();
-        PAIMON_ASSIGN_OR_RAISE(data_file_path_factory_,
+        const BinaryRow& partition = first_split->Partition();
+        const int32_t bucket = first_split->Bucket();
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFilePathFactory> data_file_path_factory,
                                owner_->path_factory_->CreateDataFilePathFactory(partition, bucket));
 
         std::vector<std::shared_ptr<DataFileMeta>> data_files;
@@ -187,44 +140,21 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
             }
         }
 
-        dv_factory_ = DeletionVector::CreateFactory(
+        DeletionVector::Factory dv_factory = DeletionVector::CreateFactory(
             owner_->options_.GetFileSystem(),
             DeletionVector::CreateDeletionFileMap(data_files, deletion_files), owner_->pool_);
         std::vector<std::vector<SortedRun>> disk_sections =
             IntervalPartition(data_files, owner_->key_comparator_).Partition();
-        inputs_.reserve(disk_sections.size());
-        for (std::vector<SortedRun>& section : disk_sections) {
-            std::shared_ptr<DataFileMeta> min_file = section.front().Files().front();
-            std::shared_ptr<DataFileMeta> max_file = min_file;
+        for (const std::vector<SortedRun>& section : disk_sections) {
             for (const SortedRun& run : section) {
-                for (const std::shared_ptr<DataFileMeta>& file : run.Files()) {
-                    if (owner_->key_comparator_->CompareTo(file->min_key, min_file->min_key) < 0) {
-                        min_file = file;
-                    }
-                    if (owner_->key_comparator_->CompareTo(file->max_key, max_file->max_key) > 0) {
-                        max_file = file;
-                    }
-                }
+                PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> disk_reader,
+                                       owner_->CreateReaderForRun(partition, run, dv_factory,
+                                                                  owner_->predicate_for_keys_,
+                                                                  data_file_path_factory));
+                readers->push_back(std::move(disk_reader));
             }
-            inputs_.push_back(RangeInput{std::shared_ptr<InternalRow>(min_file, &min_file->min_key),
-                                         std::shared_ptr<InternalRow>(max_file, &max_file->max_key),
-                                         std::move(section), nullptr});
         }
         return Status::OK();
-    }
-
-    void AddRangeInputs(std::vector<AdditionalKeyValueReader>&& additional_readers) {
-        inputs_.reserve(inputs_.size() + additional_readers.size());
-        for (AdditionalKeyValueReader& additional : additional_readers) {
-            has_unknown_range_ |= !additional.min_key || !additional.max_key;
-            inputs_.push_back(RangeInput{additional.min_key, additional.max_key, {},
-                                         std::move(additional.reader)});
-        }
-    }
-
-    Result<std::unique_ptr<KeyValueRecordReader>> CreateDiskReader(const SortedRun& run) {
-        return owner_->CreateReaderForRun(first_split_->Partition(), run, dv_factory_,
-                                          owner_->predicate_for_keys_, data_file_path_factory_);
     }
 
     Result<std::unique_ptr<BatchReader>> CreateMergedReader(
@@ -265,83 +195,7 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
                                                             owner_->pool_);
     }
 
-    Result<std::unique_ptr<BatchReader>> CreateUnknownRangeReader() {
-        std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
-        for (RangeInput& input : inputs_) {
-            for (const SortedRun& run : input.disk_runs) {
-                PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> disk_reader,
-                                       CreateDiskReader(run));
-                readers.push_back(std::move(disk_reader));
-            }
-            if (input.additional_reader) {
-                readers.push_back(std::move(input.additional_reader));
-            }
-        }
-        return CreateMergedReader(std::move(readers));
-    }
-
-    Result<std::unique_ptr<BatchReader>> CreateKnownRangeReader() {
-        std::sort(inputs_.begin(), inputs_.end(),
-                  [this](const RangeInput& lhs, const RangeInput& rhs) {
-                      return owner_->key_comparator_->CompareTo(*lhs.min_key, *rhs.min_key) < 0;
-                  });
-        std::vector<std::vector<RangeInput>> components;
-        std::shared_ptr<InternalRow> component_max_key;
-        for (RangeInput& input : inputs_) {
-            if (components.empty() ||
-                owner_->key_comparator_->CompareTo(*input.min_key, *component_max_key) > 0) {
-                components.emplace_back();
-                component_max_key = input.max_key;
-            } else if (owner_->key_comparator_->CompareTo(*input.max_key, *component_max_key) > 0) {
-                component_max_key = input.max_key;
-            }
-            components.back().push_back(std::move(input));
-        }
-
-        std::vector<std::unique_ptr<SortMergeReader>> component_readers;
-        component_readers.reserve(components.size());
-        for (std::vector<RangeInput>& component : components) {
-            if (component.size() == 1 && !component.front().additional_reader) {
-                PAIMON_ASSIGN_OR_RAISE(
-                    std::unique_ptr<SortMergeReader> disk_component,
-                    owner_->CreateSortMergeReaderForSection(
-                        component.front().disk_runs, first_split_->Partition(), dv_factory_,
-                        component.front().disk_runs.size() == 1 ? owner_->context_->GetPredicate()
-                                                                : owner_->predicate_for_keys_,
-                        data_file_path_factory_, false));
-                component_readers.push_back(std::move(disk_component));
-                continue;
-            }
-
-            std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
-            for (RangeInput& input : component) {
-                for (const SortedRun& run : input.disk_runs) {
-                    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> disk_reader,
-                                           CreateDiskReader(run));
-                    readers.push_back(std::move(disk_reader));
-                }
-                if (input.additional_reader) {
-                    readers.push_back(std::move(input.additional_reader));
-                }
-            }
-            PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> component_reader,
-                                   owner_->CreateSortMergeReader(std::move(readers)));
-            component_readers.push_back(std::move(component_reader));
-        }
-        return CreateProjectedReader(
-            std::make_unique<ConcatNonOverlappingMergeReaders>(std::move(component_readers)));
-    }
-
-    Result<std::unique_ptr<BatchReader>> CreateReader() {
-        return has_unknown_range_ ? CreateUnknownRangeReader() : CreateKnownRangeReader();
-    }
-
     MergeFileSplitRead* owner_;
-    std::shared_ptr<DataSplitImpl> first_split_;
-    std::shared_ptr<DataFilePathFactory> data_file_path_factory_;
-    DeletionVector::Factory dv_factory_;
-    std::vector<RangeInput> inputs_;
-    bool has_unknown_range_ = false;
 };
 
 Result<std::unique_ptr<MergeFileSplitRead>> MergeFileSplitRead::Create(
@@ -426,7 +280,7 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
 
 Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateRealtimeReader(
     const std::vector<std::shared_ptr<Split>>& disk_splits,
-    std::vector<AdditionalKeyValueReader>&& additional_readers) {
+    std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers) {
     return RealtimeReaderBuilder::Create(this, disk_splits, std::move(additional_readers));
 }
 
