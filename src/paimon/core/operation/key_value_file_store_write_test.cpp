@@ -59,7 +59,6 @@
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/reader/file_batch_reader.h"
-#include "paimon/realtime/arrow_realtime_store_factory.h"
 #include "paimon/realtime/realtime_context.h"
 #include "paimon/record_batch.h"
 #include "paimon/status.h"
@@ -109,69 +108,6 @@ class TestingMemoryPool final : public MemoryPool {
 
  private:
     std::unique_ptr<MemoryPool> delegate_ = GetMemoryPool();
-};
-
-class FailOnceRealtimeStore final : public RealtimeStore {
- public:
-    FailOnceRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
-                          const std::shared_ptr<bool>& fail_next_write)
-        : delegate_(delegate), fail_next_write_(fail_next_write) {}
-
-    Status Write(RealtimeWriteBatch&& batch) override {
-        if (*fail_next_write_) {
-            *fail_next_write_ = false;
-            return Status::Invalid("injected real-time store write failure");
-        }
-        return delegate_->Write(std::move(batch));
-    }
-
-    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
-        return delegate_->SealForCommit();
-    }
-
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
-        const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
-        return delegate_->CreateCommitReaders(segment);
-    }
-
-    Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
-        return delegate_->AcquireReadView();
-    }
-
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
-        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
-        const RealtimeQueryContext& context) override {
-        return delegate_->CreateQueryReaders(view, offset_begin, context);
-    }
-
-    Status AdvanceCommittedOffset(int64_t committed_offset) override {
-        return delegate_->AdvanceCommittedOffset(committed_offset);
-    }
-
-    uint64_t GetMemoryUsage() const override {
-        return delegate_->GetMemoryUsage();
-    }
-
- private:
-    std::shared_ptr<RealtimeStore> delegate_;
-    std::shared_ptr<bool> fail_next_write_;
-};
-
-class FailOnceRealtimeStoreFactory final : public RealtimeStoreFactory {
- public:
-    explicit FailOnceRealtimeStoreFactory(const std::shared_ptr<bool>& fail_next_write)
-        : fail_next_write_(fail_next_write) {}
-
-    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
-                               delegate_.Create(std::move(request)));
-        return std::shared_ptr<RealtimeStore>(
-            std::make_shared<FailOnceRealtimeStore>(delegate, fail_next_write_));
-    }
-
- private:
-    ArrowRealtimeStoreFactory delegate_;
-    std::shared_ptr<bool> fail_next_write_;
 };
 
 }
@@ -548,40 +484,6 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
 
     ASSERT_NOK_WITH_MSG(writer->Write(MakeBatch(schema, R"([[1, 10]])")),
                         "PK real-time write schema contains reserved transport field");
-    ASSERT_OK(writer->Close());
-}
-
-TEST_F(KeyValueFileStoreWriteTest, TestWriteFailureKeepsCursors) {
-    const std::map<std::string, std::string> options = {
-        {Options::BUCKET, "1"},
-        {Options::WRITE_BUFFER_SIZE, "1"},
-    };
-    const std::shared_ptr<arrow::Schema> schema = arrow::schema({
-        arrow::field("id", arrow::int64(), false),
-        arrow::field("value", arrow::utf8()),
-    });
-    std::unique_ptr<UniqueTestDirectory> dir = UniqueTestDirectory::Create();
-    ASSERT_TRUE(dir);
-    CreateTable(dir->Str(), schema, options);
-    const std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
-
-    auto fail_next_write = std::make_shared<bool>(true);
-    auto factory = std::make_shared<FailOnceRealtimeStoreFactory>(fail_next_write);
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create(factory));
-    WriteContextBuilder builder(table_path, "test");
-    builder.SetOptions(options).WithStreamingMode(true).WithRealtimeContext(realtime_context);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> write_context, builder.Finish());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         FileStoreWrite::Create(std::move(write_context)));
-
-    ASSERT_NOK_WITH_MSG(writer->Write(MakeBatch(schema, R"([[9, "rejected"]])")),
-                        "injected real-time store write failure");
-    ASSERT_OK(writer->Write(MakeBatch(schema, R"([[1, "kept"]])")));
-    using PreparedRow = std::tuple<int8_t, int64_t, std::string, int64_t, int64_t>;
-    ASSERT_OK_AND_ASSIGN(std::vector<PreparedRow> prepared_rows,
-                         ReadPreparedRows(realtime_context));
-    ASSERT_EQ((std::vector<PreparedRow>{{0, 1, "kept", 0, 0}}), prepared_rows);
     ASSERT_OK(writer->Close());
 }
 

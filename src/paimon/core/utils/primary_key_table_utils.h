@@ -24,7 +24,6 @@
 
 #include "arrow/type.h"
 #include "paimon/result.h"
-#include "paimon/status.h"
 
 namespace arrow {
 class Schema;

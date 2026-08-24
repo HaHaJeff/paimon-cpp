@@ -286,7 +286,6 @@ set(PAIMON_CORE_SRCS
     core/io/vector_file_batch_reader.cpp
     core/io/file_index_evaluator.cpp
     core/io/key_value_data_file_record_reader.cpp
-    core/io/prepared_key_value_reader.cpp
     core/io/key_value_data_file_writer_factory.cpp
     core/io/key_value_data_file_writer.cpp
     core/io/key_value_in_memory_record_reader.cpp
@@ -383,6 +382,7 @@ set(PAIMON_CORE_SRCS
     core/operation/write_restore.cpp
     core/realtime/arrow_realtime_store.cpp
     core/realtime/arrow_realtime_store_factory.cpp
+    core/realtime/prepared_key_value_reader.cpp
     core/realtime/primary_key_realtime_store.cpp
     core/realtime/realtime_append_only_writer.cpp
     core/realtime/realtime_context.cpp

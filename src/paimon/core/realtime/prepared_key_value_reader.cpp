@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include "paimon/core/io/prepared_key_value_reader.h"
+#include "paimon/core/realtime/prepared_key_value_reader.h"
 
 #include <cstdint>
 #include <memory>
