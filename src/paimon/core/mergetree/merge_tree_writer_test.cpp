@@ -96,31 +96,7 @@ class TrackingKeyValueRecordReader : public KeyValueRecordReader {
     bool* closed_flag_;
 };
 
-class ErrorKeyValueRecordReader : public KeyValueRecordReader {
- public:
-    ErrorKeyValueRecordReader(Status status, bool* closed_flag)
-        : status_(std::move(status)), closed_flag_(closed_flag) {}
-
-    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
-        return status_;
-    }
-
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return nullptr;
-    }
-
-    void Close() override {
-        if (closed_flag_ != nullptr) {
-            *closed_flag_ = true;
-        }
-    }
-
- private:
-    Status status_;
-    bool* closed_flag_;
-};
-
-}
+}  // namespace
 
 class MergeTreeWriterTest : public ::testing::TestWithParam<bool> {
  public:
@@ -270,7 +246,8 @@ class MergeTreeWriterTest : public ::testing::TestWithParam<bool> {
     }
 
     std::unique_ptr<KeyValueRecordReader> CreateSingleReader(
-        const std::shared_ptr<arrow::Array>& array, int32_t batch_size = 16) const {
+        const std::shared_ptr<arrow::Array>& array, int32_t batch_size = 16,
+        const Status& next_batch_status = Status::OK()) const {
         std::vector<DataField> write_fields = {SpecialFields::SequenceNumber(),
                                                SpecialFields::ValueKind()};
         write_fields.insert(write_fields.end(), value_fields_.begin(), value_fields_.end());
@@ -280,6 +257,7 @@ class MergeTreeWriterTest : public ::testing::TestWithParam<bool> {
             arrow::schema(arrow::FieldVector({write_schema->field(2)}));
         auto file_batch_reader =
             std::make_unique<MockFileBatchReader>(array, array->type(), batch_size);
+        file_batch_reader->SetNextBatchStatus(next_batch_status);
         return std::make_unique<MockKeyValueDataFileRecordReader>(
             std::move(file_batch_reader), key_schema, value_schema_, 0, pool_);
     }
@@ -601,13 +579,19 @@ TEST_P(MergeTreeWriterTest, TestSortedReaderFailure) {
     Status null_status = merge_writer->WriteSortedReaders(std::move(null_readers));
     ASSERT_TRUE(null_status.IsInvalid());
 
+    auto sorted_reader_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(write_type_, R"([
+      [0, 0, "Alice", 10, 0, 13.1]
+    ])")
+            .ValueOrDie());
+    Status expected_status = Status::IOError("sorted reader failure");
     bool failing_reader_closed = false;
-    auto failing_reader = std::make_unique<ErrorKeyValueRecordReader>(
-        Status::IOError("sorted reader failure"), &failing_reader_closed);
     std::vector<std::unique_ptr<KeyValueRecordReader>> failing_readers;
-    failing_readers.push_back(std::move(failing_reader));
+    failing_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
+        CreateSingleReader(sorted_reader_array, /*batch_size=*/16, expected_status),
+        &failing_reader_closed));
     Status failing_status = merge_writer->WriteSortedReaders(std::move(failing_readers));
-    ASSERT_TRUE(failing_status.IsIOError());
+    ASSERT_EQ(expected_status, failing_status);
     ASSERT_TRUE(failing_reader_closed);
     ASSERT_OK(merge_writer->Close());
 }
