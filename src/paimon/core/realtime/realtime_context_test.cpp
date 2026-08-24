@@ -171,13 +171,15 @@ TEST(RealtimeContextTest, TestRejectsMismatchedSchemaOnStoreReuse) {
     ASSERT_NOK_WITH_MSG(
         GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(arrow::int32(), metadata), {},
                                GetDefaultPool()),
-        "schema or mode does not match");
+        "schema or mode mismatch for partition {dt=2026-08-02}, bucket 0; recreate the "
+        "RealtimeContext");
     ASSERT_NOK_WITH_MSG(
         GetOrCreateAppendStore(
             context, partition, 0,
             MakeWriteSchema(arrow::int64(), arrow::key_value_metadata({"identity"}, {"v2"})), {},
             GetDefaultPool()),
-        "schema or mode does not match");
+        "schema or mode mismatch for partition {dt=2026-08-02}, bucket 0; recreate the "
+        "RealtimeContext");
     ASSERT_EQ(1, factory->stores.size());
 }
 

@@ -530,6 +530,64 @@ TEST_P(MergeTreeWriterTest, TestSortedReaders) {
     ASSERT_EQ(1, new_file->delete_row_count);
 }
 
+TEST_P(MergeTreeWriterTest, TestMergeSortedReaders) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap({{Options::FILE_FORMAT, "orc"}}));
+
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    auto path_factory = std::make_shared<DataFilePathFactory>();
+    ASSERT_OK(path_factory->Init(dir->Str(), "orc", options.DataFilePrefix(), nullptr));
+    ASSERT_OK_AND_ASSIGN(auto merge_writer,
+                         CreateMergeWriter(/*last_sequence_number=*/4, dir->Str(), path_factory,
+                                           /*schema_id=*/7, options));
+
+    auto first_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(write_type_, R"([
+      [5, 0, "Alice", 10, 0, 15.1],
+      [7, 0, "Carol", 20, 1, 17.1],
+      [10, 0, "Eve", 30, 2, 20.1]
+    ])")
+            .ValueOrDie());
+    auto second_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(write_type_, R"([
+      [6, 0, "Bob", 11, 0, 16.1],
+      [8, 3, "Carol", 21, 1, null],
+      [9, 0, "David", 22, 2, 19.1]
+    ])")
+            .ValueOrDie());
+    bool first_closed = false;
+    bool second_closed = false;
+    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
+    sorted_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
+        CreateSingleReader(first_array), &first_closed));
+    sorted_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
+        CreateSingleReader(second_array), &second_closed));
+
+    ASSERT_OK(merge_writer->WriteSortedReaders(std::move(sorted_readers)));
+    ASSERT_TRUE(first_closed);
+    ASSERT_TRUE(second_closed);
+    ASSERT_OK_AND_ASSIGN(CommitIncrement commit_increment, merge_writer->PrepareCommit(false));
+    ASSERT_OK(merge_writer->Close());
+
+    ASSERT_EQ(1, commit_increment.GetNewFilesIncrement().NewFiles().size());
+    const std::shared_ptr<DataFileMeta>& new_file =
+        commit_increment.GetNewFilesIncrement().NewFiles()[0];
+    ASSERT_EQ(5, new_file->row_count);
+    ASSERT_EQ(1, new_file->delete_row_count);
+    std::shared_ptr<arrow::ChunkedArray> expected_array;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(write_type_, {R"([
+      [5, 0, "Alice", 10, 0, 15.1],
+      [6, 0, "Bob", 11, 0, 16.1],
+      [8, 3, "Carol", 21, 1, null],
+      [9, 0, "David", 22, 2, 19.1],
+      [10, 0, "Eve", 30, 2, 20.1]
+    ])"},
+                                                                 &expected_array)
+                    .ok());
+    CheckFileContent(path_factory->ToPath(new_file), expected_array);
+}
+
 TEST_P(MergeTreeWriterTest, TestSortedReaderOwnership) {
     ASSERT_OK_AND_ASSIGN(CoreOptions options,
                          CoreOptions::FromMap({{Options::FILE_FORMAT, "orc"}}));

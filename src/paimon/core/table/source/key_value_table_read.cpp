@@ -253,6 +253,9 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateRealtimeReader(
     if (realtime_split->Version() != RealtimeSplit::kCurrentVersion) {
         return Status::Invalid("unsupported real-time split version");
     }
+    if (realtime_split->MemoryEndOffset() < realtime_split->CommittedEndOffset()) {
+        return Status::Invalid("real-time split memory end offset precedes committed end offset");
+    }
     const std::shared_ptr<RealtimeContext> realtime_context = context_->GetRealtimeContext();
     if (!realtime_context) {
         return Status::Invalid("reading a real-time split requires a real-time context");

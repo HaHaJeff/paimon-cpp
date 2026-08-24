@@ -59,6 +59,17 @@ bool SameMode(const RealtimeStoreCreateConfig& left, const RealtimeStoreCreateCo
     return true;
 }
 
+std::string PartitionToString(const std::map<std::string, std::string>& partition) {
+    std::string result = "{";
+    for (auto iter = partition.begin(); iter != partition.end(); ++iter) {
+        if (iter != partition.begin()) {
+            result += ", ";
+        }
+        result += iter->first + "=" + iter->second;
+    }
+    return result + "}";
+}
+
 }  // namespace
 
 RealtimeContextImpl::RealtimeContextImpl(const std::shared_ptr<RealtimeStoreFactory>& factory)
@@ -120,8 +131,9 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     if (iter != stores_.end()) {
         if (!SameMode(iter->second.mode_config, request.mode_config) ||
             !iter->second.write_schema->Equals(*requested_schema, /*check_metadata=*/true)) {
-            return Status::Invalid(
-                "real-time store schema or mode does not match the registered store");
+            return Status::Invalid("real-time store schema or mode mismatch for partition " +
+                                   PartitionToString(key.partition) + ", bucket " +
+                                   std::to_string(key.bucket) + "; recreate the RealtimeContext");
         }
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeReadView> read_view,
                                iter->second.store->AcquireReadView());
