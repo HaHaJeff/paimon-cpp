@@ -209,6 +209,13 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
     std::vector<std::unique_ptr<BatchReader>> readers;
     readers.reserve(splits.size());
     std::vector<std::shared_ptr<RealtimeSplit>> realtime_splits;
+    ScopeGuard cleanup_guard([&]() {
+        for (const std::unique_ptr<BatchReader>& reader : readers) {
+            if (reader) {
+                reader->Close();
+            }
+        }
+    });
     for (const std::shared_ptr<Split>& split : splits) {
         std::shared_ptr<RealtimeSplit> realtime_split =
             std::dynamic_pointer_cast<RealtimeSplit>(split);
@@ -223,8 +230,6 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
         }
     }
 
-    std::unique_ptr<BatchReader> result =
-        std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());
     if (!realtime_splits.empty()) {
         const std::shared_ptr<RealtimeContext> realtime_context = context_->GetRealtimeContext();
         if (!realtime_context) {
@@ -237,6 +242,9 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
                 realtime_context_impl->ReleaseReadView(realtime_split->OpaqueTicket()));
         }
     }
+    std::unique_ptr<BatchReader> result =
+        std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());
+    cleanup_guard.Release();
     return result;
 }
 

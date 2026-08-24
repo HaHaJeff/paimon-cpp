@@ -109,6 +109,8 @@ class PAIMON_EXPORT RealtimeReadView {
 struct PAIMON_EXPORT RealtimeQueryContext {
     /// Append mode receives the requested output fields before the mandatory leading
     /// `_VALUE_KIND` field is added. Primary-key mode receives the complete prepared schema.
+    /// This schema is borrowed and remains valid only during `CreateQueryReaders`; plugins must
+    /// import or copy it synchronously.
     ::ArrowSchema* read_schema;
     /// Predicate using field indexes from `read_schema`.
     std::shared_ptr<Predicate> predicate;

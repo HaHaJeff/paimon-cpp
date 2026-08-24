@@ -32,7 +32,6 @@
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
-#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/io/merged_key_value_record_reader.h"
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
@@ -285,18 +284,6 @@ Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegm
                                               const OffsetRange& sealed_offsets) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                            realtime_store_->CreateCommitReaders(segment));
-    ScopeGuard readers_guard([&readers]() {
-        for (const std::unique_ptr<BatchReader>& reader : readers) {
-            if (reader) {
-                reader->Close();
-            }
-        }
-    });
-    for (const std::unique_ptr<BatchReader>& reader : readers) {
-        if (!reader) {
-            return Status::Invalid("PK real-time store returned a null commit reader");
-        }
-    }
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<std::unique_ptr<KeyValueRecordReader>> prepared_readers,
         AdaptPreparedCommitBatchReaders(std::move(readers), prepared_schema_, sealed_offsets,
@@ -309,7 +296,6 @@ Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegm
             std::move(prepared_reader), key_comparator_,
             std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function))));
     }
-    readers_guard.Release();
     return merge_tree_writer_->WriteSortedReaders(std::move(sorted_readers));
 }
 

@@ -468,21 +468,27 @@ class SwapFirstTwoBatchReader final : public BatchReader {
     Result<ReadBatch> NextBatch() override {
         if (!initialized_) {
             initialized_ = true;
-            PAIMON_ASSIGN_OR_RAISE(ReadBatch first, delegate_->NextBatch());
-            if (BatchReader::IsEofBatch(first)) {
+            PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
+            if (BatchReader::IsEofBatch(batch)) {
                 return MakeEofBatch();
             }
-            PAIMON_ASSIGN_OR_RAISE(ReadBatch second, delegate_->NextBatch());
-            if (BatchReader::IsEofBatch(second)) {
-                return first;
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                std::shared_ptr<arrow::Array> array,
+                arrow::ImportArray(batch.first.get(), batch.second.get()));
+            if (array->length() < 2) {
+                return Status::Invalid("cannot make a one-row reader unsorted");
             }
-            first_ = std::move(first);
-            return second;
-        }
-        if (first_.has_value()) {
-            ReadBatch first = std::move(first_.value());
-            first_.reset();
-            return first;
+            arrow::ArrayVector pieces = {array->Slice(1, 1), array->Slice(0, 1)};
+            if (array->length() > 2) {
+                pieces.push_back(array->Slice(2));
+            }
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> swapped,
+                                              arrow::Concatenate(pieces));
+            auto output = std::make_unique<ArrowArray>();
+            auto schema = std::make_unique<ArrowSchema>();
+            PAIMON_RETURN_NOT_OK_FROM_ARROW(
+                arrow::ExportArray(*swapped, output.get(), schema.get()));
+            return ReadBatch(std::move(output), std::move(schema));
         }
         return delegate_->NextBatch();
     }
@@ -492,14 +498,12 @@ class SwapFirstTwoBatchReader final : public BatchReader {
     }
 
     void Close() override {
-        first_.reset();
         delegate_->Close();
     }
 
  private:
     bool initialized_ = false;
     std::unique_ptr<BatchReader> delegate_;
-    std::optional<ReadBatch> first_;
 };
 
 class SubstituteOffsetBatchReader final : public BatchReader {
@@ -1253,6 +1257,8 @@ class RealtimeWriteInteTest : public ::testing::Test {
         return Status::OK();
     }
 
+    void RunConcurrencyTest(bool primary_key);
+
     Result<RealtimeOffsetMap> ReadCommittedOffsets() const {
         PAIMON_ASSIGN_OR_RAISE(CoreOptions options, CoreOptions::FromMap(options_));
         SnapshotManager snapshot_manager(options.GetFileSystem(), table_path_);
@@ -1326,8 +1332,10 @@ class RealtimeWriteInteTest : public ::testing::Test {
         } else {
             CreateTable(/*partition_keys=*/{"pt"});
         }
+        auto close_state = std::make_shared<CloseTrackingReaderState>();
+        auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(close_state);
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                             RealtimeContext::Create());
+                             RealtimeContext::Create(factory));
         ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                              CreateRealtimeWriter(realtime_context));
         std::vector<Row> p0_rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
@@ -1363,6 +1371,9 @@ class RealtimeWriteInteTest : public ::testing::Test {
                              TableRead::Create(std::move(read_context)));
         ASSERT_NOK_WITH_MSG(table_read->CreateReader(invalid_splits),
                             "unsupported real-time split version");
+        if (!primary_key) {
+            ASSERT_EQ(1, close_state->query_close_count->load(std::memory_order_acquire));
+        }
 
         std::vector<Row> expected_rows = p0_rows;
         expected_rows.insert(expected_rows.end(), p1_rows.begin(), p1_rows.end());
@@ -1631,6 +1642,56 @@ TEST_F(RealtimeWriteInteTest, TestPkMergeDiskSealedAndActive) {
     ASSERT_OK(writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkMergeAllDiskSplitsWithMemory) {
+    options_[Options::SOURCE_SPLIT_OPEN_FILE_COST] = "1";
+    options_[Options::SOURCE_SPLIT_TARGET_SIZE] = "1";
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    const std::vector<std::vector<Row>> disk_batches = {
+        {{1, "disk-1", "p0"}, {2, "disk-2", "p0"}},
+        {{10, "disk-10", "p0"}, {11, "disk-11", "p0"}},
+        {{20, "disk-20", "p0"}, {21, "disk-21", "p0"}},
+    };
+    for (int64_t commit_identifier = 0;
+         commit_identifier < static_cast<int64_t>(disk_batches.size()); ++commit_identifier) {
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                             MakeBatch(disk_batches[commit_identifier], /*partitioned=*/false));
+        ASSERT_OK(writer->Write(std::move(batch)));
+        ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                             writer->PrepareCommitWithProgress(commit_identifier));
+        ASSERT_OK_AND_ASSIGN(int64_t snapshot_id, Commit(progress, commit_identifier));
+        ASSERT_OK(writer->RefreshCommittedSnapshot(snapshot_id));
+    }
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> memory_batch,
+        MakeBatch({Row{1, "memory-1", "p0"}, Row{10, "deleted-10", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/0,
+                  {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE}));
+    ASSERT_OK(writer->Write(std::move(memory_batch)));
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+    ASSERT_EQ(1, plan->Splits().size());
+    std::shared_ptr<RealtimeSplit> realtime_split =
+        std::dynamic_pointer_cast<RealtimeSplit>(plan->Splits()[0]);
+    ASSERT_NE(nullptr, realtime_split);
+    ASSERT_EQ(3, realtime_split->DiskSplits().size());
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(plan, realtime_context));
+    ASSERT_EQ((std::vector<Row>{{1, "memory-1", "p0"},
+                                {2, "disk-2", "p0"},
+                                {11, "disk-11", "p0"},
+                                {20, "disk-20", "p0"},
+                                {21, "disk-21", "p0"}}),
+              actual_rows);
+    ASSERT_OK(writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkNestedProjectionAcrossDiskAndMemory) {
     const std::shared_ptr<arrow::Field> projected_b = arrow::field("b", arrow::int64());
     fields_ = {
@@ -1709,6 +1770,45 @@ TEST_F(RealtimeWriteInteTest, TestPkNestedProjectionAcrossDiskAndMemory) {
     ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(*actual))
         << actual->ToString();
     reader->Close();
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkMemoryReadAfterSchemaEvolution) {
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "old", "p0"}}, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+
+    std::shared_ptr<arrow::Field> renamed_payload = arrow::field("renamed_payload", arrow::utf8());
+    std::shared_ptr<arrow::Field> added = arrow::field("added", arrow::int32());
+    ASSERT_OK(TestHelper::WriteNextSchema(dir_->GetFileSystem(), table_path_,
+                                          {DataField(0, fields_[0]), DataField(1, renamed_payload),
+                                           DataField(2, fields_[2]), DataField(3, added)},
+                                          /*highest_field_id=*/3, options_));
+    fields_[1] = renamed_payload;
+    fields_.push_back(added);
+    schema_ = arrow::schema(fields_);
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(CollectedReadResult result,
+                         ReadPlan(plan, realtime_context, {"id", "renamed_payload", "pt", "added"},
+                                  /*predicate=*/nullptr, /*enable_predicate_filter=*/false));
+    ASSERT_EQ(1, result.data->num_chunks());
+    std::shared_ptr<arrow::StructArray> row =
+        std::dynamic_pointer_cast<arrow::StructArray>(result.data->chunk(0));
+    ASSERT_NE(nullptr, row);
+    ASSERT_EQ(1, row->length());
+    std::shared_ptr<arrow::StringArray> renamed_values =
+        std::dynamic_pointer_cast<arrow::StringArray>(row->field(2));
+    ASSERT_NE(nullptr, renamed_values);
+    ASSERT_EQ("old", renamed_values->GetString(0));
+    ASSERT_TRUE(row->field(4)->IsNull(0));
+    result.reader->Close();
     ASSERT_OK(writer->Close());
 }
 
@@ -2274,6 +2374,40 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderCloseFailure) {
         ASSERT_NOK_WITH_MSG(create_reader(), "PK real-time store returned a null query reader");
         ASSERT_EQ(null_index + 1, state->query_close_count->load(std::memory_order_acquire));
     }
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestAppendQueryReaderCloseFailure) {
+    CreateTable(/*partition_keys=*/{});
+    auto state = std::make_shared<CloseTrackingReaderState>();
+    state->query_null_index = 1;
+    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    std::vector<Row> rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch(rows, /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+
+    ReadContextBuilder read_builder(table_path_);
+    read_builder.SetOptions(options_)
+        .SetReadFieldNames({"id", "payload", "pt"})
+        .WithRealtimeContext(realtime_context)
+        .WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
+                         TableRead::Create(std::move(read_context)));
+    ASSERT_NOK_WITH_MSG(table_read->CreateReader(plan->Splits()),
+                        "append-only real-time store returned a null query reader");
+    ASSERT_EQ(1, state->query_close_count->load(std::memory_order_acquire));
+
+    state->query_null_index = -1;
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(plan, realtime_context));
+    ASSERT_EQ(rows, actual_rows);
     ASSERT_OK(writer->Close());
 }
 
@@ -3705,8 +3839,12 @@ TEST_F(RealtimeWriteInteTest, TestReopenRealtimeContextAfterRollback) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
-    CreateTable(/*partition_keys=*/{});
+void RealtimeWriteInteTest::RunConcurrencyTest(bool primary_key) {
+    if (primary_key) {
+        CreatePkTable();
+    } else {
+        CreateTable(/*partition_keys=*/{});
+    }
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -3940,6 +4078,14 @@ TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
     ASSERT_OK_AND_ASSIGN(uint64_t memory_usage, GetRealtimeMemoryUsage(realtime_context));
     ASSERT_EQ(0, memory_usage);
     ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestConcurrentWritePrepareCommitReadAndRefresh) {
+    RunConcurrencyTest(/*primary_key=*/false);
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkConcurrency) {
+    RunConcurrencyTest(/*primary_key=*/true);
 }
 
 TEST_F(RealtimeWriteInteTest, TestMultiplePartitions) {

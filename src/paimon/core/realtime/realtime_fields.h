@@ -19,17 +19,15 @@
 
 #pragma once
 
-#include <cstdint>
-#include <limits>
-
 #include "arrow/type.h"
 #include "paimon/common/types/data_field.h"
+#include "paimon/utils/special_field_ids.h"
 
 namespace paimon {
 
 inline const DataField& RealtimeOffsetField() {
     static const DataField data_field =
-        DataField(std::numeric_limits<int32_t>::max() - 10002,
+        DataField(SpecialFieldIds::REALTIME_OFFSET,
                   arrow::field("_REALTIME_OFFSET", arrow::int64(), /*nullable=*/false));
     return data_field;
 }

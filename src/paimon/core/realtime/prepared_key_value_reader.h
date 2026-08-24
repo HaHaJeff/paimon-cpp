@@ -33,6 +33,8 @@ class BatchReader;
 class FieldsComparator;
 class MemoryPool;
 
+Status ValidatePreparedTransportSchema(const std::shared_ptr<arrow::Schema>& prepared_schema);
+
 Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
     std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
     const std::optional<OffsetRange>& visible_offsets,

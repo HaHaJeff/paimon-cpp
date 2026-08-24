@@ -18,14 +18,18 @@
 
 #include "paimon/core/realtime/primary_key_realtime_store.h"
 
+#include <algorithm>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/ipc/json_simple.h"
+#include "fmt/format.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
@@ -196,6 +200,34 @@ TEST(PrimaryKeyRealtimeStoreTest, TestWriteAndSealValidation) {
         RealtimeWriteBatch{MakeBatch(R"([[0, 4, 3, 4, "four"]])"), OffsetRange(3, 4)}));
 }
 
+TEST(PrimaryKeyRealtimeStoreTest, TestBadTransportPrefix) {
+    const std::shared_ptr<arrow::Schema> valid = PreparedSchema();
+    std::vector<arrow::FieldVector> invalid_fields;
+
+    arrow::FieldVector wrong_type = valid->fields();
+    wrong_type[0] = DataField::ConvertDataFieldToArrowField(
+                        DataField(SpecialFields::ValueKind().Id(),
+                                  arrow::field("_VALUE_KIND", arrow::int32(), false)))
+                        ->WithNullable(false);
+    invalid_fields.push_back(std::move(wrong_type));
+
+    arrow::FieldVector nullable_sequence = valid->fields();
+    nullable_sequence[1] = nullable_sequence[1]->WithNullable(true);
+    invalid_fields.push_back(std::move(nullable_sequence));
+
+    arrow::FieldVector wrong_offset_id = valid->fields();
+    wrong_offset_id[2] = DataField::ConvertDataFieldToArrowField(
+                             DataField(99, arrow::field("_REALTIME_OFFSET", arrow::int64(), false)))
+                             ->WithNullable(false);
+    invalid_fields.push_back(std::move(wrong_offset_id));
+
+    for (const arrow::FieldVector& fields : invalid_fields) {
+        ASSERT_NOK_WITH_MSG(
+            PrimaryKeyRealtimeStore::Create(arrow::schema(fields), {"id"}, GetDefaultPool()),
+            "prepared schema field");
+    }
+}
+
 TEST(PrimaryKeyRealtimeStoreTest, TestCommitBatches) {
     ASSERT_OK_AND_ASSIGN(
         std::shared_ptr<PrimaryKeyRealtimeStore> store,
@@ -233,12 +265,100 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderExportsZeroOffsets) {
     ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
                          store->CreateCommitReaders(segment.value()));
     ASSERT_EQ(1, readers.size());
-    for (int32_t row = 0; row < 2; ++row) {
-        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
-        ASSERT_FALSE(BatchReader::IsEofBatch(batch));
-        AssertOffsetsZero(batch.first.get());
-        ASSERT_TRUE(arrow::ImportArray(batch.first.get(), batch.second.get()).ok());
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+    ASSERT_EQ(2, batch.first->length);
+    AssertOffsetsZero(batch.first.get());
+    ASSERT_TRUE(arrow::ImportArray(batch.first.get(), batch.second.get()).ok());
+    ASSERT_OK_AND_ASSIGN(batch, readers[0]->NextBatch());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+}
+
+TEST(PrimaryKeyRealtimeStoreTest, TestHeapMergeAcrossBatches) {
+    constexpr int64_t kSourceCount = 2057;
+    constexpr int64_t kKeyCount = 257;
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<PrimaryKeyRealtimeStore> store,
+        PrimaryKeyRealtimeStore::Create(PreparedSchema(), {"id"}, GetDefaultPool()));
+    for (int64_t source = 0; source < kSourceCount; ++source) {
+        const int64_t id = (source * 149) % kKeyCount;
+        const std::string json =
+            fmt::format(R"([[0, {}, {}, {}, "v{}"]])", source, source, id, source);
+        ASSERT_OK(
+            store->Write(RealtimeWriteBatch{MakeBatch(json), OffsetRange(source, source + 1)}));
     }
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
+                         store->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         store->CreateCommitReaders(segment.value()));
+    ASSERT_EQ(1, readers.size());
+
+    std::vector<int64_t> expected_sources(kSourceCount);
+    std::iota(expected_sources.begin(), expected_sources.end(), 0);
+    std::sort(expected_sources.begin(), expected_sources.end(), [=](int64_t left, int64_t right) {
+        const int64_t left_id = (left * 149) % kKeyCount;
+        const int64_t right_id = (right * 149) % kKeyCount;
+        return left_id != right_id ? left_id < right_id : left < right;
+    });
+
+    int64_t output_row = 0;
+    int64_t output_batches = 0;
+    while (true) {
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            break;
+        }
+        ASSERT_LE(batch.first->length, 1024);
+        ASSERT_GT(batch.first->length, 0);
+        ++output_batches;
+        arrow::Result<std::shared_ptr<arrow::Array>> imported_result =
+            arrow::ImportArray(batch.first.get(), batch.second.get());
+        ASSERT_TRUE(imported_result.ok()) << imported_result.status().ToString();
+        std::shared_ptr<arrow::Array> imported = std::move(imported_result).ValueOrDie();
+        std::shared_ptr<arrow::StructArray> array =
+            std::dynamic_pointer_cast<arrow::StructArray>(imported);
+        ASSERT_NE(nullptr, array);
+        ASSERT_EQ(PreparedSchema()->ToString(), arrow::schema(array->type()->fields())->ToString());
+        std::shared_ptr<arrow::Int64Array> sequences =
+            std::dynamic_pointer_cast<arrow::Int64Array>(array->field(1));
+        std::shared_ptr<arrow::Int64Array> ids =
+            std::dynamic_pointer_cast<arrow::Int64Array>(array->field(3));
+        std::shared_ptr<arrow::StringArray> values =
+            std::dynamic_pointer_cast<arrow::StringArray>(array->field(4));
+        ASSERT_NE(nullptr, sequences);
+        ASSERT_NE(nullptr, ids);
+        ASSERT_NE(nullptr, values);
+        for (int64_t row = 0; row < array->length(); ++row, ++output_row) {
+            ASSERT_LT(output_row, kSourceCount);
+            const int64_t source = expected_sources[output_row];
+            ASSERT_EQ(source, sequences->Value(row));
+            ASSERT_EQ((source * 149) % kKeyCount, ids->Value(row));
+            ASSERT_EQ(fmt::format("v{}", source), values->GetString(row));
+        }
+    }
+    ASSERT_EQ(kSourceCount, output_row);
+    ASSERT_EQ(3, output_batches);
+}
+
+TEST(PrimaryKeyRealtimeStoreTest, TestCloseUnreadMultiSourceReader) {
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<PrimaryKeyRealtimeStore> store,
+        PrimaryKeyRealtimeStore::Create(PreparedSchema(), {"id"}, GetDefaultPool()));
+    ASSERT_OK(
+        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 10, 0, 1, "a"]])"), OffsetRange(0, 1)}));
+    ASSERT_OK(
+        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 20, 1, 2, "b"]])"), OffsetRange(1, 2)}));
+    ASSERT_OK(
+        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 30, 2, 3, "c"]])"), OffsetRange(2, 3)}));
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
+                         store->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         store->CreateCommitReaders(segment.value()));
+    ASSERT_EQ(1, readers.size());
+
+    readers[0]->Close();
 }
 
 TEST(PrimaryKeyRealtimeStoreTest, TestReclaimKeepsReadView) {

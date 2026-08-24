@@ -344,7 +344,7 @@ Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanCo
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context,
                                RealtimeContextImpl::Cast(context->GetRealtimeContext()));
         return std::make_unique<RealtimeTableScan>(
-            std::move(batch_scan), realtime_context, path_factory,
+            std::move(batch_scan), pk_table, realtime_context, path_factory,
             snapshot_reader->GetSnapshotManager(), core_options.GetFileSystem(),
             context->GetScanFilters(), core_options.GetRealtimeReadViewTtlMillis());
     }
