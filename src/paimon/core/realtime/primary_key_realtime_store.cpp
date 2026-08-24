@@ -177,9 +177,6 @@ class RawBatchReader final : public BatchReader {
     }
 
     Result<ReadBatch> NextBatch() override {
-        if (closed_) {
-            return MakeEofBatch();
-        }
         std::optional<size_t> selected;
         for (size_t i = 0; i < batches_.size(); ++i) {
             if (positions_[i] >= batches_[i].data->length()) {
@@ -214,10 +211,6 @@ class RawBatchReader final : public BatchReader {
         return metrics_;
     }
     void Close() override {
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
         batches_.clear();
         positions_.clear();
         key_contexts_.clear();
@@ -238,7 +231,6 @@ class RawBatchReader final : public BatchReader {
         return left_sequences->Value(positions_[left]) < right_sequences->Value(positions_[right]);
     }
 
-    bool closed_ = false;
     std::vector<StoredBatch> batches_;
     std::vector<int64_t> positions_;
     std::vector<int32_t> key_field_indexes_;

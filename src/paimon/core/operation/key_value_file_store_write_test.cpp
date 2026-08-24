@@ -411,6 +411,7 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeWrite) {
     const std::map<std::string, std::string> options = {
         {Options::BUCKET, "1"},
         {Options::WRITE_BUFFER_SIZE, "1"},
+        {Options::REALTIME_ENABLED, "true"},
     };
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
@@ -465,7 +466,8 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeWrite) {
 }
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
-    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"}};
+    const std::map<std::string, std::string> options = {
+        {Options::BUCKET, "1"}, {Options::REALTIME_ENABLED, "true"}};
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
         arrow::field("_REALTIME_OFFSET", arrow::int64()),
@@ -488,7 +490,8 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
 }
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimePool) {
-    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"}};
+    const std::map<std::string, std::string> options = {
+        {Options::BUCKET, "1"}, {Options::REALTIME_ENABLED, "true"}};
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
         arrow::field("value", arrow::utf8()),
@@ -546,7 +549,8 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimePool) {
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimeLimits) {
     const int64_t max = std::numeric_limits<int64_t>::max();
-    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"}};
+    const std::map<std::string, std::string> options = {
+        {Options::BUCKET, "1"}, {Options::REALTIME_ENABLED, "true"}};
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
         arrow::field("value", arrow::utf8()),

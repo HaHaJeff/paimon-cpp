@@ -218,9 +218,6 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCommitBatches) {
         "4 type: string\n  [\n    \"before\",\n    \"after\",\n    \"three\"\n  ]",
         actual);
     readers[0]->Close();
-    readers[0]->Close();
-    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch eof, readers[0]->NextBatch());
-    ASSERT_TRUE(BatchReader::IsEofBatch(eof));
 }
 
 TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderExportsZeroOffsets) {

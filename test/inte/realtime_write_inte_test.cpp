@@ -1939,7 +1939,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRecovery) {
                          seed_commit_builder.SetOptions(options_).Finish());
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreCommit> seed_commit,
                          FileStoreCommit::Create(std::move(seed_commit_context)));
-    ASSERT_OK(seed_commit->Commit(seed_messages));
+    ASSERT_OK(seed_commit->Commit(seed_messages, /*commit_identifier=*/0));
     ASSERT_OK(seed_writer->Close());
     const std::vector<Row> mutations = {
         {1, "one", "p0"}, {1, "one-new", "p0"}, {2, "deleted", "p0"}, {3, "three", "p0"}};

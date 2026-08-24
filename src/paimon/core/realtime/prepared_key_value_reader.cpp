@@ -490,10 +490,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
  private:
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatchImpl() {
-        if (closed_) {
-            return std::unique_ptr<KeyValueRecordReader::Iterator>();
-        }
-
         while (true) {
             ResetBatchState();
             PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader_->NextBatch());

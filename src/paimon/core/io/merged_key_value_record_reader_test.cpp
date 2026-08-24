@@ -81,16 +81,11 @@ class TrackingBatchReader : public BatchReader {
     }
 
     void Close() override {
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
         ++(*close_count_);
         delegate_->Close();
     }
 
  private:
-    bool closed_ = false;
     std::unique_ptr<BatchReader> delegate_;
     int32_t* close_count_;
 };
@@ -421,7 +416,7 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedProjection) {
     ASSERT_EQ(keyed_value_map->ValueArray()->GetInt(1), 23);
 }
 
-TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderClose) {
+TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderLifecycle) {
     std::vector<DataField> value_fields = {DataField(0, arrow::field("k0", arrow::int32())),
                                            DataField(1, arrow::field("v0", arrow::int32()))};
     std::shared_ptr<arrow::Schema> value_schema =
@@ -444,7 +439,6 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderClose) {
             std::unique_ptr<KeyValueRecordReader> reader,
             AdaptPreparedBatchReader(std::move(tracking_reader), prepared_schema, OffsetRange(0, 1),
                                      key_schema, value_schema, pool_));
-        reader->Close();
         reader->Close();
     }
     ASSERT_EQ(explicit_close_count, 1);
@@ -486,7 +480,6 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderClose) {
                                      key_schema, value_schema, pool_));
         ASSERT_NOK_WITH_MSG(reader->NextBatch(), "prepared reader failure");
         ASSERT_EQ(read_failure_close_count, 1);
-        reader->Close();
     }
     ASSERT_EQ(read_failure_close_count, 1);
 }

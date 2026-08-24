@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <optional>
+#include <utility>
 
 #include "paimon/arrow/abi.h"
 #include "paimon/testing/utils/testharness.h"
@@ -66,20 +67,18 @@ TEST(RealtimeReaderTest, TestRejectsIncompleteReader) {
                         "inner reader is null");
 }
 
-TEST(RealtimeReaderTest, TestCloseIsIdempotentAndReturnsEof) {
+TEST(RealtimeReaderTest, TestCloseReleasesResources) {
     int32_t close_count = 0;
+    std::shared_ptr<TestingReadView> read_view = std::make_shared<TestingReadView>();
+    std::weak_ptr<TestingReadView> weak_read_view = read_view;
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<RealtimeReader> reader,
-        RealtimeReader::Create(std::make_shared<TestingReadView>(),
+        RealtimeReader::Create(std::move(read_view),
                                std::make_unique<TestingBatchReader>(&close_count)));
-    reader->Close();
+    ASSERT_FALSE(weak_read_view.expired());
     reader->Close();
     ASSERT_EQ(1, close_count);
-    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
-    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
-    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatchWithBitmap batch_with_bitmap,
-                         reader->NextBatchWithBitmap());
-    ASSERT_TRUE(BatchReader::IsEofBatch(batch_with_bitmap));
+    ASSERT_TRUE(weak_read_view.expired());
 }
 
 }  // namespace
