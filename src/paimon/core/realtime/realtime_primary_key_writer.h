@@ -42,7 +42,6 @@ class FieldsComparator;
 class RealtimeContextImpl;
 struct RealtimeStoreState;
 
-/// Coordinates framework-prepared primary-key real-time writes.
 class RealtimePrimaryKeyWriter final : public BatchWriter {
  public:
     static Result<std::shared_ptr<RealtimePrimaryKeyWriter>> Create(

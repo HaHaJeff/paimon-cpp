@@ -35,7 +35,7 @@ class TableSchema;
 
 Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options, const TableSchema& schema);
 
-/// In-memory store for prepared primary-key real-time batches.
+/// Internal in-memory implementation of the default primary-key `RealtimeStore`.
 class PrimaryKeyRealtimeStore final : public RealtimeStore {
  public:
     static Result<std::shared_ptr<PrimaryKeyRealtimeStore>> Create(

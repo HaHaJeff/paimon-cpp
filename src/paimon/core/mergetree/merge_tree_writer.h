@@ -70,9 +70,8 @@ class MergeTreeWriter : public BatchWriter {
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
 
-    /// Consumes readers whose complete streams are individually sorted by primary key and
-    /// sequence number. Readers are closed on success or failure; an error may leave generated
-    /// file state unpublished, so the caller must discard this writer and replay its input.
+    /// Consumes readers whose complete streams are individually sorted by primary key and sequence
+    /// number. Readers are closed on success or failure.
     Status WriteSortedReaders(std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers);
 
     Status Compact(bool full_compaction) override;
