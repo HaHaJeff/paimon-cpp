@@ -18,6 +18,7 @@
 
 #include "paimon/core/mergetree/write_buffer.h"
 
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -39,6 +40,9 @@ Result<std::unique_ptr<WriteBuffer>> WriteBuffer::Create(
     const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
     const CoreOptions& options, const std::shared_ptr<IOManager>& io_manager,
     bool enable_multi_thread_spill, const std::shared_ptr<MemoryPool>& pool) {
+    if (last_sequence_number == std::numeric_limits<int64_t>::max()) {
+        return Status::Invalid("sequence number has reached INT64_MAX");
+    }
     auto value_type = arrow::struct_(value_schema->fields());
     auto in_memory_buffer = std::make_unique<InMemorySortBuffer>(
         last_sequence_number, value_type, trimmed_primary_keys, user_defined_sequence_fields,

@@ -47,7 +47,6 @@ class MemoryPool;
 struct RealtimeStoreState {
     std::shared_ptr<RealtimeStore> store;
     int64_t initial_offset;
-    std::optional<int64_t> initial_max_sequence_number;
 };
 
 struct RealtimePartitionBucketView {
@@ -67,9 +66,6 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
         const std::shared_ptr<RealtimeContext>& context);
 
     Result<RealtimeStoreState> GetOrCreateRealtimeStore(RealtimeStoreCreateRequest&& request);
-
-    void AdvanceMaterializedMaxSequenceNumber(const RealtimePartitionBucket& partition_bucket,
-                                              int64_t max_sequence_number);
 
     Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews();
 
@@ -100,7 +96,6 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
     std::mutex mutex_;
     std::mutex progress_mutex_;
     std::map<RealtimePartitionBucket, std::shared_ptr<RealtimeStore>> stores_;
-    std::map<RealtimePartitionBucket, int64_t> materialized_max_sequence_numbers_;
     // Full-table progress used as the initial offset when a store is created lazily.
     RealtimeOffsetMap committed_offsets_;
     // Progress already reflected in stores owned by this context.

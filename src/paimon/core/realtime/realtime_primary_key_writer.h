@@ -20,16 +20,16 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "paimon/core/utils/batch_writer.h"
-#include "paimon/realtime/realtime_context.h"
 #include "paimon/realtime/realtime_store.h"
 
 namespace arrow {
+class MemoryPool;
 class Schema;
 }  // namespace arrow
 
@@ -37,18 +37,19 @@ namespace paimon {
 
 class MemoryPool;
 class MergeTreeWriter;
-class RealtimeContextImpl;
+class FieldsComparator;
 struct RealtimeStoreState;
 
-/// Primary-key real-time writer backed by an in-memory mutation indexer.
+/// Coordinates framework-prepared primary-key real-time writes.
 class RealtimePrimaryKeyWriter final : public BatchWriter {
  public:
     static Result<std::shared_ptr<RealtimePrimaryKeyWriter>> Create(
-        const std::map<std::string, std::string>& partition, int32_t bucket,
         const std::shared_ptr<arrow::Schema>& write_schema,
-        const std::shared_ptr<RealtimeContextImpl>& realtime_context,
+        const std::vector<std::string>& trimmed_primary_keys,
+        const std::shared_ptr<FieldsComparator>& key_comparator,
+        const RealtimeStoreState& store_state, int64_t restore_max_sequence_number,
         const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
-        const std::shared_ptr<MemoryPool>& memory_pool, const RealtimeStoreState& store_state);
+        const std::shared_ptr<MemoryPool>& memory_pool);
 
     Status Write(std::unique_ptr<RecordBatch>&& batch) override;
     Result<CommitIncrement> PrepareCommit(bool wait_compaction) override;
@@ -63,20 +64,28 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
  private:
     RealtimePrimaryKeyWriter(const std::shared_ptr<RealtimeStore>& realtime_store,
                              const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
-                             const std::shared_ptr<RealtimeContextImpl>& realtime_context,
-                             const RealtimePartitionBucket& partition_bucket,
                              const std::shared_ptr<arrow::Schema>& write_schema,
-                             int64_t next_offset, const std::shared_ptr<MemoryPool>& memory_pool);
+                             const std::shared_ptr<arrow::Schema>& prepared_schema,
+                             const std::shared_ptr<arrow::Schema>& key_schema,
+                             const std::vector<std::string>& trimmed_primary_keys,
+                             const std::shared_ptr<FieldsComparator>& key_comparator,
+                             int64_t next_offset, int64_t last_sequence_number,
+                             const std::shared_ptr<MemoryPool>& memory_pool);
 
-    Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment);
+    Status FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment,
+                        int64_t expected_raw_row_count);
 
     std::shared_ptr<MemoryPool> memory_pool_;
+    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     std::shared_ptr<RealtimeStore> realtime_store_;
     std::shared_ptr<MergeTreeWriter> merge_tree_writer_;
-    std::shared_ptr<RealtimeContextImpl> realtime_context_;
-    RealtimePartitionBucket partition_bucket_;
     std::shared_ptr<arrow::Schema> write_schema_;
+    std::shared_ptr<arrow::Schema> prepared_schema_;
+    std::shared_ptr<arrow::Schema> key_schema_;
+    std::vector<std::string> trimmed_primary_keys_;
+    std::shared_ptr<FieldsComparator> key_comparator_;
     int64_t next_offset_;
+    int64_t last_sequence_number_;
     std::mutex realtime_store_mutex_;
     std::mutex prepare_mutex_;
 };

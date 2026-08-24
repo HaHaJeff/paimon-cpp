@@ -78,6 +78,10 @@ using RealtimeOffsetMap = std::map<RealtimePartitionBucket, int64_t>;
 /// partition drop, and rollback operations do not automatically clear process-local real-time
 /// state. Applications must coordinate these operations with active real-time writers and recreate
 /// the `RealtimeContext` and writers before continuing.
+///
+/// A primary-key writer and its context form one lifecycle. After a primary-key write or prepare
+/// returns an error, discard both, create fresh instances from the latest committed snapshot, and
+/// replay the caller-owned WAL. Reusing the failed context or retrying prepare is unsupported.
 class PAIMON_EXPORT RealtimeContext {
  public:
     /// Creates a context backed by Paimon's default in-memory Arrow `RealtimeStore`.

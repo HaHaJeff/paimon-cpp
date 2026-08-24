@@ -18,12 +18,13 @@
 
 #include "paimon/core/operation/key_value_file_store_write.h"
 
-#include <limits>
 #include <optional>
 #include <vector>
 
 #include "arrow/c/bridge.h"
 #include "paimon/common/data/binary_row.h"
+#include "paimon/common/table/special_fields.h"
+#include "paimon/common/types/data_field.h"
 #include "paimon/core/compact/noop_compact_manager.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/io/data_file_meta.h"
@@ -35,6 +36,7 @@
 #include "paimon/core/operation/file_store_scan.h"
 #include "paimon/core/operation/key_value_file_store_scan.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
+#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/utils/file_store_path_factory.h"
@@ -124,7 +126,6 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         std::shared_ptr<Levels> levels,
         Levels::Create(key_comparator_, restore_data_files, options_.GetNumLevels()));
     std::map<std::string, std::string> partition_map;
-    int64_t initial_max_sequence_number = restore_max_seq_number;
     std::shared_ptr<CompactManager> compact_manager;
     std::shared_ptr<RealtimeContextImpl> realtime_context_impl;
     std::optional<RealtimeStoreState> realtime_store_state;
@@ -135,19 +136,27 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         partition_map =
             std::map<std::string, std::string>(partition_values.begin(), partition_values.end());
         PAIMON_ASSIGN_OR_RAISE(realtime_context_impl, RealtimeContextImpl::Cast(realtime_context_));
+        if (schema_->GetFieldByName(RealtimeOffsetField().Name())) {
+            return Status::Invalid("PK real-time write schema contains reserved transport field " +
+                                   RealtimeOffsetField().Name());
+        }
+        arrow::FieldVector prepared_fields = {
+            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
+                ->WithNullable(false),
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
+                ->WithNullable(false),
+            DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false)};
+        prepared_fields.insert(prepared_fields.end(), schema_->fields().begin(),
+                               schema_->fields().end());
         auto c_write_schema = std::make_unique<ArrowSchema>();
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema_, c_write_schema.get()));
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(
+            arrow::ExportSchema(*arrow::schema(std::move(prepared_fields)), c_write_schema.get()));
         PAIMON_ASSIGN_OR_RAISE(
             RealtimeStoreState store_state,
             realtime_context_impl->GetOrCreateRealtimeStore(RealtimeStoreCreateRequest{
                 std::move(c_write_schema), options_.ToMap(), pool_, partition_map, bucket,
-                PrimaryKeyRealtimeStoreCreateConfig{trimmed_primary_keys,
-                                                    restore_max_seq_number}}));
+                PrimaryKeyRealtimeStoreCreateConfig{}}));
         realtime_store_state = std::move(store_state);
-        initial_max_sequence_number = realtime_store_state->initial_max_sequence_number.value();
-        if (initial_max_sequence_number == std::numeric_limits<int64_t>::max()) {
-            return Status::Invalid("PK sequence number has reached INT64_MAX");
-        }
         compact_manager = std::make_shared<NoopCompactManager>();
     } else {
         auto compact_strategy = compact_manager_factory_->CreateCompactStrategy();
@@ -159,15 +168,16 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     PAIMON_ASSIGN_OR_RAISE(
         std::shared_ptr<MergeTreeWriter> writer,
         MergeTreeWriter::Create(
-            initial_max_sequence_number, trimmed_primary_keys, data_file_path_factory,
-            key_comparator_, user_defined_seq_comparator_, merge_function_wrapper_,
-            table_schema_->Id(), schema_, options_, compact_manager,
-            realtime_context_ ? nullptr : io_manager_, enable_multi_thread_spill_, pool_));
+            restore_max_seq_number, trimmed_primary_keys, data_file_path_factory, key_comparator_,
+            user_defined_seq_comparator_, merge_function_wrapper_, table_schema_->Id(), schema_,
+            options_, compact_manager, realtime_context_ ? nullptr : io_manager_,
+            enable_multi_thread_spill_, pool_));
     if (!realtime_context_) {
         return std::shared_ptr<BatchWriter>(std::move(writer));
     }
-    return RealtimePrimaryKeyWriter::Create(partition_map, bucket, schema_, realtime_context_impl,
-                                            writer, pool_, realtime_store_state.value());
+    return RealtimePrimaryKeyWriter::Create(schema_, trimmed_primary_keys, key_comparator_,
+                                            realtime_store_state.value(), restore_max_seq_number,
+                                            writer, pool_);
 }
 
 Status KeyValueFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {

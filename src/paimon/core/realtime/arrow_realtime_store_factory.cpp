@@ -21,14 +21,9 @@
 
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
-#include "paimon/common/utils/fields_comparator.h"
 #include "paimon/common/utils/scope_guard.h"
-#include "paimon/core/core_options.h"
-#include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
-#include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/core/realtime/arrow_realtime_store.h"
 #include "paimon/core/realtime/primary_key_realtime_store.h"
 #include "paimon/macros.h"
@@ -55,31 +50,8 @@ Result<std::shared_ptr<RealtimeStore>> ArrowRealtimeStoreFactory::Create(
                                                     request.memory_pool, arrow_pool);
     }
 
-    const PrimaryKeyRealtimeStoreCreateConfig& primary_key_config =
-        std::get<PrimaryKeyRealtimeStoreCreateConfig>(request.mode_config);
-    std::vector<DataField> key_fields;
-    key_fields.reserve(primary_key_config.primary_keys.size());
-    for (const std::string& primary_key : primary_key_config.primary_keys) {
-        const int32_t field_index = imported_schema->GetFieldIndex(primary_key);
-        if (field_index < 0) {
-            return Status::Invalid("primary key ", primary_key, " is missing from write schema");
-        }
-        key_fields.emplace_back(field_index, imported_schema->field(field_index));
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FieldsComparator> key_comparator,
-                           FieldsComparator::Create(key_fields, /*is_ascending_order=*/true));
-    auto merge_function_wrapper_factory = []() {
-        auto merge_function = std::make_unique<DeduplicateMergeFunction>(
-            /*ignore_delete=*/false);
-        return std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function));
-    };
-    PAIMON_ASSIGN_OR_RAISE(CoreOptions core_options, CoreOptions::FromMap(request.options));
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<PrimaryKeyRealtimeStore> store,
-        PrimaryKeyRealtimeStore::Create(imported_schema, primary_key_config.primary_keys,
-                                        key_comparator, merge_function_wrapper_factory,
-                                        primary_key_config.restore_max_sequence_number,
-                                        core_options.GetReadBatchSize(), request.memory_pool));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                           PrimaryKeyRealtimeStore::Create(imported_schema, request.memory_pool));
     return std::shared_ptr<RealtimeStore>(std::move(store));
 }
 

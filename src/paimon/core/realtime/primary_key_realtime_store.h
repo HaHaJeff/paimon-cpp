@@ -19,11 +19,7 @@
 
 #pragma once
 
-#include <cstdint>
-#include <functional>
 #include <memory>
-#include <string>
-#include <vector>
 
 #include "paimon/realtime/realtime_store.h"
 
@@ -34,34 +30,15 @@ class Schema;
 namespace paimon {
 
 class CoreOptions;
-class FieldsComparator;
-struct KeyValue;
 class MemoryPool;
-class InternalRow;
-template <typename T>
-class MergeFunctionWrapper;
 
 Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options);
 
-/// Optional metadata exposed by PK query readers with a known inclusive key range.
-class PrimaryKeyRangeProvider {
- public:
-    virtual ~PrimaryKeyRangeProvider() = default;
-
-    virtual std::shared_ptr<InternalRow> GetMinKey() const = 0;
-    virtual std::shared_ptr<InternalRow> GetMaxKey() const = 0;
-};
-
-/// In-memory store for primary-key real-time writes.
+/// In-memory store for prepared primary-key real-time batches.
 class PrimaryKeyRealtimeStore final : public RealtimeStore {
  public:
     static Result<std::shared_ptr<PrimaryKeyRealtimeStore>> Create(
-        const std::shared_ptr<arrow::Schema>& write_schema,
-        const std::vector<std::string>& primary_keys,
-        const std::shared_ptr<FieldsComparator>& key_comparator,
-        const std::function<std::shared_ptr<MergeFunctionWrapper<KeyValue>>()>&
-            merge_function_wrapper_factory,
-        int64_t restore_max_sequence_number, int32_t read_batch_size,
+        const std::shared_ptr<arrow::Schema>& prepared_schema,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
     ~PrimaryKeyRealtimeStore() override;

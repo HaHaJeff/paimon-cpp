@@ -21,6 +21,7 @@
 #include <cassert>
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <utility>
@@ -610,6 +611,20 @@ TEST_P(MergeTreeWriterTest, TestSortedReaderFailure) {
     ASSERT_TRUE(failing_status.IsIOError());
     ASSERT_TRUE(failing_reader_closed);
     ASSERT_OK(merge_writer->Close());
+}
+
+TEST_P(MergeTreeWriterTest, TestRejectsExhaustedSequence) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap({{Options::FILE_FORMAT, "orc"}}));
+
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    auto path_factory = std::make_shared<DataFilePathFactory>();
+    ASSERT_OK(path_factory->Init(dir->Str(), "orc", options.DataFilePrefix(), nullptr));
+
+    ASSERT_NOK_WITH_MSG(CreateMergeWriter(std::numeric_limits<int64_t>::max(), dir->Str(),
+                                          path_factory, 0, options),
+                        "sequence number has reached INT64_MAX");
 }
 
 TEST_P(MergeTreeWriterTest, TestSharedShreddingMapDataFileMetaInfo) {

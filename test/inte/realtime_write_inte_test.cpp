@@ -443,9 +443,52 @@ class CloseTrackingRealtimeStoreFactory final : public RealtimeStoreFactory {
     std::shared_ptr<CloseTrackingReaderState> state_;
 };
 
-class InvalidReaderRealtimeStore final : public RealtimeStore {
+class SplitBatchReader final : public BatchReader {
  public:
-    explicit InvalidReaderRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate)
+    explicit SplitBatchReader(std::unique_ptr<BatchReader> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    Result<ReadBatch> NextBatch() override {
+        while (!current_batch_ || next_row_ == current_batch_->length()) {
+            PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
+            if (BatchReader::IsEofBatch(batch)) {
+                return MakeEofBatch();
+            }
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                std::shared_ptr<arrow::Array> array,
+                arrow::ImportArray(batch.first.get(), batch.second.get()));
+            if (!array || array->type_id() != arrow::Type::STRUCT) {
+                return Status::Invalid("split batch reader received a non-struct batch");
+            }
+            current_batch_ = std::dynamic_pointer_cast<arrow::StructArray>(array);
+            next_row_ = 0;
+        }
+        std::shared_ptr<arrow::Array> slice = current_batch_->Slice(next_row_, /*length=*/1);
+        ++next_row_;
+        auto output = std::make_unique<ArrowArray>();
+        auto schema = std::make_unique<ArrowSchema>();
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*slice, output.get(), schema.get()));
+        return ReadBatch(std::move(output), std::move(schema));
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return delegate_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        current_batch_.reset();
+        delegate_->Close();
+    }
+
+ private:
+    std::unique_ptr<BatchReader> delegate_;
+    std::shared_ptr<arrow::StructArray> current_batch_;
+    int64_t next_row_ = 0;
+};
+
+class SplitCommitReaderRealtimeStore final : public RealtimeStore {
+ public:
+    explicit SplitCommitReaderRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate)
         : delegate_(delegate) {}
 
     Status Write(RealtimeWriteBatch&& batch) override {
@@ -457,9 +500,12 @@ class InvalidReaderRealtimeStore final : public RealtimeStore {
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
-        const std::shared_ptr<RealtimeSegmentHandle>&) override {
-        std::vector<std::unique_ptr<BatchReader>> readers;
-        readers.push_back(nullptr);
+        const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
+        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
+                               delegate_->CreateCommitReaders(segment));
+        for (std::unique_ptr<BatchReader>& reader : readers) {
+            reader = std::make_unique<SplitBatchReader>(std::move(reader));
+        }
         return readers;
     }
 
@@ -468,8 +514,9 @@ class InvalidReaderRealtimeStore final : public RealtimeStore {
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
-        const std::shared_ptr<RealtimeReadView>&, int64_t, const RealtimeQueryContext&) override {
-        return std::vector<std::unique_ptr<BatchReader>>();
+        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
+        const RealtimeQueryContext& context) override {
+        return delegate_->CreateQueryReaders(view, offset_begin, context);
     }
 
     Status AdvanceCommittedOffset(int64_t committed_offset) override {
@@ -484,13 +531,13 @@ class InvalidReaderRealtimeStore final : public RealtimeStore {
     std::shared_ptr<RealtimeStore> delegate_;
 };
 
-class InvalidReaderRealtimeStoreFactory final : public RealtimeStoreFactory {
+class SplitCommitReaderRealtimeStoreFactory final : public RealtimeStoreFactory {
  public:
     Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
                                delegate_.Create(std::move(request)));
         return std::shared_ptr<RealtimeStore>(
-            std::make_shared<InvalidReaderRealtimeStore>(delegate));
+            std::make_shared<SplitCommitReaderRealtimeStore>(delegate));
     }
 
  private:
@@ -1311,10 +1358,11 @@ TEST_F(RealtimeWriteInteTest, TestPkRead) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
 
-    std::vector<Row> first_rows = {{1, "old", "p0"}, {2, "two", "p0"}};
+    std::vector<Row> first_rows = {{1, "old", "p0"}, {2, "two", "p0"}, {1, "new-in-run", "p0"}};
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
                          MakeBatch(first_rows, /*partitioned=*/false, /*bucket=*/0,
-                                   {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::INSERT}));
+                                   {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::INSERT,
+                                    RecordBatch::RowKind::UPDATE_AFTER}));
     ASSERT_OK(writer->Write(std::move(first_batch)));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> update_batch,
                          MakeBatch({Row{1, "new", "p0"}}, /*partitioned=*/false, /*bucket=*/0,
@@ -1756,13 +1804,13 @@ TEST_F(RealtimeWriteInteTest, TestPkRecovery) {
                          MakeBatch(mutations, /*partitioned=*/false, /*bucket=*/0, mutation_kinds));
     ASSERT_OK(first_writer->Write(std::move(batch)));
     ASSERT_OK_AND_ASSIGN(std::vector<int64_t> memory_sequences, ReadPkSequences(first_context));
-    ASSERT_EQ((std::vector<int64_t>{2, 3, 4}), memory_sequences);
+    ASSERT_EQ((std::vector<int64_t>{1, 2, 3, 4}), memory_sequences);
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
                          first_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
     ASSERT_EQ(1, progress.size());
     ASSERT_EQ(OffsetRange(0, 4), progress[0].offset_range);
     ASSERT_EQ(1, NewFiles(progress).size());
-    ASSERT_EQ(memory_sequences.front(), NewFiles(progress)[0]->min_sequence_number);
+    ASSERT_EQ(2, NewFiles(progress)[0]->min_sequence_number);
     ASSERT_EQ(memory_sequences.back(), NewFiles(progress)[0]->max_sequence_number);
     ASSERT_OK(Commit(progress, /*commit_identifier=*/1));
     ASSERT_OK(first_writer->Close());
@@ -1801,9 +1849,16 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
     constexpr int64_t kCommitRoundsBeforeCompaction = 4;
     std::set<std::string> committed_file_names;
     for (int64_t round = 0; round < kCommitRoundsBeforeCompaction; ++round) {
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                             MakeBatch({Row{round, "value-" + std::to_string(round), "p0"}},
-                                       /*partitioned=*/false));
+        const bool delete_latest_live_row = round == kCommitRoundsBeforeCompaction - 1;
+        ASSERT_OK_AND_ASSIGN(
+            std::unique_ptr<RecordBatch> batch,
+            MakeBatch(
+                {Row{delete_latest_live_row ? round - 1 : round,
+                     delete_latest_live_row ? "deleted" : "value-" + std::to_string(round), "p0"}},
+                /*partitioned=*/false, /*bucket=*/0,
+                delete_latest_live_row
+                    ? std::vector<RecordBatch::RowKind>{RecordBatch::RowKind::DELETE}
+                    : std::vector<RecordBatch::RowKind>{}));
         ASSERT_OK(writer->Write(std::move(batch)));
         ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
                              writer->PrepareCommitWithProgress(round));
@@ -1819,11 +1874,6 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
         ASSERT_OK_AND_ASSIGN(uint64_t memory_usage, GetRealtimeMemoryUsage(realtime_context));
         ASSERT_EQ(0, memory_usage);
     }
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> next_batch,
-                         MakeBatch({Row{4, "value-4", "p0"}},
-                                   /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(next_batch)));
-
     WriteContextBuilder compact_builder(table_path_, commit_user_);
     compact_builder.SetOptions(options_).WithStreamingMode(true);
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> compact_context, compact_builder.Finish());
@@ -1848,6 +1898,14 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
     }
     ASSERT_EQ(committed_file_names, compacted_file_names);
     ASSERT_FALSE(compact_message->GetCompactIncrement().CompactAfter().empty());
+    constexpr int64_t kHistoricalMaxSequenceNumber = kCommitRoundsBeforeCompaction - 1;
+    int64_t compacted_live_max_sequence_number = -1;
+    for (const std::shared_ptr<DataFileMeta>& file :
+         compact_message->GetCompactIncrement().CompactAfter()) {
+        compacted_live_max_sequence_number =
+            std::max(compacted_live_max_sequence_number, file->max_sequence_number);
+    }
+    ASSERT_LT(compacted_live_max_sequence_number, kHistoricalMaxSequenceNumber);
     ASSERT_OK(CommitMessages(compact_messages, /*commit_identifier=*/4));
     ASSERT_OK(compact_writer->Close());
 
@@ -1859,45 +1917,38 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
     ASSERT_EQ(Snapshot::CommitKind::Compact(), compact_snapshot->GetCommitKind());
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap offsets, ReadCommittedOffsets());
     ASSERT_EQ(4, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
-    ASSERT_OK(writer->RefreshCommittedSnapshot(compact_snapshot->Id()));
-    ASSERT_OK_AND_ASSIGN(std::vector<Row> compacted_rows, ReadRows(realtime_context));
-    ASSERT_EQ((std::vector<Row>{{0, "value-0", "p0"},
-                                {1, "value-1", "p0"},
-                                {2, "value-2", "p0"},
-                                {3, "value-3", "p0"},
-                                {4, "value-4", "p0"}}),
-              compacted_rows);
-
-    constexpr int64_t kCommitRoundsAfterCompaction = 2;
-    for (int64_t round = 0; round < kCommitRoundsAfterCompaction; ++round) {
-        if (round > 0) {
-            ASSERT_OK_AND_ASSIGN(
-                std::unique_ptr<RecordBatch> batch,
-                MakeBatch({Row{4 + round, "value-" + std::to_string(4 + round), "p0"}},
-                          /*partitioned=*/false));
-            ASSERT_OK(writer->Write(std::move(batch)));
-        }
-        const int64_t commit_identifier = 5 + round;
-        ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
-                             writer->PrepareCommitWithProgress(commit_identifier));
-        ASSERT_EQ(1, progress.size());
-        ASSERT_EQ(OffsetRange(4 + round, 5 + round), progress[0].offset_range);
-        ASSERT_OK_AND_ASSIGN(latest_snapshot_id, Commit(progress, commit_identifier));
-        ASSERT_OK(writer->RefreshCommittedSnapshot(latest_snapshot_id));
-        ASSERT_OK_AND_ASSIGN(uint64_t memory_usage, GetRealtimeMemoryUsage(realtime_context));
-        ASSERT_EQ(0, memory_usage);
-    }
-    ASSERT_OK_AND_ASSIGN(offsets, ReadCommittedOffsets());
-    ASSERT_EQ(6, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
-    ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows(realtime_context));
-    ASSERT_EQ((std::vector<Row>{{0, "value-0", "p0"},
-                                {1, "value-1", "p0"},
-                                {2, "value-2", "p0"},
-                                {3, "value-3", "p0"},
-                                {4, "value-4", "p0"},
-                                {5, "value-5", "p0"}}),
-              final_rows);
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> compacted_rows, ReadRows());
+    ASSERT_EQ((std::vector<Row>{{0, "value-0", "p0"}, {1, "value-1", "p0"}}), compacted_rows);
     ASSERT_OK(writer->Close());
+    writer.reset();
+    realtime_context.reset();
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> fresh_context, RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> fresh_writer,
+                         CreateRealtimeWriter(fresh_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> fresh_batch,
+                         MakeBatch({Row{4, "value-4", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(fresh_writer->Write(std::move(fresh_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<int64_t> fresh_sequences, ReadPkSequences(fresh_context));
+    ASSERT_EQ((std::vector<int64_t>{compacted_live_max_sequence_number + 1}), fresh_sequences);
+    ASSERT_LT(fresh_sequences.front(), kHistoricalMaxSequenceNumber);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> fresh_progress,
+                         fresh_writer->PrepareCommitWithProgress(/*commit_identifier=*/5));
+    ASSERT_EQ(1, fresh_progress.size());
+    ASSERT_EQ(OffsetRange(4, 5), fresh_progress[0].offset_range);
+    ASSERT_EQ(compacted_live_max_sequence_number + 1,
+              NewFiles(fresh_progress)[0]->min_sequence_number);
+    ASSERT_EQ(compacted_live_max_sequence_number + 1,
+              NewFiles(fresh_progress)[0]->max_sequence_number);
+    ASSERT_OK_AND_ASSIGN(latest_snapshot_id, Commit(fresh_progress, /*commit_identifier=*/5));
+    ASSERT_OK(fresh_writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(offsets, ReadCommittedOffsets());
+    ASSERT_EQ(5, offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> final_rows, ReadRows());
+    ASSERT_EQ((std::vector<Row>{{0, "value-0", "p0"}, {1, "value-1", "p0"}, {4, "value-4", "p0"}}),
+              final_rows);
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkConcurrency) {
@@ -2054,19 +2105,29 @@ TEST_F(RealtimeWriteInteTest, TestPkWriteDuringPrepare) {
 
 TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
     CreatePkTable();
-    auto factory = std::make_shared<InvalidReaderRealtimeStoreFactory>();
+    auto factory = std::make_shared<SplitCommitReaderRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
+                         MakeBatch({Row{4, "four", "p0"}, Row{3, "three", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(first_batch)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
+                         MakeBatch({Row{2, "two", "p0"}, Row{1, "one", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(second_batch)));
 
-    ASSERT_NOK_WITH_MSG(ReadRows(realtime_context),
-                        "PK real-time store returned no query readers for active memory");
-    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
-                        "PK real-time store returned a null commit reader");
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, progress.size());
+    ASSERT_EQ(OffsetRange(0, 4), progress[0].offset_range);
+    ASSERT_OK(Commit(progress, /*commit_identifier=*/0));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> rows, ReadRows());
+    ASSERT_EQ((std::vector<Row>{
+                  {1, "one", "p0"}, {2, "two", "p0"}, {3, "three", "p0"}, {4, "four", "p0"}}),
+              rows);
     ASSERT_OK(writer->Close());
 }
 
@@ -2752,52 +2813,6 @@ TEST_F(RealtimeWriteInteTest, TestCloseWriterAllowsContextReuseByLaterWriter) {
     ASSERT_OK(Commit(commits, /*commit_identifier=*/1));
     std::vector<Row> expected_rows = first_rows;
     expected_rows.insert(expected_rows.end(), second_rows.begin(), second_rows.end());
-    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
-    ASSERT_EQ(expected_rows, actual_rows);
-    ASSERT_OK(second_writer->Close());
-}
-
-TEST_F(RealtimeWriteInteTest, TestPkWriterHandoff) {
-    CreatePkTable();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer,
-                         CreateRealtimeWriter(realtime_context));
-    std::vector<Row> first_rows = MakeRows(/*first_id=*/0, /*count=*/3, /*partition=*/"p0");
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
-                         MakeBatch(first_rows, /*partitioned=*/false));
-    ASSERT_OK(first_writer->Write(std::move(first_batch)));
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> commits,
-                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
-    ASSERT_EQ(1, commits.size());
-    ASSERT_EQ(OffsetRange(0, 3), commits[0].offset_range);
-    ASSERT_EQ(1, NewFiles(commits).size());
-    ASSERT_EQ(0, NewFiles(commits)[0]->min_sequence_number);
-    ASSERT_EQ(2, NewFiles(commits)[0]->max_sequence_number);
-    ASSERT_OK(first_writer->Close());
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
-                         CreateRealtimeWriter(realtime_context));
-    std::vector<Row> second_rows = {
-        Row{0, "updated-0", "p0"},
-        Row{3, "value-3", "p0"},
-    };
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
-                         MakeBatch(second_rows, /*partitioned=*/false));
-    ASSERT_OK(second_writer->Write(std::move(second_batch)));
-    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_commits,
-                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
-    ASSERT_EQ(1, second_commits.size());
-    ASSERT_EQ(OffsetRange(3, 5), second_commits[0].offset_range);
-    ASSERT_EQ(1, NewFiles(second_commits).size());
-    ASSERT_EQ(3, NewFiles(second_commits)[0]->min_sequence_number);
-    ASSERT_EQ(4, NewFiles(second_commits)[0]->max_sequence_number);
-
-    commits.push_back(std::move(second_commits[0]));
-    ASSERT_OK(Commit(commits, /*commit_identifier=*/1));
-    std::vector<Row> expected_rows = first_rows;
-    expected_rows[0] = second_rows[0];
-    expected_rows.push_back(second_rows[1]);
     ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
     ASSERT_EQ(expected_rows, actual_rows);
     ASSERT_OK(second_writer->Close());

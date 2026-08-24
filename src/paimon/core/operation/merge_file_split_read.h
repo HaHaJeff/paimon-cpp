@@ -127,7 +127,6 @@ class MergeFileSplitRead : public AbstractSplitRead {
         return key_schema_;
     }
 
-    /// Merges ordinary disk splits with generic additional sorted KeyValue readers.
     Result<std::unique_ptr<BatchReader>> CreateRealtimeReader(
         const std::vector<std::shared_ptr<Split>>& disk_splits,
         std::vector<AdditionalKeyValueReader>&& additional_readers);

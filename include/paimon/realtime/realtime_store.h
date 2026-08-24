@@ -47,19 +47,15 @@ struct PAIMON_EXPORT AppendRealtimeStoreCreateConfig {
     StatisticsMode statistics_mode;
 };
 
-struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {
-    std::vector<std::string> primary_keys;
-    /// Largest sequence restored from the committed snapshot. A PK store assigns one contiguous
-    /// sequence to every mutation in `Write` order, starting at the next value, and rejects
-    /// `Write` before the assigned sequence would exceed `INT64_MAX - 1`.
-    int64_t restore_max_sequence_number;
-};
+struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {};
 
 using RealtimeStoreCreateConfig =
     std::variant<AppendRealtimeStoreCreateConfig, PrimaryKeyRealtimeStoreCreateConfig>;
 
 struct PAIMON_EXPORT RealtimeStoreCreateRequest {
-    /// Complete table write schema whose ownership is transferred to the factory.
+    /// Schema whose ownership is transferred to the factory. Append mode receives the complete
+    /// table write schema. Primary-key mode receives the prepared transport schema:
+    /// [_VALUE_KIND, _SEQUENCE_NUMBER, _REALTIME_OFFSET, table write fields].
     std::unique_ptr<::ArrowSchema> write_schema;
     std::map<std::string, std::string> options;
     std::shared_ptr<MemoryPool> memory_pool;
@@ -68,10 +64,12 @@ struct PAIMON_EXPORT RealtimeStoreCreateRequest {
     RealtimeStoreCreateConfig mode_config;
 };
 
-/// A table record batch and its framework-assigned contiguous offset range.
+/// A record batch and its framework-assigned contiguous offset range.
 ///
-/// The batch contains only table write fields. Row `i` is associated with
-/// `offset_range.begin + i`; the offset is progress metadata and is not a table field.
+/// Append-mode batches contain table write fields, and row `i` is associated with
+/// `offset_range.begin + i`. Primary-key batches contain the prepared transport schema supplied
+/// to the factory and are physically sorted by full primary key then sequence number; their
+/// per-row `_REALTIME_OFFSET` field preserves the original write-order offset after sorting.
 struct PAIMON_EXPORT RealtimeWriteBatch {
     /// Input batch whose ownership is transferred to `RealtimeStore::Write`.
     std::unique_ptr<RecordBatch> batch;
@@ -106,7 +104,8 @@ class PAIMON_EXPORT RealtimeReadView {
 
 /// Parameters used by a `RealtimeStore` to create readers for a query.
 struct PAIMON_EXPORT RealtimeQueryContext {
-    /// Requested output fields before the mandatory leading `_VALUE_KIND` field is added.
+    /// Append mode receives the requested output fields before the mandatory leading
+    /// `_VALUE_KIND` field is added. Primary-key mode receives the complete prepared schema.
     ::ArrowSchema* read_schema;
     /// Predicate using field indexes from `read_schema`.
     std::shared_ptr<Predicate> predicate;
@@ -143,9 +142,13 @@ class PAIMON_EXPORT RealtimeStore {
 
     /// Creates readers that expose all rows in a sealed segment for Paimon file writing.
     ///
-    /// Concatenating the returned readers must produce every sealed row exactly once and in write
-    /// order. Each output batch contains `_VALUE_KIND` followed by all fields from the factory's
-    /// `write_schema`.
+    /// Concatenating the returned readers must produce every sealed row exactly once. Append-mode
+    /// readers preserve write order and contain `_VALUE_KIND` followed by table write fields.
+    /// Primary-key readers expose raw prepared rows. Each returned reader's complete stream,
+    /// including across `NextBatch` boundaries, is sorted by full primary key then sequence
+    /// number; all readers collectively cover sealed mutations exactly once. Reader cardinality is
+    /// independent of the number of writes. Paimon adapts and merges those rows before writing
+    /// files.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -155,16 +158,17 @@ class PAIMON_EXPORT RealtimeStore {
     /// also provide a consistent snapshot when a write or seal is in progress.
     virtual Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() = 0;
 
-    /// Creates readers over rows in `view` whose offsets are greater than or equal to
-    /// `offset_begin`.
+    /// Creates readers over rows in `view`. Append mode returns rows whose offsets are greater
+    /// than or equal to `offset_begin`. Primary-key mode ignores `offset_begin` and returns raw
+    /// prepared rows; Paimon applies offset filtering, projection, and merge-on-read adaptation.
     ///
-    /// Each output batch contains `_VALUE_KIND` first, followed by the fields requested by
-    /// `context.read_schema` except a duplicate `_VALUE_KIND`. Concatenating all returned readers
-    /// must produce every matching row once. Primary-key readers additionally provide a non-null
-    /// `_SEQUENCE_NUMBER` when requested, are individually sorted by primary key, and contain at
-    /// most one mutation per key. Assigned sequences remain stable across views and queries;
-    /// readers need not be globally sorted with one another. Paimon retains `view` for the lifetime
-    /// of the resulting framework reader.
+    /// Append-mode output batches contain `_VALUE_KIND` first, followed by requested fields except
+    /// a duplicate `_VALUE_KIND`; all returned append readers collectively cover every matching
+    /// row exactly once. Primary-key output batches use the prepared transport schema and may
+    /// contain multiple mutations per key. Each returned primary-key reader's complete stream is
+    /// sorted by full primary key then sequence number, and all readers collectively cover raw
+    /// mutations exactly once. Reader cardinality is independent of the number of writes. Paimon
+    /// retains `view` for the lifetime of the resulting framework reader.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
         const RealtimeQueryContext& context) = 0;

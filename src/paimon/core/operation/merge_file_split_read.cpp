@@ -81,8 +81,6 @@ class MergeFunctionWrapper;
 
 namespace {
 
-/// Concatenates merge readers whose key ranges are ordered and non-overlapping, preserving one
-/// projection pipeline without merging independent disk-only components.
 class ConcatNonOverlappingMergeReaders final : public SortMergeReader {
  public:
     explicit ConcatNonOverlappingMergeReaders(
@@ -117,7 +115,7 @@ class ConcatNonOverlappingMergeReaders final : public SortMergeReader {
     size_t current_ = 0;
 };
 
-}  // namespace
+}
 
 class MergeFileSplitRead::RealtimeReaderBuilder {
  public:
@@ -219,8 +217,8 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
         inputs_.reserve(inputs_.size() + additional_readers.size());
         for (AdditionalKeyValueReader& additional : additional_readers) {
             has_unknown_range_ |= !additional.min_key || !additional.max_key;
-            inputs_.push_back(RangeInput{additional.min_key, additional.max_key,
-                                         /*disk_runs=*/{}, std::move(additional.reader)});
+            inputs_.push_back(RangeInput{additional.min_key, additional.max_key, {},
+                                         std::move(additional.reader)});
         }
     }
 
@@ -310,7 +308,7 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
                         component.front().disk_runs, first_split_->Partition(), dv_factory_,
                         component.front().disk_runs.size() == 1 ? owner_->context_->GetPredicate()
                                                                 : owner_->predicate_for_keys_,
-                        data_file_path_factory_, /*drop_delete=*/false));
+                        data_file_path_factory_, false));
                 component_readers.push_back(std::move(disk_component));
                 continue;
             }
