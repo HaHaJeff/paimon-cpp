@@ -233,7 +233,7 @@ Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& 
         return Status::Invalid("real-time union read does not support data evolution");
     }
     if (!table_schema.PrimaryKeys().empty()) {
-        PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options));
+        PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options, table_schema));
     }
     if (context.IsStreamingMode()) {
         return Status::Invalid("real-time union read currently supports batch scans only");

@@ -38,6 +38,10 @@
 
 struct ArrowSchema;
 
+namespace arrow {
+class Schema;
+}  // namespace arrow
+
 namespace paimon {
 
 class RealtimeStore;
@@ -53,6 +57,12 @@ struct RealtimePartitionBucketView {
     RealtimePartitionBucket partition_bucket;
     std::shared_ptr<RealtimeStore> store;
     std::shared_ptr<RealtimeReadView> read_view;
+};
+
+struct RealtimeStoreRegistryEntry {
+    std::shared_ptr<RealtimeStore> store;
+    std::shared_ptr<arrow::Schema> write_schema;
+    RealtimeStoreCreateConfig mode_config;
 };
 
 class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
@@ -98,7 +108,7 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
     std::shared_ptr<RealtimeStoreFactory> factory_;
     std::mutex mutex_;
     std::mutex progress_mutex_;
-    std::map<RealtimePartitionBucket, std::shared_ptr<RealtimeStore>> stores_;
+    std::map<RealtimePartitionBucket, RealtimeStoreRegistryEntry> stores_;
     std::map<RealtimePartitionBucket, int64_t> materialized_max_sequence_numbers_;
     // Full-table progress used as the initial offset when a store is created lazily.
     RealtimeOffsetMap committed_offsets_;

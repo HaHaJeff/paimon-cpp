@@ -31,14 +31,16 @@ namespace paimon {
 
 class CoreOptions;
 class MemoryPool;
+class TableSchema;
 
-Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options);
+Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options, const TableSchema& schema);
 
 /// In-memory store for prepared primary-key real-time batches.
 class PrimaryKeyRealtimeStore final : public RealtimeStore {
  public:
     static Result<std::shared_ptr<PrimaryKeyRealtimeStore>> Create(
         const std::shared_ptr<arrow::Schema>& prepared_schema,
+        const std::vector<std::string>& trimmed_primary_keys,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
     ~PrimaryKeyRealtimeStore() override;

@@ -47,7 +47,10 @@ struct PAIMON_EXPORT AppendRealtimeStoreCreateConfig {
     StatisticsMode statistics_mode;
 };
 
-struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {};
+struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {
+    /// Primary-key fields after removing partition fields, in comparison order.
+    std::vector<std::string> trimmed_primary_keys;
+};
 
 using RealtimeStoreCreateConfig =
     std::variant<AppendRealtimeStoreCreateConfig, PrimaryKeyRealtimeStoreCreateConfig>;
@@ -148,7 +151,8 @@ class PAIMON_EXPORT RealtimeStore {
     /// including across `NextBatch` boundaries, is sorted by full primary key then sequence
     /// number; all readers collectively cover sealed mutations exactly once. Reader cardinality is
     /// independent of the number of writes. Paimon adapts and merges those rows before writing
-    /// files.
+    /// files. Paimon validates the complete ordering and coverage before publishing generated file
+    /// state; a violation fails the prepare operation.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) = 0;
 
@@ -168,7 +172,8 @@ class PAIMON_EXPORT RealtimeStore {
     /// contain multiple mutations per key. Each returned primary-key reader's complete stream is
     /// sorted by full primary key then sequence number, and all readers collectively cover raw
     /// mutations exactly once. Reader cardinality is independent of the number of writes. Paimon
-    /// retains `view` for the lifetime of the resulting framework reader.
+    /// validates ordering while adapting each complete reader stream and retains `view` for the
+    /// lifetime of the resulting framework reader.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
         const RealtimeQueryContext& context) = 0;

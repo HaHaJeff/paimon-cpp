@@ -95,7 +95,7 @@ class TrackingBatchReader : public BatchReader {
     int32_t* close_count_;
 };
 
-}
+}  // namespace
 
 class MergedKeyValueRecordReaderTest : public testing::Test {
  public:
@@ -229,8 +229,7 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderOffsetFilter) {
     ])")
             .ValueOrDie());
 
-    auto batch_reader =
-        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 2);
+    auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 2);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
         AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(2, 4),
@@ -248,77 +247,28 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderOffsetFilter) {
     KeyValueChecker::CheckResult(expected, results, 1, 2);
 }
 
-TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderRawCountBeforeDedup) {
-    std::vector<DataField> value_fields = {DataField(0, arrow::field("k0", arrow::int32())),
-                                           DataField(1, arrow::field("v0", arrow::int32()))};
+TEST_F(MergedKeyValueRecordReaderTest, TestRejectsUnsortedPluginRowsAcrossBatches) {
+    std::vector<DataField> value_fields = {DataField(0, arrow::field("id", arrow::int32()))};
     std::shared_ptr<arrow::Schema> value_schema =
         DataField::ConvertDataFieldsToArrowSchema(value_fields);
     std::shared_ptr<arrow::Schema> key_schema = arrow::schema({value_schema->field(0)});
     std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema(value_schema->fields());
     std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
-    auto prepared_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    std::shared_ptr<arrow::Array> prepared_array =
         arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([
-        [0, 10, 0, 1, 100],
-        [2, 11, 1, 1, 101],
-        [0, 12, 2, 2, 200]
-    ])")
-            .ValueOrDie());
-
-    int64_t raw_row_count = 0;
+            [0, 10, 0, 2],
+            [0, 11, 1, 1]
+        ])")
+            .ValueOrDie();
     auto batch_reader =
-        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 2);
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<KeyValueRecordReader> raw_reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, std::nullopt, key_schema,
-                                 value_schema, pool_, &raw_row_count));
-
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<FieldsComparator> key_comparator,
-                         FieldsComparator::Create({value_fields[0]}, true));
-    auto merged_reader = std::make_unique<MergedKeyValueRecordReader>(
-        std::move(raw_reader), key_comparator, merge_function_wrapper_);
-    ASSERT_OK_AND_ASSIGN(
-        std::vector<KeyValue> results,
-        (ReadResultCollector::CollectKeyValueResult<
-            MergedKeyValueRecordReader, KeyValueRecordReader::Iterator>(merged_reader.get())));
-
-    ASSERT_EQ(raw_row_count, 3);
-    std::vector<RowKind*> row_kinds = {const_cast<RowKind*>(RowKind::UpdateAfter()),
-                                       const_cast<RowKind*>(RowKind::Insert())};
-    std::vector<int64_t> levels = {KeyValue::UNKNOWN_LEVEL, KeyValue::UNKNOWN_LEVEL};
-    std::vector<KeyValue> expected = KeyValueChecker::GenerateKeyValues(
-        row_kinds, {11, 12}, levels, {{1}, {2}}, {{1, 101}, {2, 200}}, pool_);
-    KeyValueChecker::CheckResult(expected, results, 1, 2);
-}
-
-TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderRawCountBeforeFilter) {
-    std::vector<DataField> value_fields = {DataField(0, arrow::field("k0", arrow::int32()))};
-    std::shared_ptr<arrow::Schema> value_schema =
-        DataField::ConvertDataFieldsToArrowSchema(value_fields);
-    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema(value_schema->fields());
-    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
-    auto prepared_array = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([
-        [0, 10, 0, 1],
-        [0, 11, 1, 2],
-        [0, 12, 2, 3],
-        [0, 13, 3, 4]
-    ])")
-            .ValueOrDie());
-
-    int64_t raw_row_count = 0;
-    auto batch_reader =
-        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 2);
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(2, 4),
-                                 value_schema, value_schema, pool_, &raw_row_count));
-    ASSERT_OK_AND_ASSIGN(
-        std::vector<KeyValue> results,
-        (ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
-                                                    KeyValueRecordReader::Iterator>(reader.get())));
-
-    ASSERT_EQ(results.size(), 2);
-    ASSERT_EQ(raw_row_count, 4);
+        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, /*batch_size=*/1);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<KeyValueRecordReader> reader,
+                         AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema,
+                                                  std::nullopt, key_schema, value_schema, pool_));
+    Result<std::vector<KeyValue>> result =
+        ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
+                                                   KeyValueRecordReader::Iterator>(reader.get());
+    ASSERT_NOK_WITH_MSG(result, "not globally sorted by primary key and sequence number");
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {
@@ -345,8 +295,7 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {
     ASSERT_EQ(query_results[0].value->GetFieldCount(), 1);
     ASSERT_EQ(query_results[0].value->GetInt(0), 1);
 
-    auto batch_reader =
-        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
+    auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
     ASSERT_NOK_WITH_MSG(AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema,
                                                  std::nullopt, value_schema, value_schema, pool_),
                         "exact");
@@ -364,8 +313,7 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderSafeDecode) {
     auto invalid_array = std::dynamic_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(invalid_type, R"([[0, 10, 0, 1]])").ValueOrDie());
 
-    auto batch_reader =
-        std::make_unique<MockFileBatchReader>(invalid_array, invalid_type, 1);
+    auto batch_reader = std::make_unique<MockFileBatchReader>(invalid_array, invalid_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
         AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
@@ -398,9 +346,12 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedProjection) {
     std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
     auto prepared_array = std::dynamic_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([
-        [0, 10, 0, 1, [[100, 200], [300, 400]], [["k1", [7, 8]], ["k2", [9, 10]]], [[[11, 12], 13], [[21, 22], 23]]]
+        [0, 9, 9, 0, [[1, 2]], [["prefix", [3, 4]]], [[[5, 6], 7]]],
+        [0, 10, 0, 1, [[100, 200], [300, 400]], [["k1", [7, 8]], ["k2", [9, 10]]], [[[11, 12], 13], [[21, 22], 23]]],
+        [0, 11, 11, 2, [[8, 9]], [["suffix", [10, 11]]], [[[12, 13], 14]]]
     ])")
             .ValueOrDie());
+    prepared_array = checked_pointer_cast<arrow::StructArray>(prepared_array->Slice(1, 1));
 
     std::shared_ptr<arrow::Field> query_item_b = MakeField("renamed_b", arrow::int32(), 11);
     std::shared_ptr<arrow::Field> query_item_a = MakeField("renamed_a", arrow::int32(), 10);
@@ -420,8 +371,7 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedProjection) {
     std::shared_ptr<arrow::Schema> query_value_schema =
         arrow::schema({id, query_items, query_attrs, query_keyed_values});
 
-    auto batch_reader =
-        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
+    auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
         AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "arrow/type_fwd.h"
 #include "paimon/core/io/key_value_record_reader.h"
@@ -29,6 +30,7 @@
 
 namespace paimon {
 class BatchReader;
+class FieldsComparator;
 class MemoryPool;
 
 Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
@@ -36,6 +38,22 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
     const std::optional<OffsetRange>& visible_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<MemoryPool>& memory_pool, int64_t* raw_row_count = nullptr);
+    const std::shared_ptr<FieldsComparator>& key_comparator,
+    const std::shared_ptr<MemoryPool>& memory_pool);
 
-}
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBatchReaders(
+    std::vector<std::unique_ptr<BatchReader>>&& readers,
+    const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
+    const std::shared_ptr<arrow::Schema>& key_schema,
+    const std::shared_ptr<arrow::Schema>& value_schema,
+    const std::shared_ptr<FieldsComparator>& key_comparator,
+    const std::shared_ptr<MemoryPool>& memory_pool);
+
+Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
+    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
+    const std::optional<OffsetRange>& visible_offsets,
+    const std::shared_ptr<arrow::Schema>& key_schema,
+    const std::shared_ptr<arrow::Schema>& value_schema,
+    const std::shared_ptr<MemoryPool>& memory_pool);
+
+}  // namespace paimon

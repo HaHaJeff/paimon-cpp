@@ -44,10 +44,16 @@ class RealtimeReader final : public BatchReader {
     }
 
     Result<ReadBatch> NextBatch() override {
+        if (closed_) {
+            return MakeEofBatch();
+        }
         return reader_->NextBatch();
     }
 
     Result<ReadBatchWithBitmap> NextBatchWithBitmap() override {
+        if (closed_) {
+            return MakeEofBatchWithBitmap();
+        }
         return reader_->NextBatchWithBitmap();
     }
 
@@ -56,6 +62,10 @@ class RealtimeReader final : public BatchReader {
     }
 
     void Close() override {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
         reader_->Close();
         read_view_.reset();
     }
@@ -68,6 +78,7 @@ class RealtimeReader final : public BatchReader {
     // before releasing the data it references.
     std::shared_ptr<RealtimeReadView> read_view_;
     std::unique_ptr<BatchReader> reader_;
+    bool closed_ = false;
 };
 
 }  // namespace paimon

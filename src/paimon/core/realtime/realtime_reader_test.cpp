@@ -37,6 +37,8 @@ class TestingReadView : public RealtimeReadView {
 
 class TestingBatchReader : public BatchReader {
  public:
+    explicit TestingBatchReader(int32_t* close_count = nullptr) : close_count_(close_count) {}
+
     Result<ReadBatch> NextBatch() override {
         return MakeEofBatch();
     }
@@ -45,7 +47,14 @@ class TestingBatchReader : public BatchReader {
         return nullptr;
     }
 
-    void Close() override {}
+    void Close() override {
+        if (close_count_) {
+            ++(*close_count_);
+        }
+    }
+
+ private:
+    int32_t* close_count_;
 };
 
 TEST(RealtimeReaderTest, TestRejectsIncompleteReader) {
@@ -55,6 +64,22 @@ TEST(RealtimeReaderTest, TestRejectsIncompleteReader) {
     ASSERT_NOK_WITH_MSG(RealtimeReader::Create(std::make_shared<TestingReadView>(),
                                                /*reader=*/nullptr),
                         "inner reader is null");
+}
+
+TEST(RealtimeReaderTest, TestCloseIsIdempotentAndReturnsEof) {
+    int32_t close_count = 0;
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RealtimeReader> reader,
+        RealtimeReader::Create(std::make_shared<TestingReadView>(),
+                               std::make_unique<TestingBatchReader>(&close_count)));
+    reader->Close();
+    reader->Close();
+    ASSERT_EQ(1, close_count);
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatchWithBitmap batch_with_bitmap,
+                         reader->NextBatchWithBitmap());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch_with_bitmap));
 }
 
 }  // namespace

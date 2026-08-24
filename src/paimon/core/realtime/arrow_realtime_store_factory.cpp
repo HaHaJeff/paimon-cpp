@@ -50,8 +50,11 @@ Result<std::shared_ptr<RealtimeStore>> ArrowRealtimeStoreFactory::Create(
                                                     request.memory_pool, arrow_pool);
     }
 
+    const PrimaryKeyRealtimeStoreCreateConfig& config =
+        std::get<PrimaryKeyRealtimeStoreCreateConfig>(request.mode_config);
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                           PrimaryKeyRealtimeStore::Create(imported_schema, request.memory_pool));
+                           PrimaryKeyRealtimeStore::Create(
+                               imported_schema, config.trimmed_primary_keys, request.memory_pool));
     return std::shared_ptr<RealtimeStore>(std::move(store));
 }
 

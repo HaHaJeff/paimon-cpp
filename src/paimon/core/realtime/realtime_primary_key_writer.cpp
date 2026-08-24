@@ -266,15 +266,12 @@ Result<CommitIncrement> RealtimePrimaryKeyWriter::PrepareCommit(bool wait_compac
         return Status::Invalid("PK real-time store sealed a null segment");
     }
     std::optional<OffsetRange> sealed_range;
-    int64_t expected_raw_row_count = 0;
     if (segment) {
         sealed_range = segment.value()->GetOffsetRange();
-        if (sealed_range->begin < 0 || sealed_range->end < sealed_range->begin ||
-            __builtin_sub_overflow(sealed_range->end, sealed_range->begin,
-                                   &expected_raw_row_count)) {
+        if (sealed_range->begin < 0 || sealed_range->end < sealed_range->begin) {
             return Status::Invalid("PK real-time store returned an invalid sealed offset range");
         }
-        PAIMON_RETURN_NOT_OK(FlushSegment(segment.value(), expected_raw_row_count));
+        PAIMON_RETURN_NOT_OK(FlushSegment(segment.value(), sealed_range.value()));
     }
     PAIMON_ASSIGN_OR_RAISE(CommitIncrement increment,
                            merge_tree_writer_->PrepareCommit(wait_compaction));
@@ -285,7 +282,7 @@ Result<CommitIncrement> RealtimePrimaryKeyWriter::PrepareCommit(bool wait_compac
 }
 
 Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegmentHandle>& segment,
-                                              int64_t expected_raw_row_count) {
+                                              const OffsetRange& sealed_offsets) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                            realtime_store_->CreateCommitReaders(segment));
     ScopeGuard readers_guard([&readers]() {
@@ -295,28 +292,25 @@ Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegm
             }
         }
     });
-    int64_t raw_row_count = 0;
-    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
-    sorted_readers.reserve(readers.size());
-    for (std::unique_ptr<BatchReader>& reader : readers) {
+    for (const std::unique_ptr<BatchReader>& reader : readers) {
         if (!reader) {
             return Status::Invalid("PK real-time store returned a null commit reader");
         }
-        PAIMON_ASSIGN_OR_RAISE(
-            std::unique_ptr<KeyValueRecordReader> prepared_reader,
-            AdaptPreparedBatchReader(std::move(reader), prepared_schema_, std::nullopt, key_schema_,
-                                     write_schema_, memory_pool_, &raw_row_count));
+    }
+    PAIMON_ASSIGN_OR_RAISE(
+        std::vector<std::unique_ptr<KeyValueRecordReader>> prepared_readers,
+        AdaptPreparedCommitBatchReaders(std::move(readers), prepared_schema_, sealed_offsets,
+                                        key_schema_, write_schema_, key_comparator_, memory_pool_));
+    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
+    sorted_readers.reserve(prepared_readers.size());
+    for (std::unique_ptr<KeyValueRecordReader>& prepared_reader : prepared_readers) {
         auto merge_function = std::make_unique<DeduplicateMergeFunction>(/*ignore_delete=*/false);
         sorted_readers.push_back(std::make_unique<MergedKeyValueRecordReader>(
             std::move(prepared_reader), key_comparator_,
             std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function))));
     }
     readers_guard.Release();
-    PAIMON_RETURN_NOT_OK(merge_tree_writer_->WriteSortedReaders(std::move(sorted_readers)));
-    if (raw_row_count != expected_raw_row_count) {
-        return Status::Invalid("PK real-time store commit readers did not cover the sealed range");
-    }
-    return Status::OK();
+    return merge_tree_writer_->WriteSortedReaders(std::move(sorted_readers));
 }
 
 Status RealtimePrimaryKeyWriter::Compact(bool) {

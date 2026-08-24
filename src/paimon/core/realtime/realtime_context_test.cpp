@@ -96,10 +96,12 @@ class TestingRealtimeStoreFactory : public RealtimeStoreFactory {
     std::vector<std::shared_ptr<TestingRealtimeStore>> stores;
 };
 
-std::unique_ptr<ArrowSchema> MakeWriteSchema() {
+std::unique_ptr<ArrowSchema> MakeWriteSchema(
+    const std::shared_ptr<arrow::DataType>& id_type = arrow::int64(),
+    const std::shared_ptr<arrow::KeyValueMetadata>& metadata = nullptr) {
     auto schema = std::make_unique<ArrowSchema>();
     EXPECT_TRUE(
-        arrow::ExportSchema(*arrow::schema({arrow::field("id", arrow::int64())}), schema.get())
+        arrow::ExportSchema(*arrow::schema({arrow::field("id", id_type)}, metadata), schema.get())
             .ok());
     return schema;
 }
@@ -156,6 +158,27 @@ TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
     ASSERT_EQ(2, factory->stores[0]->acquire_count);
     ASSERT_EQ(1, factory->stores[1]->acquire_count);
     ASSERT_EQ(1, factory->stores[2]->acquire_count);
+}
+
+TEST(RealtimeContextTest, TestRejectsMismatchedSchemaOnStoreReuse) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+    std::shared_ptr<arrow::KeyValueMetadata> metadata =
+        arrow::key_value_metadata({"identity"}, {"v1"});
+    ASSERT_OK(GetOrCreateAppendStore(
+        context, partition, 0, MakeWriteSchema(arrow::int64(), metadata), {}, GetDefaultPool()));
+    ASSERT_NOK_WITH_MSG(
+        GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(arrow::int32(), metadata), {},
+                               GetDefaultPool()),
+        "schema or mode does not match");
+    ASSERT_NOK_WITH_MSG(
+        GetOrCreateAppendStore(
+            context, partition, 0,
+            MakeWriteSchema(arrow::int64(), arrow::key_value_metadata({"identity"}, {"v2"})), {},
+            GetDefaultPool()),
+        "schema or mode does not match");
+    ASSERT_EQ(1, factory->stores.size());
 }
 
 TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {

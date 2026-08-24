@@ -423,6 +423,208 @@ class SplitCommitReaderRealtimeStoreFactory final : public RealtimeStoreFactory 
     ArrowRealtimeStoreFactory delegate_;
 };
 
+class DropLastBatchReader final : public BatchReader {
+ public:
+    explicit DropLastBatchReader(std::unique_ptr<BatchReader> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    Result<ReadBatch> NextBatch() override {
+        if (!buffered_.has_value()) {
+            PAIMON_ASSIGN_OR_RAISE(ReadBatch first, delegate_->NextBatch());
+            if (BatchReader::IsEofBatch(first)) {
+                return MakeEofBatch();
+            }
+            buffered_ = std::move(first);
+        }
+        PAIMON_ASSIGN_OR_RAISE(ReadBatch next, delegate_->NextBatch());
+        if (BatchReader::IsEofBatch(next)) {
+            buffered_.reset();
+            return MakeEofBatch();
+        }
+        ReadBatch result = std::move(buffered_.value());
+        buffered_ = std::move(next);
+        return result;
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return delegate_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        buffered_.reset();
+        delegate_->Close();
+    }
+
+ private:
+    std::unique_ptr<BatchReader> delegate_;
+    std::optional<ReadBatch> buffered_;
+};
+
+class SwapFirstTwoBatchReader final : public BatchReader {
+ public:
+    explicit SwapFirstTwoBatchReader(std::unique_ptr<BatchReader> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    Result<ReadBatch> NextBatch() override {
+        if (!initialized_) {
+            initialized_ = true;
+            PAIMON_ASSIGN_OR_RAISE(ReadBatch first, delegate_->NextBatch());
+            if (BatchReader::IsEofBatch(first)) {
+                return MakeEofBatch();
+            }
+            PAIMON_ASSIGN_OR_RAISE(ReadBatch second, delegate_->NextBatch());
+            if (BatchReader::IsEofBatch(second)) {
+                return first;
+            }
+            first_ = std::move(first);
+            return second;
+        }
+        if (first_.has_value()) {
+            ReadBatch first = std::move(first_.value());
+            first_.reset();
+            return first;
+        }
+        return delegate_->NextBatch();
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return delegate_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        first_.reset();
+        delegate_->Close();
+    }
+
+ private:
+    bool initialized_ = false;
+    std::unique_ptr<BatchReader> delegate_;
+    std::optional<ReadBatch> first_;
+};
+
+class SubstituteOffsetBatchReader final : public BatchReader {
+ public:
+    explicit SubstituteOffsetBatchReader(std::unique_ptr<BatchReader> delegate)
+        : delegate_(std::move(delegate)) {}
+
+    Result<ReadBatch> NextBatch() override {
+        PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            return batch;
+        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            std::shared_ptr<arrow::Array> array,
+            arrow::ImportArray(batch.first.get(), batch.second.get()));
+        if (!array || array->type_id() != arrow::Type::STRUCT || array->length() == 0) {
+            return Status::Invalid("offset substitution requires a non-empty struct batch");
+        }
+        std::shared_ptr<arrow::StructArray> struct_array =
+            std::dynamic_pointer_cast<arrow::StructArray>(array);
+        std::shared_ptr<arrow::Int64Array> offsets =
+            std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(2));
+        if (!offsets) {
+            return Status::Invalid("offset substitution requires an int64 REALTIME_OFFSET");
+        }
+        arrow::Int64Builder builder;
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Reserve(offsets->length()));
+        for (int64_t row = 0; row < offsets->length(); ++row) {
+            builder.UnsafeAppend(0);
+        }
+        std::shared_ptr<arrow::Array> substituted_offsets;
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Finish(&substituted_offsets));
+        std::shared_ptr<arrow::ArrayData> substituted_data = struct_array->data()->Copy();
+        substituted_data->child_data[2] = substituted_offsets->data();
+        std::shared_ptr<arrow::Array> substituted = arrow::MakeArray(std::move(substituted_data));
+        auto output = std::make_unique<ArrowArray>();
+        auto schema = std::make_unique<ArrowSchema>();
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(
+            arrow::ExportArray(*substituted, output.get(), schema.get()));
+        return ReadBatch(std::move(output), std::move(schema));
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return delegate_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        delegate_->Close();
+    }
+
+ private:
+    std::unique_ptr<BatchReader> delegate_;
+};
+
+enum class CommitReaderMalformation { DROP_LAST, UNSORTED, SUBSTITUTE_OFFSET };
+
+class MalformedCoverageRealtimeStore final : public RealtimeStore {
+ public:
+    MalformedCoverageRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
+                                   CommitReaderMalformation malformation)
+        : delegate_(delegate), malformation_(malformation) {}
+
+    Status Write(RealtimeWriteBatch&& batch) override {
+        return delegate_->Write(std::move(batch));
+    }
+    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
+        return delegate_->SealForCommit();
+    }
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
+        const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
+        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
+                               delegate_->CreateCommitReaders(segment));
+        for (std::unique_ptr<BatchReader>& reader : readers) {
+            switch (malformation_) {
+                case CommitReaderMalformation::DROP_LAST:
+                    reader = std::make_unique<DropLastBatchReader>(std::move(reader));
+                    break;
+                case CommitReaderMalformation::UNSORTED:
+                    reader = std::make_unique<SwapFirstTwoBatchReader>(std::move(reader));
+                    break;
+                case CommitReaderMalformation::SUBSTITUTE_OFFSET:
+                    reader = std::make_unique<SubstituteOffsetBatchReader>(std::move(reader));
+                    break;
+            }
+        }
+        return readers;
+    }
+    Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
+        return delegate_->AcquireReadView();
+    }
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
+        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
+        const RealtimeQueryContext& context) override {
+        return delegate_->CreateQueryReaders(view, offset_begin, context);
+    }
+    Status AdvanceCommittedOffset(int64_t committed_offset) override {
+        return delegate_->AdvanceCommittedOffset(committed_offset);
+    }
+    uint64_t GetMemoryUsage() const override {
+        return delegate_->GetMemoryUsage();
+    }
+
+ private:
+    std::shared_ptr<RealtimeStore> delegate_;
+    CommitReaderMalformation malformation_;
+};
+
+class MalformedCoverageRealtimeStoreFactory final : public RealtimeStoreFactory {
+ public:
+    explicit MalformedCoverageRealtimeStoreFactory(
+        CommitReaderMalformation malformation = CommitReaderMalformation::DROP_LAST)
+        : malformation_(malformation) {}
+
+    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
+                               delegate_.Create(std::move(request)));
+        return std::shared_ptr<RealtimeStore>(
+            std::make_shared<MalformedCoverageRealtimeStore>(delegate, malformation_));
+    }
+
+ private:
+    ArrowRealtimeStoreFactory delegate_;
+    CommitReaderMalformation malformation_;
+};
+
 }  // namespace
 
 namespace {
@@ -1312,6 +1514,50 @@ TEST_F(RealtimeWriteInteTest, TestPkRead) {
     ASSERT_TRUE(query_view->expired());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkDeleteInsertAndPinnedReadsAcrossRefresh) {
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> delete_batch,
+                         MakeBatch({Row{1, "deleted", "p0"}}, /*partitioned=*/false, /*bucket=*/0,
+                                   {RecordBatch::RowKind::DELETE}));
+    ASSERT_OK(writer->Write(std::move(delete_batch)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> insert_batch,
+                         MakeBatch({Row{1, "inserted", "p0"}}, /*partitioned=*/false, /*bucket=*/0,
+                                   {RecordBatch::RowKind::INSERT}));
+    ASSERT_OK(writer->Write(std::move(insert_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                         writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, progress.size());
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> pinned_plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> reader_plan,
+                         CreatePlan(realtime_context, /*predicate=*/nullptr));
+    ReadContextBuilder read_builder(table_path_);
+    read_builder.SetOptions(options_)
+        .SetReadFieldNames({"id", "payload", "pt"})
+        .WithRealtimeContext(realtime_context)
+        .WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
+                         TableRead::Create(std::move(read_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> pinned_reader,
+                         table_read->CreateReader(reader_plan->Splits()));
+
+    ASSERT_OK_AND_ASSIGN(int64_t snapshot_id, Commit(progress, /*commit_identifier=*/0));
+    ASSERT_OK(writer->RefreshCommittedSnapshot(snapshot_id));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> plan_rows, ReadRows(pinned_plan, realtime_context));
+    ASSERT_EQ((std::vector<Row>{{1, "inserted", "p0"}}), plan_rows);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> reader_rows,
+                         ReadResultCollector::CollectResult(pinned_reader.get()));
+    ASSERT_EQ(1, reader_rows->length());
+    ASSERT_OK(writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkMergeDiskSealedAndActive) {
     options_[Options::READ_BATCH_SIZE] = "2";
     CreatePkTable();
@@ -1903,6 +2149,56 @@ TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
     ASSERT_OK(writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkRejectsMalformedCoverage) {
+    CreatePkTable();
+    auto factory = std::make_shared<MalformedCoverageRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
+                        "commit readers did not cover the sealed range");
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRejectsEqualCardinalityOffsetSubstitution) {
+    CreatePkTable();
+    auto factory = std::make_shared<MalformedCoverageRealtimeStoreFactory>(
+        CommitReaderMalformation::SUBSTITUTE_OFFSET);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
+                        "duplicate REALTIME_OFFSET");
+    ASSERT_OK(writer->Close());
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRejectsUnsortedPluginRows) {
+    CreatePkTable();
+    auto factory =
+        std::make_shared<MalformedCoverageRealtimeStoreFactory>(CommitReaderMalformation::UNSORTED);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
+                        "not globally sorted by primary key and sequence number");
+    ASSERT_OK(writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
     CreatePkTable();
     auto state = std::make_shared<CloseTrackingReaderState>();
@@ -1973,10 +2269,10 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderCloseFailure) {
         return table_read->CreateReader(plan->Splits());
     };
 
-    for (int32_t null_index = 0; null_index <= 2; ++null_index) {
+    for (int32_t null_index = 0; null_index <= 1; ++null_index) {
         state->query_null_index = null_index;
         ASSERT_NOK_WITH_MSG(create_reader(), "PK real-time store returned a null query reader");
-        ASSERT_EQ(2 * (null_index + 1), state->query_close_count->load(std::memory_order_acquire));
+        ASSERT_EQ(null_index + 1, state->query_close_count->load(std::memory_order_acquire));
     }
     ASSERT_OK(writer->Close());
 }
