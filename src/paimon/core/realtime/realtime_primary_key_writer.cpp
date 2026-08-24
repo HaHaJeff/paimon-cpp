@@ -138,13 +138,16 @@ Result<std::shared_ptr<arrow::StructArray>> PrepareBatch(
 }  // namespace
 
 Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Create(
+    const std::map<std::string, std::string>& partition, int32_t bucket,
     const std::shared_ptr<arrow::Schema>& write_schema,
     const std::vector<std::string>& trimmed_primary_keys,
-    const std::shared_ptr<FieldsComparator>& key_comparator, const RealtimeStoreState& store_state,
-    int64_t restored_max_sequence_number, const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
+    const std::shared_ptr<FieldsComparator>& key_comparator,
+    const std::shared_ptr<RealtimeContextImpl>& realtime_context,
+    const RealtimeStoreState& store_state, int64_t restored_max_sequence_number,
+    const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     if (!store_state.store || !merge_tree_writer || !write_schema || !key_comparator ||
-        !memory_pool) {
+        !realtime_context || !memory_pool) {
         return Status::Invalid("PK real-time writer received a null dependency");
     }
     if (trimmed_primary_keys.empty()) {
@@ -170,16 +173,22 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
         DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false)};
     prepared_fields.insert(prepared_fields.end(), write_schema->fields().begin(),
                            write_schema->fields().end());
+    const RealtimePartitionBucket partition_bucket(partition, bucket);
+    const int64_t initial_max_sequence_number =
+        realtime_context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
+                                                               restored_max_sequence_number);
     return std::shared_ptr<RealtimePrimaryKeyWriter>(new RealtimePrimaryKeyWriter(
-        store_state.store, merge_tree_writer, write_schema,
+        store_state.store, merge_tree_writer, realtime_context, partition_bucket, write_schema,
         arrow::schema(std::move(prepared_fields)), arrow::schema(std::move(key_fields)),
         trimmed_primary_keys, key_comparator, store_state.initial_offset,
-        restored_max_sequence_number, memory_pool));
+        initial_max_sequence_number, memory_pool));
 }
 
 RealtimePrimaryKeyWriter::RealtimePrimaryKeyWriter(
     const std::shared_ptr<RealtimeStore>& realtime_store,
     const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
+    const std::shared_ptr<RealtimeContextImpl>& realtime_context,
+    const RealtimePartitionBucket& partition_bucket,
     const std::shared_ptr<arrow::Schema>& write_schema,
     const std::shared_ptr<arrow::Schema>& prepared_schema,
     const std::shared_ptr<arrow::Schema>& key_schema,
@@ -190,6 +199,8 @@ RealtimePrimaryKeyWriter::RealtimePrimaryKeyWriter(
       arrow_pool_(GetArrowPool(memory_pool)),
       realtime_store_(realtime_store),
       merge_tree_writer_(merge_tree_writer),
+      realtime_context_(realtime_context),
+      partition_bucket_(partition_bucket),
       write_schema_(write_schema),
       prepared_schema_(prepared_schema),
       key_schema_(key_schema),
@@ -237,6 +248,8 @@ Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
         std::move(prepared_batch), OffsetRange(next_offset_, next_offset_ + count)}));
     next_offset_ += count;
     last_sequence_number_ += count;
+    realtime_context_->AdvanceMaterializedMaxSequenceNumber(partition_bucket_,
+                                                            last_sequence_number_);
     return Status::OK();
 }
 

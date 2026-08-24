@@ -175,9 +175,9 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     if (!realtime_context_) {
         return std::shared_ptr<BatchWriter>(std::move(writer));
     }
-    return RealtimePrimaryKeyWriter::Create(schema_, trimmed_primary_keys, key_comparator_,
-                                            realtime_store_state.value(), restore_max_seq_number,
-                                            writer, pool_);
+    return RealtimePrimaryKeyWriter::Create(
+        partition_map, bucket, schema_, trimmed_primary_keys, key_comparator_,
+        realtime_context_impl, realtime_store_state.value(), restore_max_seq_number, writer, pool_);
 }
 
 Status KeyValueFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {

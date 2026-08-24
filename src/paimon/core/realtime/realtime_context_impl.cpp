@@ -130,6 +130,17 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     return RealtimeStoreState{std::move(store), initial_offset};
 }
 
+int64_t RealtimeContextImpl::AdvanceMaterializedMaxSequenceNumber(
+    const RealtimePartitionBucket& partition_bucket, int64_t max_sequence_number) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto [iter, inserted] =
+        materialized_max_sequence_numbers_.emplace(partition_bucket, max_sequence_number);
+    if (!inserted && max_sequence_number > iter->second) {
+        iter->second = max_sequence_number;
+    }
+    return iter->second;
+}
+
 Result<std::vector<RealtimePartitionBucketView>> RealtimeContextImpl::AcquireReadViews() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<RealtimePartitionBucketView> result;

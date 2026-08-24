@@ -1526,6 +1526,51 @@ TEST_F(RealtimeWriteInteTest, TestPkCompositeMerge) {
     ASSERT_OK(writer->Close());
 }
 
+TEST_F(RealtimeWriteInteTest, TestPkWriterHandoff) {
+    CreatePkTable();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> first_writer,
+                         CreateRealtimeWriter(realtime_context));
+    const std::vector<Row> first_rows = {
+        {0, "value-0", "p0"}, {1, "value-1", "p0"}, {2, "value-2", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
+                         MakeBatch(first_rows, /*partitioned=*/false));
+    ASSERT_OK(first_writer->Write(std::move(first_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> first_progress,
+                         first_writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
+    ASSERT_EQ(1, first_progress.size());
+    ASSERT_EQ(OffsetRange(0, 3), first_progress[0].offset_range);
+    ASSERT_EQ(1, NewFiles(first_progress).size());
+    ASSERT_EQ(0, NewFiles(first_progress)[0]->min_sequence_number);
+    ASSERT_EQ(2, NewFiles(first_progress)[0]->max_sequence_number);
+    ASSERT_OK(first_writer->Close());
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> second_writer,
+                         CreateRealtimeWriter(realtime_context));
+    const std::vector<Row> second_rows = {{0, "updated-0", "p0"}, {3, "value-3", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
+                         MakeBatch(second_rows, /*partitioned=*/false));
+    ASSERT_OK(second_writer->Write(std::move(second_batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> second_progress,
+                         second_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_EQ(1, second_progress.size());
+    ASSERT_EQ(OffsetRange(3, 5), second_progress[0].offset_range);
+    ASSERT_EQ(1, NewFiles(second_progress).size());
+    ASSERT_EQ(3, NewFiles(second_progress)[0]->min_sequence_number);
+    ASSERT_EQ(4, NewFiles(second_progress)[0]->max_sequence_number);
+
+    first_progress.push_back(std::move(second_progress[0]));
+    ASSERT_OK(Commit(first_progress, /*commit_identifier=*/1));
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(realtime_context));
+    ASSERT_EQ((std::vector<Row>{{0, "updated-0", "p0"},
+                                {1, "value-1", "p0"},
+                                {2, "value-2", "p0"},
+                                {3, "value-3", "p0"}}),
+              actual_rows);
+    ASSERT_OK(second_writer->Close());
+}
+
 TEST_F(RealtimeWriteInteTest, TestPkPartitionBucketRecovery) {
     options_[Options::BUCKET] = "2";
     CreatePkTable(/*partition_keys=*/{"pt"});

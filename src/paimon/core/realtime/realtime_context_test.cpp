@@ -158,6 +158,22 @@ TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
     ASSERT_EQ(1, factory->stores[2]->acquire_count);
 }
 
+TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+    const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/0);
+
+    ASSERT_EQ(4, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
+                                                               /*max_sequence_number=*/4));
+    ASSERT_EQ(8, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
+                                                               /*max_sequence_number=*/8));
+    ASSERT_EQ(8, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
+                                                               /*max_sequence_number=*/6));
+    ASSERT_EQ(10, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
+                                                                /*max_sequence_number=*/10));
+}
+
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));

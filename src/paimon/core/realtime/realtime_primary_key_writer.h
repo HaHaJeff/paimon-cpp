@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "paimon/core/utils/batch_writer.h"
+#include "paimon/realtime/realtime_context.h"
 #include "paimon/realtime/realtime_store.h"
 
 namespace arrow {
@@ -38,16 +39,19 @@ namespace paimon {
 class MemoryPool;
 class MergeTreeWriter;
 class FieldsComparator;
+class RealtimeContextImpl;
 struct RealtimeStoreState;
 
 /// Coordinates framework-prepared primary-key real-time writes.
 class RealtimePrimaryKeyWriter final : public BatchWriter {
  public:
     static Result<std::shared_ptr<RealtimePrimaryKeyWriter>> Create(
+        const std::map<std::string, std::string>& partition, int32_t bucket,
         const std::shared_ptr<arrow::Schema>& write_schema,
         const std::vector<std::string>& trimmed_primary_keys,
         const std::shared_ptr<FieldsComparator>& key_comparator,
-        const RealtimeStoreState& store_state, int64_t restore_max_sequence_number,
+        const std::shared_ptr<RealtimeContextImpl>& realtime_context,
+        const RealtimeStoreState& store_state, int64_t restored_max_sequence_number,
         const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
@@ -64,6 +68,8 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
  private:
     RealtimePrimaryKeyWriter(const std::shared_ptr<RealtimeStore>& realtime_store,
                              const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
+                             const std::shared_ptr<RealtimeContextImpl>& realtime_context,
+                             const RealtimePartitionBucket& partition_bucket,
                              const std::shared_ptr<arrow::Schema>& write_schema,
                              const std::shared_ptr<arrow::Schema>& prepared_schema,
                              const std::shared_ptr<arrow::Schema>& key_schema,
@@ -79,6 +85,8 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     std::shared_ptr<RealtimeStore> realtime_store_;
     std::shared_ptr<MergeTreeWriter> merge_tree_writer_;
+    std::shared_ptr<RealtimeContextImpl> realtime_context_;
+    RealtimePartitionBucket partition_bucket_;
     std::shared_ptr<arrow::Schema> write_schema_;
     std::shared_ptr<arrow::Schema> prepared_schema_;
     std::shared_ptr<arrow::Schema> key_schema_;

@@ -67,6 +67,9 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
 
     Result<RealtimeStoreState> GetOrCreateRealtimeStore(RealtimeStoreCreateRequest&& request);
 
+    int64_t AdvanceMaterializedMaxSequenceNumber(const RealtimePartitionBucket& partition_bucket,
+                                                 int64_t max_sequence_number);
+
     Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews();
 
     Result<std::string> PinReadView(const RealtimePartitionBucketView& view, int64_t ttl_millis);
@@ -96,6 +99,7 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
     std::mutex mutex_;
     std::mutex progress_mutex_;
     std::map<RealtimePartitionBucket, std::shared_ptr<RealtimeStore>> stores_;
+    std::map<RealtimePartitionBucket, int64_t> materialized_max_sequence_numbers_;
     // Full-table progress used as the initial offset when a store is created lazily.
     RealtimeOffsetMap committed_offsets_;
     // Progress already reflected in stores owned by this context.
