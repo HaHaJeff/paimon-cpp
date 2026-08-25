@@ -225,7 +225,7 @@ class ReadView final : public RealtimeReadView {
 class StoredBatchReader final : public BatchReader {
  public:
     explicit StoredBatchReader(const StoredBatch& batch,
-                               std::shared_ptr<arrow::MemoryPool> arrow_pool = nullptr)
+                               std::shared_ptr<arrow::MemoryPool> arrow_pool)
         : arrow_pool_(std::move(arrow_pool)),
           data_(batch.data),
           metrics_(std::make_shared<MetricsImpl>()) {}
@@ -240,10 +240,15 @@ class StoredBatchReader final : public BatchReader {
             ArrowArrayRelease(array_ptr);
             ArrowSchemaRelease(schema_ptr);
         });
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*data_, array.get(), schema.get()));
-        if (arrow_pool_) {
-            PAIMON_RETURN_NOT_OK(RetainArrowArrayMemoryPool(array.get(), arrow_pool_));
-        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            std::shared_ptr<arrow::RecordBatch> record_batch,
+            arrow::RecordBatch::FromStructArray(data_, arrow_pool_.get()));
+        PAIMON_ASSIGN_OR_RAISE(
+            std::shared_ptr<arrow::RecordBatch> normalized_batch,
+            ArrowUtils::NormalizeRecordBatchOffsets(record_batch, arrow_pool_.get()));
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(
+            arrow::ExportRecordBatch(*normalized_batch, array.get(), schema.get()));
+        PAIMON_RETURN_NOT_OK(RetainArrowArrayMemoryPool(array.get(), arrow_pool_));
         data_.reset();
         arrow_pool_.reset();
         export_guard.Release();
@@ -321,7 +326,7 @@ class PrimaryKeyRealtimeStore::Impl {
         std::vector<std::unique_ptr<BatchReader>> readers;
         readers.reserve(segment->Batches().size());
         for (const StoredBatch& batch : segment->Batches()) {
-            readers.push_back(std::make_unique<StoredBatchReader>(batch));
+            readers.push_back(std::make_unique<StoredBatchReader>(batch, arrow_pool_));
         }
         return readers;
     }
@@ -360,8 +365,7 @@ class PrimaryKeyRealtimeStore::Impl {
                                           arrow_pool_.get()));
                 StoredBatch query_batch{checked_pointer_cast<arrow::StructArray>(projected.array),
                                         batch.offset_range, /*memory_usage=*/0};
-                readers.push_back(std::make_unique<StoredBatchReader>(
-                    query_batch, projected.uses_arrow_pool ? arrow_pool_ : nullptr));
+                readers.push_back(std::make_unique<StoredBatchReader>(query_batch, arrow_pool_));
             }
         }
         return readers;

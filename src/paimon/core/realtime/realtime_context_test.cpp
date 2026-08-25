@@ -56,6 +56,9 @@ class TestingRealtimeStore : public RealtimeStore {
     }
     Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
         ++acquire_count;
+        if (return_null_read_view) {
+            return std::shared_ptr<RealtimeReadView>();
+        }
         return std::make_shared<TestingReadView>();
     }
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
@@ -78,6 +81,7 @@ class TestingRealtimeStore : public RealtimeStore {
     int32_t acquire_count = 0;
     int32_t advance_count = 0;
     bool fail_next_advance = false;
+    bool return_null_read_view = false;
     std::vector<int64_t> committed_offsets;
 };
 
@@ -88,11 +92,15 @@ class TestingRealtimeStoreFactory : public RealtimeStoreFactory {
             return Status::Invalid("testing write schema is null");
         }
         ArrowSchemaRelease(request.write_schema.get());
+        if (return_null_store) {
+            return std::shared_ptr<RealtimeStore>();
+        }
         auto store = std::make_shared<TestingRealtimeStore>();
         stores.push_back(store);
         return store;
     }
 
+    bool return_null_store = false;
     std::vector<std::shared_ptr<TestingRealtimeStore>> stores;
 };
 
@@ -419,6 +427,21 @@ TEST(RealtimeContextTest, TestExpiresAbandonedReadViewTicket) {
 TEST(RealtimeContextTest, TestRejectsNullFactory) {
     ASSERT_NOK_WITH_MSG(RealtimeContext::Create(/*factory=*/nullptr),
                         "real-time store factory is null");
+}
+
+TEST(RealtimeContextTest, TestRejectsNullPluginResults) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    factory->return_null_store = true;
+    ASSERT_NOK_WITH_MSG(GetOrCreateAppendStore(context, /*partition=*/{}, /*bucket=*/0,
+                                               MakeWriteSchema(), {}, GetDefaultPool()),
+                        "real-time store factory returned a null store");
+
+    factory->return_null_store = false;
+    ASSERT_OK(GetOrCreateAppendStore(context, /*partition=*/{}, /*bucket=*/0, MakeWriteSchema(), {},
+                                     GetDefaultPool()));
+    factory->stores[0]->return_null_read_view = true;
+    ASSERT_NOK_WITH_MSG(context->AcquireReadViews(), "real-time store returned a null read view");
 }
 
 }  // namespace

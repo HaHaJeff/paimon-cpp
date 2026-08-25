@@ -255,12 +255,45 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderPerStoredBatch) {
     }
 }
 
-TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderExportsZeroOffsets) {
+void AssertSlicedBatch(BatchReader* reader) {
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader->NextBatch());
+    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
+    ASSERT_EQ(2, batch.first->length);
+    AssertOffsetsZero(batch.first.get());
+    arrow::Result<std::shared_ptr<arrow::Array>> import_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(import_result.ok()) << import_result.status().ToString();
+    std::shared_ptr<arrow::Array> array = std::move(import_result).ValueOrDie();
+    std::shared_ptr<arrow::StructArray> values = checked_pointer_cast<arrow::StructArray>(array);
+    ASSERT_EQ(2, checked_pointer_cast<arrow::Int64Array>(values->field(3))->Value(0));
+    ASSERT_EQ(3, checked_pointer_cast<arrow::Int64Array>(values->field(3))->Value(1));
+    std::shared_ptr<arrow::StructArray> nested =
+        checked_pointer_cast<arrow::StructArray>(values->field(4));
+    ASSERT_EQ("two", checked_pointer_cast<arrow::StringArray>(nested->field(0))->GetString(0));
+    ASSERT_EQ("three", checked_pointer_cast<arrow::StringArray>(nested->field(0))->GetString(1));
+    std::shared_ptr<arrow::ListArray> items =
+        checked_pointer_cast<arrow::ListArray>(nested->field(1));
+    std::shared_ptr<arrow::Int32Array> first_items =
+        checked_pointer_cast<arrow::Int32Array>(items->value_slice(0));
+    ASSERT_EQ(3, first_items->Value(0));
+    ASSERT_EQ(4, first_items->Value(1));
+    std::shared_ptr<arrow::Int32Array> second_items =
+        checked_pointer_cast<arrow::Int32Array>(items->value_slice(1));
+    ASSERT_EQ(5, second_items->Value(0));
+    ASSERT_EQ(6, second_items->Value(1));
+    ASSERT_OK_AND_ASSIGN(batch, reader->NextBatch());
+    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+}
+
+TEST(PrimaryKeyRealtimeStoreTest, TestSlicedReadersExportZeroOffsets) {
     std::shared_ptr<arrow::Schema> schema = NestedPreparedSchema();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
                          PrimaryKeyRealtimeStore::Create(schema, GetDefaultPool()));
     ASSERT_OK(store->Write(RealtimeWriteBatch{
-        MakeBatch(schema, R"([[0, 1, 0, 1, ["one", [1, 2]]], [0, 2, 1, 2, ["two", [3, 4]]]])"),
+        MakeSlicedBatch(
+            schema,
+            R"([[0, 1, 0, 1, ["one", [1, 2]]], [0, 2, 1, 2, ["two", [3, 4]]], [0, 3, 2, 3, ["three", [5, 6]]], [0, 4, 3, 4, ["four", [7, 8]]]])",
+            1, 2),
         OffsetRange(0, 2)}));
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
                          store->SealForCommit());
@@ -268,13 +301,16 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderExportsZeroOffsets) {
     ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
                          store->CreateCommitReaders(segment.value()));
     ASSERT_EQ(1, readers.size());
-    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
-    ASSERT_FALSE(BatchReader::IsEofBatch(batch));
-    ASSERT_EQ(2, batch.first->length);
-    AssertOffsetsZero(batch.first.get());
-    ASSERT_TRUE(arrow::ImportArray(batch.first.get(), batch.second.get()).ok());
-    ASSERT_OK_AND_ASSIGN(batch, readers[0]->NextBatch());
-    ASSERT_TRUE(BatchReader::IsEofBatch(batch));
+    AssertSlicedBatch(readers[0].get());
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
+    auto c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*schema, c_schema.get()).ok());
+    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
+                                 /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(readers, store->CreateQueryReaders(view, /*offset_begin=*/0, context));
+    ASSERT_EQ(1, readers.size());
+    AssertSlicedBatch(readers[0].get());
 }
 
 TEST(PrimaryKeyRealtimeStoreTest, TestCloseUnreadBatchReaders) {

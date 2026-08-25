@@ -150,6 +150,9 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     RealtimeStoreMode mode = request.mode;
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store,
                            factory_->Create(std::move(request)));
+    if (!store) {
+        return Status::Invalid("real-time store factory returned a null store");
+    }
     stores_.emplace(partition_bucket, StoreEntry{store, requested_schema, mode});
     if (offset_iter != committed_offsets_.end()) {
         reclaimed_offsets_.emplace(partition_bucket, offset_iter->second);
@@ -180,6 +183,9 @@ Result<std::vector<RealtimePartitionBucketView>> RealtimeContextImpl::AcquireRea
     for (const auto& [partition_bucket, store] : stores_) {
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeReadView> read_view,
                                store.store->AcquireReadView());
+        if (!read_view) {
+            return Status::Invalid("real-time store returned a null read view");
+        }
         result.push_back(
             RealtimePartitionBucketView{partition_bucket, store.store, std::move(read_view)});
     }
