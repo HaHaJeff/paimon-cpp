@@ -47,10 +47,7 @@ struct PAIMON_EXPORT AppendRealtimeStoreCreateConfig {
     StatisticsMode statistics_mode;
 };
 
-struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {
-    /// Primary-key fields after removing partition fields, in comparison order.
-    std::vector<std::string> trimmed_primary_keys;
-};
+struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {};
 
 using RealtimeStoreCreateConfig =
     std::variant<AppendRealtimeStoreCreateConfig, PrimaryKeyRealtimeStoreCreateConfig>;

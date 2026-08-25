@@ -154,7 +154,7 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
             RealtimeStoreState store_state,
             realtime_context_impl->GetOrCreateRealtimeStore(RealtimeStoreCreateRequest{
                 std::move(c_write_schema), options_.ToMap(), pool_, partition_map, bucket,
-                PrimaryKeyRealtimeStoreCreateConfig{trimmed_primary_keys}}));
+                PrimaryKeyRealtimeStoreCreateConfig{}}));
         realtime_store_state = std::move(store_state);
         compact_manager = std::make_shared<NoopCompactManager>();
     } else {

@@ -49,14 +49,7 @@ namespace paimon {
 namespace {
 
 bool SameMode(const RealtimeStoreCreateConfig& left, const RealtimeStoreCreateConfig& right) {
-    if (left.index() != right.index()) {
-        return false;
-    }
-    if (const auto* left_pk = std::get_if<PrimaryKeyRealtimeStoreCreateConfig>(&left)) {
-        const auto& right_pk = std::get<PrimaryKeyRealtimeStoreCreateConfig>(right);
-        return left_pk->trimmed_primary_keys == right_pk.trimmed_primary_keys;
-    }
-    return true;
+    return left.index() == right.index();
 }
 
 std::string PartitionToString(const std::map<std::string, std::string>& partition) {

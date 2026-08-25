@@ -18,25 +18,17 @@
 
 #include "paimon/core/realtime/primary_key_realtime_store.h"
 
-#include <cstddef>
 #include <mutex>
 #include <optional>
-#include <queue>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
-#include "arrow/compute/api.h"
-#include "paimon/common/data/columnar/columnar_batch_context.h"
-#include "paimon/common/data/columnar/columnar_row_ref.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/types/data_field.h"
-#include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
-#include "paimon/common/utils/fields_comparator.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/index/pk/primary_key_index_definitions.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
@@ -155,116 +147,19 @@ class ReadView final : public RealtimeReadView {
     std::optional<OffsetRange> range_;
 };
 
-class RawBatchReader final : public BatchReader {
+class StoredBatchReader final : public BatchReader {
  public:
-    RawBatchReader(std::vector<StoredBatch> batches, std::vector<int32_t> key_field_indexes,
-                   const std::shared_ptr<FieldsComparator>& key_comparator,
-                   const std::shared_ptr<MemoryPool>& memory_pool)
-        : batches_(std::move(batches)),
-          positions_(batches_.size(), 0),
-          key_field_indexes_(std::move(key_field_indexes)),
-          key_comparator_(key_comparator),
-          memory_pool_(memory_pool),
-          arrow_pool_(GetArrowPool(memory_pool)),
-          heap_(SourceGreater{this}),
-          metrics_(std::make_shared<MetricsImpl>()) {
-        key_contexts_.reserve(batches_.size());
-        sequence_arrays_.reserve(batches_.size());
-        for (size_t i = 0; i < batches_.size(); ++i) {
-            const StoredBatch& batch = batches_[i];
-            arrow::ArrayVector key_arrays;
-            key_arrays.reserve(key_field_indexes_.size());
-            for (int32_t field_index : key_field_indexes_) {
-                key_arrays.push_back(batch.data->field(field_index));
-            }
-            key_contexts_.push_back(
-                std::make_shared<ColumnarBatchContext>(key_arrays, memory_pool_));
-            sequence_arrays_.push_back(
-                checked_pointer_cast<arrow::Int64Array>(batch.data->field(1)));
-            if (batch.data->length() > 0) {
-                heap_.push(i);
-            }
-        }
-    }
+    explicit StoredBatchReader(const StoredBatch& batch)
+        : data_(batch.data), metrics_(std::make_shared<MetricsImpl>()) {}
 
     Result<ReadBatch> NextBatch() override {
-        if (heap_.empty()) {
+        if (!data_) {
             return MakeEofBatch();
-        }
-
-        struct SelectedRow {
-            size_t selected_source;
-            int64_t source_ordinal;
-        };
-        struct SelectedSource {
-            size_t source;
-            std::vector<int64_t> rows;
-            int64_t base = -1;
-        };
-        std::vector<SelectedRow> selected_rows;
-        selected_rows.reserve(kOutputBatchSize);
-        std::vector<SelectedSource> selected_sources;
-        std::unordered_map<size_t, size_t> selected_source_indexes;
-        while (!heap_.empty() && selected_rows.size() < kOutputBatchSize) {
-            const size_t source = heap_.top();
-            heap_.pop();
-            auto [source_it, inserted] =
-                selected_source_indexes.emplace(source, selected_sources.size());
-            if (inserted) {
-                selected_sources.push_back(SelectedSource{source, {}});
-            }
-            SelectedSource& selected_source = selected_sources[source_it->second];
-            selected_rows.push_back(
-                SelectedRow{source_it->second, static_cast<int64_t>(selected_source.rows.size())});
-            selected_source.rows.push_back(positions_[source]++);
-            if (positions_[source] < batches_[source].data->length()) {
-                heap_.push(source);
-            }
-        }
-
-        arrow::compute::ExecContext context(arrow_pool_.get());
-        arrow::ArrayVector grouped_batches;
-        int64_t grouped_row_count = 0;
-        for (SelectedSource& selected_source : selected_sources) {
-            arrow::Int64Builder source_index_builder(arrow_pool_.get());
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(
-                source_index_builder.AppendValues(selected_source.rows));
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> source_indices,
-                                              source_index_builder.Finish());
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                arrow::Datum source_batch,
-                arrow::compute::Take(arrow::Datum(batches_[selected_source.source].data),
-                                     arrow::Datum(source_indices),
-                                     arrow::compute::TakeOptions::NoBoundsCheck(), &context));
-            selected_source.base = grouped_row_count;
-            grouped_row_count += static_cast<int64_t>(selected_source.rows.size());
-            grouped_batches.push_back(source_batch.make_array());
-        }
-
-        std::shared_ptr<arrow::Array> batch;
-        if (grouped_batches.size() == 1) {
-            batch = std::move(grouped_batches[0]);
-        } else {
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                std::shared_ptr<arrow::Array> grouped,
-                arrow::Concatenate(grouped_batches, arrow_pool_.get()));
-            arrow::Int64Builder order_builder(arrow_pool_.get());
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(order_builder.Reserve(selected_rows.size()));
-            for (const SelectedRow& selected : selected_rows) {
-                order_builder.UnsafeAppend(selected_sources[selected.selected_source].base +
-                                           selected.source_ordinal);
-            }
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> order,
-                                              order_builder.Finish());
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                arrow::Datum reordered,
-                arrow::compute::Take(arrow::Datum(grouped), arrow::Datum(order),
-                                     arrow::compute::TakeOptions::NoBoundsCheck(), &context));
-            batch = reordered.make_array();
         }
         auto array = std::make_unique<ArrowArray>();
         auto schema = std::make_unique<ArrowSchema>();
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*batch, array.get(), schema.get()));
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*data_, array.get(), schema.get()));
+        data_.reset();
         return ReadBatch(std::move(array), std::move(schema));
     }
 
@@ -272,50 +167,11 @@ class RawBatchReader final : public BatchReader {
         return metrics_;
     }
     void Close() override {
-        while (!heap_.empty()) {
-            heap_.pop();
-        }
-        batches_.clear();
-        positions_.clear();
-        key_contexts_.clear();
-        sequence_arrays_.clear();
+        data_.reset();
     }
 
  private:
-    static constexpr size_t kOutputBatchSize = 1024;
-
-    bool Less(size_t left, size_t right) const {
-        ColumnarRowRef left_key(key_contexts_[left], positions_[left]);
-        ColumnarRowRef right_key(key_contexts_[right], positions_[right]);
-        const int32_t key_comparison = key_comparator_->CompareTo(left_key, right_key);
-        if (key_comparison != 0) {
-            return key_comparison < 0;
-        }
-        const int64_t left_sequence = sequence_arrays_[left]->Value(positions_[left]);
-        const int64_t right_sequence = sequence_arrays_[right]->Value(positions_[right]);
-        if (left_sequence != right_sequence) {
-            return left_sequence < right_sequence;
-        }
-        return left < right;
-    }
-
-    struct SourceGreater {
-        RawBatchReader* reader;
-
-        bool operator()(size_t left, size_t right) const {
-            return reader->Less(right, left);
-        }
-    };
-
-    std::vector<StoredBatch> batches_;
-    std::vector<int64_t> positions_;
-    std::vector<int32_t> key_field_indexes_;
-    std::shared_ptr<FieldsComparator> key_comparator_;
-    std::shared_ptr<MemoryPool> memory_pool_;
-    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
-    std::vector<std::shared_ptr<ColumnarBatchContext>> key_contexts_;
-    std::vector<std::shared_ptr<arrow::Int64Array>> sequence_arrays_;
-    std::priority_queue<size_t, std::vector<size_t>, SourceGreater> heap_;
+    std::shared_ptr<arrow::StructArray> data_;
     std::shared_ptr<Metrics> metrics_;
 };
 
@@ -323,13 +179,8 @@ class RawBatchReader final : public BatchReader {
 
 class PrimaryKeyRealtimeStore::Impl {
  public:
-    Impl(std::shared_ptr<arrow::Schema> prepared_schema, std::vector<int32_t> key_field_indexes,
-         const std::shared_ptr<FieldsComparator>& key_comparator,
-         const std::shared_ptr<MemoryPool>& memory_pool)
-        : prepared_schema_(std::move(prepared_schema)),
-          key_field_indexes_(std::move(key_field_indexes)),
-          key_comparator_(key_comparator),
-          memory_pool_(memory_pool) {}
+    explicit Impl(std::shared_ptr<arrow::Schema> prepared_schema)
+        : prepared_schema_(std::move(prepared_schema)) {}
 
     Status Write(RealtimeWriteBatch&& write_batch) {
         if (!write_batch.batch || !write_batch.batch->GetData()) {
@@ -349,7 +200,6 @@ class PrimaryKeyRealtimeStore::Impl {
         }
         std::shared_ptr<arrow::StructArray> prepared =
             checked_pointer_cast<arrow::StructArray>(array);
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(prepared->ValidateFull());
         std::lock_guard<std::mutex> lock(mutex_);
         if (last_offset_ && write_batch.offset_range.begin != last_offset_.value()) {
             return Status::Invalid("PK real-time offset ranges must be contiguous");
@@ -381,9 +231,9 @@ class PrimaryKeyRealtimeStore::Impl {
             return Status::Invalid("segment was not created by the PK real-time store");
         }
         std::vector<std::unique_ptr<BatchReader>> readers;
-        if (!segment->Batches().empty()) {
-            readers.push_back(std::make_unique<RawBatchReader>(
-                segment->Batches(), key_field_indexes_, key_comparator_, memory_pool_));
+        readers.reserve(segment->Batches().size());
+        for (const StoredBatch& batch : segment->Batches()) {
+            readers.push_back(std::make_unique<StoredBatchReader>(batch));
         }
         return readers;
     }
@@ -407,13 +257,10 @@ class PrimaryKeyRealtimeStore::Impl {
             return Status::Invalid("read view was not created by the PK real-time store");
         }
         std::vector<std::unique_ptr<BatchReader>> readers;
-        std::vector<StoredBatch> batches;
         for (const std::shared_ptr<Segment>& segment : typed->Segments()) {
-            batches.insert(batches.end(), segment->Batches().begin(), segment->Batches().end());
-        }
-        if (!batches.empty()) {
-            readers.push_back(std::make_unique<RawBatchReader>(
-                std::move(batches), key_field_indexes_, key_comparator_, memory_pool_));
+            for (const StoredBatch& batch : segment->Batches()) {
+                readers.push_back(std::make_unique<StoredBatchReader>(batch));
+            }
         }
         return readers;
     }
@@ -439,9 +286,6 @@ class PrimaryKeyRealtimeStore::Impl {
 
  private:
     std::shared_ptr<arrow::Schema> prepared_schema_;
-    std::vector<int32_t> key_field_indexes_;
-    std::shared_ptr<FieldsComparator> key_comparator_;
-    std::shared_ptr<MemoryPool> memory_pool_;
     mutable std::mutex mutex_;
     std::vector<StoredBatch> building_;
     std::vector<std::shared_ptr<Segment>> sealed_;
@@ -454,31 +298,10 @@ PrimaryKeyRealtimeStore::PrimaryKeyRealtimeStore(std::unique_ptr<Impl>&& impl)
 PrimaryKeyRealtimeStore::~PrimaryKeyRealtimeStore() = default;
 
 Result<std::shared_ptr<PrimaryKeyRealtimeStore>> PrimaryKeyRealtimeStore::Create(
-    const std::shared_ptr<arrow::Schema>& prepared_schema,
-    const std::vector<std::string>& trimmed_primary_keys,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
+    const std::shared_ptr<arrow::Schema>& prepared_schema) {
     PAIMON_RETURN_NOT_OK(ValidatePreparedTransportSchema(prepared_schema));
-    if (trimmed_primary_keys.empty() || !memory_pool) {
-        return Status::Invalid("PK primary keys are empty or memory pool is null");
-    }
-    std::vector<int32_t> key_field_indexes;
-    std::vector<DataField> key_fields;
-    key_field_indexes.reserve(trimmed_primary_keys.size());
-    key_fields.reserve(trimmed_primary_keys.size());
-    for (const std::string& key : trimmed_primary_keys) {
-        const int32_t field_index = prepared_schema->GetFieldIndex(key);
-        if (field_index < 3) {
-            return Status::Invalid("PK field is missing from prepared schema: ", key);
-        }
-        key_field_indexes.push_back(field_index);
-        PAIMON_ASSIGN_OR_RAISE(DataField field, DataField::ConvertArrowFieldToDataField(
-                                                    prepared_schema->field(field_index)));
-        key_fields.push_back(std::move(field));
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FieldsComparator> key_comparator,
-                           FieldsComparator::Create(key_fields, /*is_ascending_order=*/true));
-    return std::shared_ptr<PrimaryKeyRealtimeStore>(new PrimaryKeyRealtimeStore(
-        std::make_unique<Impl>(prepared_schema, key_field_indexes, key_comparator, memory_pool)));
+    return std::shared_ptr<PrimaryKeyRealtimeStore>(
+        new PrimaryKeyRealtimeStore(std::make_unique<Impl>(prepared_schema)));
 }
 Status PrimaryKeyRealtimeStore::Write(RealtimeWriteBatch&& batch) {
     return impl_->Write(std::move(batch));

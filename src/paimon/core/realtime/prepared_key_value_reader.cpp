@@ -32,7 +32,6 @@
 #include "arrow/array/builder_primitive.h"
 #include "arrow/buffer.h"
 #include "arrow/c/bridge.h"
-#include "arrow/compute/api.h"
 #include "arrow/type.h"
 #include "arrow/util/bit_util.h"
 #include "fmt/format.h"
@@ -386,39 +385,6 @@ Result<arrow::ArrayVector> ProjectFieldsByPaimonIds(
     return result;
 }
 
-Result<std::shared_ptr<arrow::StructArray>> ApplyOffsetFilter(
-    const std::shared_ptr<arrow::StructArray>& data_batch,
-    const std::shared_ptr<arrow::NumericArray<arrow::Int64Type>>& offset_array,
-    const std::optional<OffsetRange>& visible_offsets, arrow::MemoryPool* arrow_pool) {
-    if (!visible_offsets.has_value()) {
-        return data_batch;
-    }
-
-    arrow::BooleanBuilder filter_builder(arrow_pool);
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(filter_builder.Reserve(offset_array->length()));
-    int64_t visible_row_count = 0;
-    for (int64_t i = 0; i < offset_array->length(); ++i) {
-        int64_t offset = offset_array->Value(i);
-        bool visible = offset >= visible_offsets->begin && offset < visible_offsets->end;
-        filter_builder.UnsafeAppend(visible);
-        visible_row_count += visible;
-    }
-    if (visible_row_count == 0) {
-        return std::shared_ptr<arrow::StructArray>();
-    }
-    if (visible_row_count == data_batch->length()) {
-        return data_batch;
-    }
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> filter,
-                                      filter_builder.Finish());
-    arrow::compute::ExecContext exec_context(arrow_pool);
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-        arrow::Datum filtered,
-        arrow::compute::Filter(data_batch, filter, arrow::compute::FilterOptions::Defaults(),
-                               &exec_context));
-    return checked_pointer_cast<arrow::StructArray>(filtered.make_array());
-}
-
 class PreparedKeyValueReader final : public KeyValueRecordReader {
  public:
     PreparedKeyValueReader(std::unique_ptr<BatchReader>&& reader,
@@ -448,20 +414,20 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         explicit Iterator(PreparedKeyValueReader* reader) : reader_(reader) {}
 
         Result<bool> HasNext() const override {
-            return cursor_ < reader_->row_kind_array_->length();
+            return cursor_ < reader_->RowCount();
         }
 
         Result<KeyValue> Next() override {
-            if (cursor_ >= reader_->row_kind_array_->length()) {
+            if (cursor_ >= reader_->RowCount()) {
                 return Status::Invalid("No more prepared key values in current iterator");
             }
+            const int64_t row = reader_->RowAt(cursor_);
             std::shared_ptr<InternalRow> key =
-                std::make_shared<ColumnarRowRef>(reader_->key_ctx_, cursor_);
-            auto value = std::make_unique<ColumnarRowRef>(reader_->value_ctx_, cursor_);
-            PAIMON_ASSIGN_OR_RAISE(
-                const RowKind* row_kind,
-                RowKind::FromByteValue(reader_->row_kind_array_->Value(cursor_)));
-            int64_t sequence_number = reader_->sequence_number_array_->Value(cursor_);
+                std::make_shared<ColumnarRowRef>(reader_->key_ctx_, row);
+            auto value = std::make_unique<ColumnarRowRef>(reader_->value_ctx_, row);
+            PAIMON_ASSIGN_OR_RAISE(const RowKind* row_kind,
+                                   RowKind::FromByteValue(reader_->row_kind_array_->Value(row)));
+            int64_t sequence_number = reader_->sequence_number_array_->Value(row);
             ++cursor_;
             return KeyValue(row_kind, sequence_number, KeyValue::UNKNOWN_LEVEL, std::move(key),
                             std::move(value));
@@ -535,19 +501,12 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                 data_batch = checked_pointer_cast<arrow::StructArray>(arrow_array);
             }
             PAIMON_RETURN_NOT_OK(ValidatePreparedBatch(data_batch));
-            PAIMON_RETURN_NOT_OK(ValidateOrdering(data_batch));
 
             std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> offset_array =
                 checked_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
                     data_batch->field(kRealtimeOffsetIndex));
             if (offset_coverage_) {
                 PAIMON_RETURN_NOT_OK(offset_coverage_->Add(*offset_array));
-            }
-            PAIMON_ASSIGN_OR_RAISE(
-                data_batch,
-                ApplyOffsetFilter(data_batch, offset_array, visible_offsets_, arrow_pool_.get()));
-            if (!data_batch) {
-                continue;
             }
 
             row_kind_array_ = checked_pointer_cast<arrow::NumericArray<arrow::Int8Type>>(
@@ -562,6 +521,10 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                                                             value_schema_, arrow_pool_.get()));
             key_ctx_ = std::make_shared<ColumnarBatchContext>(key_fields, pool_);
             value_ctx_ = std::make_shared<ColumnarBatchContext>(value_fields, pool_);
+            PAIMON_RETURN_NOT_OK(ValidateOrdering(key_ctx_, sequence_number_array_));
+            if (!SelectVisibleRows(*offset_array)) {
+                continue;
+            }
             ArrowUtils::TraverseArray(data_batch);
             return std::make_unique<Iterator>(this);
         }
@@ -600,18 +563,13 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         return Status::OK();
     }
 
-    Status ValidateOrdering(const std::shared_ptr<arrow::StructArray>& data_batch) {
-        if (data_batch->length() == 0) {
+    Status ValidateOrdering(
+        const std::shared_ptr<ColumnarBatchContext>& key_context,
+        const std::shared_ptr<arrow::NumericArray<arrow::Int64Type>>& sequences) {
+        if (sequences->length() == 0) {
             return Status::OK();
         }
-        PAIMON_ASSIGN_OR_RAISE(
-            arrow::ArrayVector key_fields,
-            ProjectFieldsByPaimonIds(data_batch, prepared_schema_, key_schema_, arrow_pool_.get()));
-        std::shared_ptr<ColumnarBatchContext> key_context =
-            std::make_shared<ColumnarBatchContext>(key_fields, pool_);
-        std::shared_ptr<arrow::Int64Array> sequences =
-            checked_pointer_cast<arrow::Int64Array>(data_batch->field(kSequenceNumberIndex));
-        for (int64_t row = 0; row < data_batch->length(); ++row) {
+        for (int64_t row = 0; row < sequences->length(); ++row) {
             ColumnarRowRef current_key(key_context, row);
             if (previous_key_context_) {
                 ColumnarRowRef previous_key(previous_key_context_, previous_key_row_);
@@ -631,11 +589,36 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         return Status::OK();
     }
 
+    bool SelectVisibleRows(const arrow::Int64Array& offsets) {
+        if (!visible_offsets_.has_value()) {
+            return true;
+        }
+        visible_rows_.emplace();
+        visible_rows_->reserve(offsets.length());
+        for (int64_t row = 0; row < offsets.length(); ++row) {
+            const int64_t offset = offsets.Value(row);
+            if (offset >= visible_offsets_->begin && offset < visible_offsets_->end) {
+                visible_rows_->push_back(row);
+            }
+        }
+        return !visible_rows_->empty();
+    }
+
+    int64_t RowCount() const {
+        return visible_rows_.has_value() ? static_cast<int64_t>(visible_rows_->size())
+                                         : row_kind_array_->length();
+    }
+
+    int64_t RowAt(int64_t ordinal) const {
+        return visible_rows_.has_value() ? (*visible_rows_)[ordinal] : ordinal;
+    }
+
     void ResetBatchState() {
         key_ctx_.reset();
         value_ctx_.reset();
         row_kind_array_.reset();
         sequence_number_array_.reset();
+        visible_rows_.reset();
     }
 
  private:
@@ -655,6 +638,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     std::shared_ptr<ColumnarBatchContext> value_ctx_;
     std::shared_ptr<arrow::NumericArray<arrow::Int8Type>> row_kind_array_;
     std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> sequence_number_array_;
+    std::optional<std::vector<int64_t>> visible_rows_;
     std::shared_ptr<ColumnarBatchContext> previous_key_context_;
     int64_t previous_key_row_ = 0;
     int64_t previous_sequence_ = 0;

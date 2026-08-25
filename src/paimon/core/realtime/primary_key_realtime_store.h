@@ -30,7 +30,6 @@ class Schema;
 namespace paimon {
 
 class CoreOptions;
-class MemoryPool;
 class TableSchema;
 
 Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options, const TableSchema& schema);
@@ -39,9 +38,7 @@ Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options, const Table
 class PrimaryKeyRealtimeStore final : public RealtimeStore {
  public:
     static Result<std::shared_ptr<PrimaryKeyRealtimeStore>> Create(
-        const std::shared_ptr<arrow::Schema>& prepared_schema,
-        const std::vector<std::string>& trimmed_primary_keys,
-        const std::shared_ptr<MemoryPool>& memory_pool);
+        const std::shared_ptr<arrow::Schema>& prepared_schema);
 
     ~PrimaryKeyRealtimeStore() override;
 

@@ -2349,7 +2349,7 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
               final_rows);
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
+TEST_F(RealtimeWriteInteTest, TestPkMultipleStoredBatchesMergeForQueryAndCommit) {
     CreatePkTable();
     auto factory = MakeDecoratingFactory<SplitCommitReaderRealtimeStore>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
@@ -2357,23 +2357,28 @@ TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
                          CreateRealtimeWriter(realtime_context));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> first_batch,
-                         MakeBatch({Row{4, "four", "p0"}, Row{3, "three", "p0"}},
+                         MakeBatch({Row{4, "four", "p0"}, Row{2, "two", "p0"}, Row{1, "one", "p0"}},
                                    /*partitioned=*/false));
     ASSERT_OK(writer->Write(std::move(first_batch)));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> second_batch,
-                         MakeBatch({Row{2, "two", "p0"}, Row{1, "one", "p0"}},
-                                   /*partitioned=*/false));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> second_batch,
+        MakeBatch({Row{3, "three", "p0"}, Row{2, "deleted", "p0"}, Row{1, "one-new", "p0"}},
+                  /*partitioned=*/false, /*bucket=*/0,
+                  {RecordBatch::RowKind::INSERT, RecordBatch::RowKind::DELETE,
+                   RecordBatch::RowKind::UPDATE_AFTER}));
     ASSERT_OK(writer->Write(std::move(second_batch)));
+
+    const std::vector<Row> expected = {{1, "one-new", "p0"}, {3, "three", "p0"}, {4, "four", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> query_rows, ReadRows(realtime_context));
+    ASSERT_EQ(expected, query_rows);
 
     ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
                          writer->PrepareCommitWithProgress(/*commit_identifier=*/0));
     ASSERT_EQ(1, progress.size());
-    ASSERT_EQ(OffsetRange(0, 4), progress[0].offset_range);
+    ASSERT_EQ(OffsetRange(0, 6), progress[0].offset_range);
     ASSERT_OK(Commit(progress, /*commit_identifier=*/0));
     ASSERT_OK_AND_ASSIGN(std::vector<Row> rows, ReadRows());
-    ASSERT_EQ((std::vector<Row>{
-                  {1, "one", "p0"}, {2, "two", "p0"}, {3, "three", "p0"}, {4, "four", "p0"}}),
-              rows);
+    ASSERT_EQ(expected, rows);
     ASSERT_OK(writer->Close());
 }
 
@@ -2445,7 +2450,7 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderCloseFailure) {
         state->query_null_index = null_index;
         ASSERT_NOK_WITH_MSG(CreateQueryReader(realtime_context),
                             "PK real-time store returned a null query reader");
-        ASSERT_EQ(null_index + 1, state->query_close_count->load(std::memory_order_acquire));
+        ASSERT_EQ((null_index + 1) * 2, state->query_close_count->load(std::memory_order_acquire));
     }
     ASSERT_OK(writer->Close());
 }
