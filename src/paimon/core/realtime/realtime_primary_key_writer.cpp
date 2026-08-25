@@ -283,10 +283,10 @@ Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegm
                                               const OffsetRange& sealed_offsets) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                            realtime_store_->CreateCommitReaders(segment));
-    PAIMON_ASSIGN_OR_RAISE(
-        std::vector<std::unique_ptr<KeyValueRecordReader>> prepared_readers,
-        AdaptPreparedCommitBatchReaders(std::move(readers), prepared_schema_, sealed_offsets,
-                                        key_schema_, write_schema_, memory_pool_));
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> prepared_readers,
+                           PreparedKeyValueReaderFactory::CreateForCommit(
+                               std::move(readers), prepared_schema_, sealed_offsets, key_schema_,
+                               write_schema_, memory_pool_));
     std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
     sorted_readers.reserve(prepared_readers.size());
     for (std::unique_ptr<KeyValueRecordReader>& prepared_reader : prepared_readers) {
@@ -295,7 +295,7 @@ Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegm
             std::move(prepared_reader), key_comparator_,
             std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge_function))));
     }
-    return merge_tree_writer_->WriteSortedReaders(std::move(sorted_readers));
+    return merge_tree_writer_->WriteSortedReadersToFiles(std::move(sorted_readers));
 }
 
 Status RealtimePrimaryKeyWriter::Compact(bool) {

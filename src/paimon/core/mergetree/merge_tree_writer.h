@@ -72,7 +72,8 @@ class MergeTreeWriter : public BatchWriter {
 
     /// Consumes readers whose complete streams are individually sorted by primary key and sequence
     /// number. Readers are closed on success or failure.
-    Status WriteSortedReaders(std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers);
+    Status WriteSortedReadersToFiles(
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers);
 
     Status Compact(bool full_compaction) override;
 

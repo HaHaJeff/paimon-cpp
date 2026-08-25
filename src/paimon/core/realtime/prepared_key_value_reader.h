@@ -32,23 +32,27 @@ namespace paimon {
 class BatchReader;
 class MemoryPool;
 
-/// Validates the required leading fields of a prepared real-time transport schema.
-Status ValidatePreparedTransportSchema(const std::shared_ptr<arrow::Schema>& prepared_schema);
+class PreparedKeyValueReaderFactory {
+ public:
+    PreparedKeyValueReaderFactory() = delete;
+    ~PreparedKeyValueReaderFactory() = delete;
 
-/// Adapts a plugin query reader and limits its rows to `visible_offsets` when present.
-Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
-    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
-    const std::optional<OffsetRange>& visible_offsets,
-    const std::shared_ptr<arrow::Schema>& key_schema,
-    const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<MemoryPool>& memory_pool);
+    static Status ValidateTransportSchema(const std::shared_ptr<arrow::Schema>& prepared_schema);
 
-/// Adapts commit readers and validates their offsets against `sealed_offsets`.
-Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBatchReaders(
-    std::vector<std::unique_ptr<BatchReader>>&& readers,
-    const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
-    const std::shared_ptr<arrow::Schema>& key_schema,
-    const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<MemoryPool>& memory_pool);
+    static Result<std::unique_ptr<KeyValueRecordReader>> Create(
+        std::unique_ptr<BatchReader>&& reader,
+        const std::shared_ptr<arrow::Schema>& prepared_schema,
+        const std::optional<OffsetRange>& visible_offsets,
+        const std::shared_ptr<arrow::Schema>& key_schema,
+        const std::shared_ptr<arrow::Schema>& value_schema,
+        const std::shared_ptr<MemoryPool>& memory_pool);
+
+    static Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateForCommit(
+        std::vector<std::unique_ptr<BatchReader>>&& readers,
+        const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
+        const std::shared_ptr<arrow::Schema>& key_schema,
+        const std::shared_ptr<arrow::Schema>& value_schema,
+        const std::shared_ptr<MemoryPool>& memory_pool);
+};
 
 }  // namespace paimon

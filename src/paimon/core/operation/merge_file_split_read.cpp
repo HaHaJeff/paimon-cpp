@@ -81,8 +81,9 @@ class MergeFunctionWrapper;
 class MergeFileSplitRead::RealtimeReaderBuilder {
  public:
     static Result<std::unique_ptr<BatchReader>> Create(
-        MergeFileSplitRead* owner, const std::vector<std::shared_ptr<Split>>& disk_splits,
-        std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers) {
+        const std::vector<std::shared_ptr<Split>>& disk_splits,
+        std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers,
+        MergeFileSplitRead* owner) {
         RealtimeReaderBuilder builder(owner);
         std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
         if (!disk_splits.empty()) {
@@ -140,18 +141,18 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
             }
         }
 
-        DeletionVector::Factory dv_factory = DeletionVector::CreateFactory(
-            owner_->options_.GetFileSystem(),
-            DeletionVector::CreateDeletionFileMap(data_files, deletion_files), owner_->pool_);
-        std::vector<std::vector<SortedRun>> disk_sections =
-            IntervalPartition(data_files, owner_->key_comparator_).Partition();
+        DeletionVector::Factory dv_factory;
+        std::vector<std::vector<SortedRun>> disk_sections;
+        PAIMON_RETURN_NOT_OK(
+            owner_->CreateDiskSections(data_files, deletion_files, &dv_factory, &disk_sections));
         for (const std::vector<SortedRun>& section : disk_sections) {
-            for (const SortedRun& run : section) {
-                PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> disk_reader,
-                                       owner_->CreateReaderForRun(partition, run, dv_factory,
-                                                                  owner_->predicate_for_keys_,
-                                                                  data_file_path_factory));
-                readers->push_back(std::move(disk_reader));
+            PAIMON_ASSIGN_OR_RAISE(
+                std::vector<std::unique_ptr<KeyValueRecordReader>> section_readers,
+                owner_->CreateRecordReadersForSection(section, partition, dv_factory,
+                                                      owner_->predicate_for_keys_,
+                                                      data_file_path_factory));
+            for (std::unique_ptr<KeyValueRecordReader>& reader : section_readers) {
+                readers->push_back(std::move(reader));
             }
         }
         return Status::OK();
@@ -165,34 +166,9 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
         }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> sort_merge_reader,
                                owner_->CreateSortMergeReader(std::move(record_readers)));
-        return CreateProjectedReader(std::move(sort_merge_reader));
-    }
-
-    Result<std::unique_ptr<BatchReader>> CreateProjectedReader(
-        std::unique_ptr<SortMergeReader>&& sort_merge_reader) {
-        if (!owner_->force_keep_delete_) {
-            sort_merge_reader = std::make_unique<DropDeleteReader>(std::move(sort_merge_reader));
-        }
-
-        std::unique_ptr<BatchReader> projection_reader;
-        if (!owner_->context_->EnableMultiThreadRowToBatch()) {
-            PAIMON_ASSIGN_OR_RAISE(
-                projection_reader,
-                KeyValueProjectionReader::Create(
-                    std::move(sort_merge_reader), owner_->raw_read_schema_, owner_->projection_,
-                    owner_->options_.GetReadBatchSize(), owner_->pool_));
-        } else {
-            const int32_t thread_number = owner_->context_->GetRowToBatchThreadNumber();
-            assert(thread_number > 0);
-            projection_reader = std::make_unique<AsyncKeyValueProjectionReader>(
-                std::move(sort_merge_reader), owner_->raw_read_schema_, owner_->projection_,
-                owner_->options_.GetReadBatchSize(), thread_number, owner_->pool_);
-        }
-        PAIMON_ASSIGN_OR_RAISE(projection_reader,
-                               owner_->ApplyPredicateFilterIfNeeded(
-                                   std::move(projection_reader), owner_->context_->GetPredicate()));
-        return std::make_unique<CompleteRowKindBatchReader>(std::move(projection_reader),
-                                                            owner_->pool_);
+        return owner_->CreateProjectedReader(std::move(sort_merge_reader),
+                                             owner_->context_->GetPredicate(),
+                                             /*complete_row_kind=*/true);
     }
 
     MergeFileSplitRead* owner_;
@@ -281,7 +257,7 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReader(
 Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateRealtimeReader(
     const std::vector<std::shared_ptr<Split>>& disk_splits,
     std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers) {
-    return RealtimeReaderBuilder::Create(this, disk_splits, std::move(additional_readers));
+    return RealtimeReaderBuilder::Create(disk_splits, std::move(additional_readers), this);
 }
 
 void MergeFileSplitRead::SetMergeFunctionWrapper(
@@ -362,13 +338,10 @@ Result<std::unique_ptr<FileBatchReader>> MergeFileSplitRead::ApplyIndexAndDvRead
 Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateMergeReader(
     const std::shared_ptr<DataSplitImpl>& data_split,
     const std::shared_ptr<DataFilePathFactory>& data_file_path_factory) {
-    auto dv_factory = DeletionVector::CreateFactory(
-        options_.GetFileSystem(),
-        DeletionVector::CreateDeletionFileMap(data_split->DataFiles(), data_split->DeletionFiles()),
-        pool_);
-
-    std::vector<std::vector<SortedRun>> sections =
-        IntervalPartition(data_split->DataFiles(), key_comparator_).Partition();
+    DeletionVector::Factory dv_factory;
+    std::vector<std::vector<SortedRun>> sections;
+    PAIMON_RETURN_NOT_OK(CreateDiskSections(data_split->DataFiles(), data_split->DeletionFiles(),
+                                            &dv_factory, &sections));
     std::vector<std::unique_ptr<BatchReader>> batch_readers;
     batch_readers.reserve(sections.size());
     // no overlap through multiple sections
@@ -579,36 +552,75 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateReaderForSection(
     } else {
         predicate = context_->GetPredicate();
     }
-    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> sort_merge_reader,
-                           CreateSortMergeReaderForSection(section, partition, dv_factory,
-                                                           predicate, data_file_path_factory,
-                                                           /*drop_delete=*/!force_keep_delete_));
-    // KeyValueProjectionReader converts KeyValue objects to arrow array according to projection
-    if (!context_->EnableMultiThreadRowToBatch()) {
-        return KeyValueProjectionReader::Create(std::move(sort_merge_reader), raw_read_schema_,
-                                                projection_, options_.GetReadBatchSize(), pool_);
+    PAIMON_ASSIGN_OR_RAISE(
+        std::unique_ptr<SortMergeReader> sort_merge_reader,
+        CreateSortMergeReaderForSection(section, partition, dv_factory, predicate,
+                                        data_file_path_factory, /*drop_delete=*/false));
+    return CreateProjectedReader(std::move(sort_merge_reader), /*predicate=*/nullptr,
+                                 /*complete_row_kind=*/false);
+}
+
+Status MergeFileSplitRead::CreateDiskSections(
+    const std::vector<std::shared_ptr<DataFileMeta>>& data_files,
+    const std::vector<std::optional<DeletionFile>>& deletion_files,
+    DeletionVector::Factory* dv_factory, std::vector<std::vector<SortedRun>>* sections) const {
+    *dv_factory = DeletionVector::CreateFactory(
+        options_.GetFileSystem(), DeletionVector::CreateDeletionFileMap(data_files, deletion_files),
+        pool_);
+    *sections = IntervalPartition(data_files, key_comparator_).Partition();
+    return Status::OK();
+}
+
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
+MergeFileSplitRead::CreateRecordReadersForSection(
+    const std::vector<SortedRun>& section, const BinaryRow& partition,
+    DeletionVector::Factory dv_factory, const std::shared_ptr<Predicate>& predicate,
+    const std::shared_ptr<DataFilePathFactory>& data_file_path_factory) const {
+    std::vector<std::unique_ptr<KeyValueRecordReader>> record_readers;
+    record_readers.reserve(section.size());
+    for (const SortedRun& run : section) {
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<KeyValueRecordReader> run_reader,
+            CreateReaderForRun(partition, run, dv_factory, predicate, data_file_path_factory));
+        record_readers.emplace_back(std::move(run_reader));
     }
-    int32_t thread_number = context_->GetRowToBatchThreadNumber();
-    assert(thread_number > 0);
-    return std::make_unique<AsyncKeyValueProjectionReader>(
-        std::move(sort_merge_reader), raw_read_schema_, projection_, options_.GetReadBatchSize(),
-        thread_number, pool_);
+    return record_readers;
+}
+
+Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateProjectedReader(
+    std::unique_ptr<SortMergeReader>&& sort_merge_reader,
+    const std::shared_ptr<Predicate>& predicate, bool complete_row_kind) {
+    if (!force_keep_delete_) {
+        sort_merge_reader = std::make_unique<DropDeleteReader>(std::move(sort_merge_reader));
+    }
+    std::unique_ptr<BatchReader> projection_reader;
+    if (!context_->EnableMultiThreadRowToBatch()) {
+        PAIMON_ASSIGN_OR_RAISE(
+            projection_reader,
+            KeyValueProjectionReader::Create(std::move(sort_merge_reader), raw_read_schema_,
+                                             projection_, options_.GetReadBatchSize(), pool_));
+    } else {
+        const int32_t thread_number = context_->GetRowToBatchThreadNumber();
+        assert(thread_number > 0);
+        projection_reader = std::make_unique<AsyncKeyValueProjectionReader>(
+            std::move(sort_merge_reader), raw_read_schema_, projection_,
+            options_.GetReadBatchSize(), thread_number, pool_);
+    }
+    PAIMON_ASSIGN_OR_RAISE(projection_reader,
+                           ApplyPredicateFilterIfNeeded(std::move(projection_reader), predicate));
+    if (complete_row_kind) {
+        return std::make_unique<CompleteRowKindBatchReader>(std::move(projection_reader), pool_);
+    }
+    return projection_reader;
 }
 
 Result<std::unique_ptr<SortMergeReader>> MergeFileSplitRead::CreateSortMergeReaderForSection(
     const std::vector<SortedRun>& section, const BinaryRow& partition,
     DeletionVector::Factory dv_factory, const std::shared_ptr<Predicate>& predicate,
     const std::shared_ptr<DataFilePathFactory>& data_file_path_factory, bool drop_delete) {
-    // with overlap in one section
-    std::vector<std::unique_ptr<KeyValueRecordReader>> record_readers;
-    record_readers.reserve(section.size());
-    for (const auto& run : section) {
-        // no overlap in a run
-        PAIMON_ASSIGN_OR_RAISE(
-            std::unique_ptr<KeyValueRecordReader> run_reader,
-            CreateReaderForRun(partition, run, dv_factory, predicate, data_file_path_factory));
-        record_readers.emplace_back(std::move(run_reader));
-    }
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> record_readers,
+                           CreateRecordReadersForSection(section, partition, dv_factory, predicate,
+                                                         data_file_path_factory));
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> sort_merge_reader,
                            CreateSortMergeReader(std::move(record_readers)));
     if (drop_delete) {

@@ -96,7 +96,7 @@ Status RealtimeContextImpl::Start() {
 }
 
 Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
-    RealtimeStoreCreateRequest&& request) {
+    RealtimeStoreCreateRequest&& request, const RealtimePartitionBucket& partition_bucket) {
     if (!request.write_schema || !request.write_schema->release) {
         return Status::Invalid("real-time store write schema is null");
     }
@@ -107,10 +107,9 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     schema_guard.Release();
     std::lock_guard<std::mutex> progress_lock(progress_mutex_);
     std::lock_guard<std::mutex> registry_lock(mutex_);
-    const RealtimePartitionBucket key(request.partition, request.bucket);
-    auto iter = stores_.find(key);
+    auto iter = stores_.find(partition_bucket);
     int64_t initial_offset = 0;
-    auto offset_iter = committed_offsets_.find(key);
+    auto offset_iter = committed_offsets_.find(partition_bucket);
     if (offset_iter != committed_offsets_.end()) {
         if (offset_iter->second == std::numeric_limits<int64_t>::max()) {
             return Status::Invalid("real-time offset has reached INT64_MAX");
@@ -121,8 +120,9 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
         if (iter->second.mode != request.mode ||
             !iter->second.write_schema->Equals(*requested_schema, /*check_metadata=*/true)) {
             return Status::Invalid("real-time store schema or mode mismatch for partition " +
-                                   PartitionToString(key.partition) + ", bucket " +
-                                   std::to_string(key.bucket) + "; recreate the RealtimeContext");
+                                   PartitionToString(partition_bucket.partition) + ", bucket " +
+                                   std::to_string(partition_bucket.bucket) +
+                                   "; recreate the RealtimeContext");
         }
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeReadView> read_view,
                                iter->second.store->AcquireReadView());
@@ -150,9 +150,9 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     RealtimeStoreMode mode = request.mode;
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store,
                            factory_->Create(std::move(request)));
-    stores_.emplace(key, StoreEntry{store, requested_schema, mode});
+    stores_.emplace(partition_bucket, StoreEntry{store, requested_schema, mode});
     if (offset_iter != committed_offsets_.end()) {
-        reclaimed_offsets_.emplace(key, offset_iter->second);
+        reclaimed_offsets_.emplace(partition_bucket, offset_iter->second);
     }
     return RealtimeStoreState{std::move(store), initial_offset};
 }

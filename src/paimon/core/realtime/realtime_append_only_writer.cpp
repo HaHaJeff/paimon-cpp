@@ -55,11 +55,11 @@ Result<std::shared_ptr<RealtimeAppendOnlyWriter>> RealtimeAppendOnlyWriter::Crea
     }
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeContextImpl> realtime_context_impl,
                            RealtimeContextImpl::Cast(realtime_context));
-    RealtimeStoreCreateRequest request{
-        std::move(write_schema),        options,        memory_pool, partition, bucket,
-        RealtimeStoreMode::APPEND_ONLY, statistics_mode};
+    RealtimeStoreCreateRequest request{std::move(write_schema), options, memory_pool,
+                                       RealtimeStoreMode::APPEND_ONLY, statistics_mode};
     PAIMON_ASSIGN_OR_RAISE(RealtimeStoreState store_state,
-                           realtime_context_impl->GetOrCreateRealtimeStore(std::move(request)));
+                           realtime_context_impl->GetOrCreateRealtimeStore(
+                               std::move(request), RealtimePartitionBucket(partition, bucket)));
     return std::shared_ptr<RealtimeAppendOnlyWriter>(new RealtimeAppendOnlyWriter(
         store_state.store, file_writer, input_schema, store_state.initial_offset, memory_pool));
 }

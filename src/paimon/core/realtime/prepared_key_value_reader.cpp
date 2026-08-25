@@ -292,8 +292,8 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
             }
             std::shared_ptr<arrow::StructArray> data_batch =
                 checked_pointer_cast<arrow::StructArray>(arrow_array);
-            Status transport_status =
-                ValidatePreparedTransportSchema(arrow::schema(data_batch->type()->fields()));
+            Status transport_status = PreparedKeyValueReaderFactory::ValidateTransportSchema(
+                arrow::schema(data_batch->type()->fields()));
             if (!transport_status.ok()) {
                 return Status::Invalid(
                     "prepared batch field does not match prepared transport "
@@ -420,7 +420,8 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
 }  // namespace
 
-Status ValidatePreparedTransportSchema(const std::shared_ptr<arrow::Schema>& prepared_schema) {
+Status PreparedKeyValueReaderFactory::ValidateTransportSchema(
+    const std::shared_ptr<arrow::Schema>& prepared_schema) {
     if (!prepared_schema || prepared_schema->num_fields() < kPreparedValueStartIndex) {
         return Status::Invalid("prepared schema must contain realtime transport fields");
     }
@@ -450,7 +451,7 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
     if (visible_offsets.has_value() && visible_offsets->begin > visible_offsets->end) {
         return Status::Invalid("prepared visible offset range begin exceeds end");
     }
-    PAIMON_RETURN_NOT_OK(ValidatePreparedTransportSchema(prepared_schema));
+    PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
     if (!key_schema) {
         return Status::Invalid("prepared key schema cannot be null");
     }
@@ -476,7 +477,7 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
 
 }  // namespace
 
-Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
+Result<std::unique_ptr<KeyValueRecordReader>> PreparedKeyValueReaderFactory::Create(
     std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
     const std::optional<OffsetRange>& visible_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
@@ -487,7 +488,8 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
                                         /*offset_coverage=*/nullptr);
 }
 
-Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBatchReaders(
+Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
+PreparedKeyValueReaderFactory::CreateForCommit(
     std::vector<std::unique_ptr<BatchReader>>&& readers,
     const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,

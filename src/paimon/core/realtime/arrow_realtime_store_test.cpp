@@ -233,11 +233,7 @@ TEST_F(ArrowRealtimeStoreTest, TestFullStatisticsPrunesNonMatchingBatch) {
     ArrowRealtimeStoreFactory factory;
     std::unique_ptr<ArrowSchema> write_schema = MakeReadSchema(schema_);
     RealtimeStoreCreateRequest request{std::move(write_schema),
-                                       /*options=*/{},
-                                       pool_,
-                                       /*partition=*/{},
-                                       /*bucket=*/0,
-                                       RealtimeStoreMode::APPEND_ONLY,
+                                       /*options=*/{}, pool_, RealtimeStoreMode::APPEND_ONLY,
                                        StatisticsMode::FULL};
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeStore> realtime_store,
                          factory.Create(std::move(request)));
@@ -279,11 +275,7 @@ TEST_F(ArrowRealtimeStoreTest, TestFactoryRejectsInvalidMode) {
     ArrowRealtimeStoreFactory factory;
     std::unique_ptr<ArrowSchema> write_schema = MakeReadSchema(schema_);
     RealtimeStoreCreateRequest request{std::move(write_schema),
-                                       /*options=*/{},
-                                       pool_,
-                                       /*partition=*/{},
-                                       /*bucket=*/0,
-                                       static_cast<RealtimeStoreMode>(-1)};
+                                       /*options=*/{}, pool_, static_cast<RealtimeStoreMode>(-1)};
     ASSERT_NOK_WITH_MSG(factory.Create(std::move(request)), "invalid real-time store mode: -1");
 }
 

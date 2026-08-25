@@ -79,7 +79,7 @@ struct SpecialFields {
         }
         return field_name == SequenceNumber().Name() || field_name == ValueKind().Name() ||
                field_name == RowKind().Name() || field_name == RowId().Name() ||
-               field_name == IndexScore().Name();
+               field_name == IndexScore().Name() || field_name == RealtimeOffset().Name();
     }
 
     // TODO(xinyu.lxy): add a func to complete row-tracking fields

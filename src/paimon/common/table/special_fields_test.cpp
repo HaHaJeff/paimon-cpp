@@ -73,7 +73,7 @@ TEST(SpecialFieldsTest, TestIsSystemField) {
     ASSERT_TRUE(SpecialFields::IsSystemField("rowkind"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_ROW_ID"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_INDEX_SCORE"));
-    ASSERT_FALSE(SpecialFields::IsSystemField("_REALTIME_OFFSET"));
+    ASSERT_TRUE(SpecialFields::IsSystemField("_REALTIME_OFFSET"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_KEY_0"));
 }
 

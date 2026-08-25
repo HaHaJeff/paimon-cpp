@@ -359,7 +359,7 @@ TEST_P(MergeTreeWriterTest, TestSimple) {
                          CreateMergeWriter(-1, dir->Str(), sorted_reader_path_factory, 1, options));
     std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
     sorted_readers.push_back(CreateSingleReader(sorted_reader_array));
-    ASSERT_OK(sorted_reader_writer->WriteSortedReaders(std::move(sorted_readers)));
+    ASSERT_OK(sorted_reader_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
     ASSERT_OK_AND_ASSIGN(CommitIncrement sorted_reader_commit_increment,
                          sorted_reader_writer->PrepareCommit(false));
     ASSERT_OK(sorted_reader_writer->Close());
@@ -464,7 +464,7 @@ TEST_P(MergeTreeWriterTest, TestWriteMultiBatch) {
                          CreateMergeWriter(9, dir->Str(), sorted_reader_path_factory, 0, options));
     std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
     sorted_readers.push_back(CreateSingleReader(sorted_reader_array));
-    ASSERT_OK(sorted_reader_writer->WriteSortedReaders(std::move(sorted_readers)));
+    ASSERT_OK(sorted_reader_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
     ASSERT_OK_AND_ASSIGN(CommitIncrement sorted_reader_commit_increment,
                          sorted_reader_writer->PrepareCommit(false));
     ASSERT_OK(sorted_reader_writer->Close());
@@ -498,7 +498,7 @@ TEST_P(MergeTreeWriterTest, TestSortedReaders) {
     std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
     sorted_readers.push_back(CreateSingleReader(sorted_reader_array));
 
-    ASSERT_OK(merge_writer->WriteSortedReaders(std::move(sorted_readers)));
+    ASSERT_OK(merge_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
     ASSERT_OK_AND_ASSIGN(CommitIncrement commit_increment, merge_writer->PrepareCommit(false));
     ASSERT_OK(merge_writer->Close());
 
@@ -564,7 +564,7 @@ TEST_P(MergeTreeWriterTest, TestMergeSortedReaders) {
     sorted_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
         CreateSingleReader(second_array), &second_closed));
 
-    ASSERT_OK(merge_writer->WriteSortedReaders(std::move(sorted_readers)));
+    ASSERT_OK(merge_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
     ASSERT_TRUE(first_closed);
     ASSERT_TRUE(second_closed);
     ASSERT_OK_AND_ASSIGN(CommitIncrement commit_increment, merge_writer->PrepareCommit(false));
@@ -611,7 +611,7 @@ TEST_P(MergeTreeWriterTest, TestSortedReaderOwnership) {
     sorted_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
         CreateSingleReader(sorted_reader_array), &closed));
 
-    ASSERT_OK(merge_writer->WriteSortedReaders(std::move(sorted_readers)));
+    ASSERT_OK(merge_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
     ASSERT_TRUE(closed);
     ASSERT_OK(merge_writer->Close());
 }
@@ -629,12 +629,12 @@ TEST_P(MergeTreeWriterTest, TestSortedReaderFailure) {
                          CreateMergeWriter(-1, dir->Str(), path_factory, 0, options));
 
     std::vector<std::unique_ptr<KeyValueRecordReader>> empty_readers;
-    Status empty_status = merge_writer->WriteSortedReaders(std::move(empty_readers));
+    Status empty_status = merge_writer->WriteSortedReadersToFiles(std::move(empty_readers));
     ASSERT_TRUE(empty_status.IsInvalid());
 
     std::vector<std::unique_ptr<KeyValueRecordReader>> null_readers;
     null_readers.push_back(nullptr);
-    Status null_status = merge_writer->WriteSortedReaders(std::move(null_readers));
+    Status null_status = merge_writer->WriteSortedReadersToFiles(std::move(null_readers));
     ASSERT_TRUE(null_status.IsInvalid());
 
     auto sorted_reader_array = std::dynamic_pointer_cast<arrow::StructArray>(
@@ -648,7 +648,7 @@ TEST_P(MergeTreeWriterTest, TestSortedReaderFailure) {
     failing_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
         CreateSingleReader(sorted_reader_array, /*batch_size=*/16, expected_status),
         &failing_reader_closed));
-    Status failing_status = merge_writer->WriteSortedReaders(std::move(failing_readers));
+    Status failing_status = merge_writer->WriteSortedReadersToFiles(std::move(failing_readers));
     ASSERT_EQ(expected_status, failing_status);
     ASSERT_TRUE(failing_reader_closed);
     ASSERT_OK(merge_writer->Close());

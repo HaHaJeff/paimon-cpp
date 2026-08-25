@@ -71,8 +71,8 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderForTest(
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<MemoryPool>& memory_pool) {
-    return AdaptPreparedBatchReader(std::move(reader), prepared_schema, visible_offsets, key_schema,
-                                    value_schema, memory_pool);
+    return PreparedKeyValueReaderFactory::Create(
+        std::move(reader), prepared_schema, visible_offsets, key_schema, value_schema, memory_pool);
 }
 
 class TrackingBatchReader : public BatchReader {

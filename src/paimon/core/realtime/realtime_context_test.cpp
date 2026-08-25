@@ -120,8 +120,9 @@ Result<RealtimeStoreState> GetOrCreateAppendStore(
     const std::shared_ptr<MemoryPool>& memory_pool,
     StatisticsMode statistics_mode = StatisticsMode::NONE) {
     return context->GetOrCreateRealtimeStore(
-        RealtimeStoreCreateRequest{std::move(write_schema), options, memory_pool, partition, bucket,
-                                   RealtimeStoreMode::APPEND_ONLY, statistics_mode});
+        RealtimeStoreCreateRequest{std::move(write_schema), options, memory_pool,
+                                   RealtimeStoreMode::APPEND_ONLY, statistics_mode},
+        RealtimePartitionBucket(partition, bucket));
 }
 
 TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
@@ -170,8 +171,10 @@ TEST(RealtimeContextTest, TestRejectsMismatchedModeOnStoreReuse) {
         GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, GetDefaultPool()));
 
     ASSERT_NOK_WITH_MSG(
-        context->GetOrCreateRealtimeStore(RealtimeStoreCreateRequest{
-            MakeWriteSchema(), {}, GetDefaultPool(), partition, 0, RealtimeStoreMode::PRIMARY_KEY}),
+        context->GetOrCreateRealtimeStore(
+            RealtimeStoreCreateRequest{
+                MakeWriteSchema(), {}, GetDefaultPool(), RealtimeStoreMode::PRIMARY_KEY},
+            RealtimePartitionBucket(partition, 0)),
         "schema or mode mismatch for partition {dt=2026-08-02}, bucket 0; recreate the "
         "RealtimeContext");
     ASSERT_EQ(1, factory->stores.size());

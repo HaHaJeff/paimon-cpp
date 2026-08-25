@@ -143,6 +143,20 @@ class MergeFileSplitRead : public AbstractSplitRead {
         DeletionVector::Factory dv_factory,
         const std::shared_ptr<DataFilePathFactory>& data_file_path_factory);
 
+    Status CreateDiskSections(const std::vector<std::shared_ptr<DataFileMeta>>& data_files,
+                              const std::vector<std::optional<DeletionFile>>& deletion_files,
+                              DeletionVector::Factory* dv_factory,
+                              std::vector<std::vector<SortedRun>>* sections) const;
+
+    Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateRecordReadersForSection(
+        const std::vector<SortedRun>& section, const BinaryRow& partition,
+        DeletionVector::Factory dv_factory, const std::shared_ptr<Predicate>& predicate,
+        const std::shared_ptr<DataFilePathFactory>& data_file_path_factory) const;
+
+    Result<std::unique_ptr<BatchReader>> CreateProjectedReader(
+        std::unique_ptr<SortMergeReader>&& sort_merge_reader,
+        const std::shared_ptr<Predicate>& predicate, bool complete_row_kind);
+
     Result<std::unique_ptr<KeyValueRecordReader>> CreateReaderForRun(
         const BinaryRow& partition, const SortedRun& sorted_run, DeletionVector::Factory dv_factory,
         const std::shared_ptr<Predicate>& predicate,

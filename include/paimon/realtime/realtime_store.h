@@ -57,10 +57,6 @@ struct PAIMON_EXPORT RealtimeStoreCreateRequest {
     std::map<std::string, std::string> options;
     /// Memory pool for allocations retained by the store.
     std::shared_ptr<MemoryPool> memory_pool;
-    /// Partition values identifying the store.
-    std::map<std::string, std::string> partition;
-    /// Bucket identifying the store within its partition.
-    int32_t bucket = -1;
     /// Table mode implemented by the store.
     RealtimeStoreMode mode = RealtimeStoreMode::APPEND_ONLY;
     /// Statistics collected by append-only stores.
@@ -192,7 +188,7 @@ class PAIMON_EXPORT RealtimeStoreFactory {
  public:
     virtual ~RealtimeStoreFactory() = default;
 
-    /// Creates a store for the requested table mode and partition-bucket.
+    /// Creates a store for the requested table mode.
     /// The factory consumes `request`, including ownership of `request.write_schema`.
     virtual Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) = 0;
 };

@@ -52,6 +52,8 @@
 #include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
+#include "paimon/core/schema/schema_manager.h"
+#include "paimon/core/schema/table_schema.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
 #include "paimon/core/table/source/realtime_split.h"
 #include "paimon/core/utils/snapshot_manager.h"
@@ -1200,11 +1202,24 @@ class RealtimeWriteInteTest : public ::testing::Test {
         if (views.size() != 1) {
             return Status::Invalid("expected one PK real-time read view");
         }
+        PAIMON_ASSIGN_OR_RAISE(CoreOptions core_options, CoreOptions::FromMap(options_));
+        SchemaManager schema_manager(core_options.GetFileSystem(), table_path_);
+        PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<TableSchema>> table_schema,
+                               schema_manager.Latest());
+        if (!table_schema) {
+            return Status::Invalid("expected a table schema");
+        }
         auto read_schema = std::make_unique<ArrowSchema>();
         arrow::FieldVector requested_fields = {
-            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())};
-        requested_fields.insert(requested_fields.end(), schema_->fields().begin(),
-                                schema_->fields().end());
+            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
+                ->WithNullable(false),
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
+                ->WithNullable(false),
+            DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
+        std::shared_ptr<arrow::Schema> value_schema =
+            DataField::ConvertDataFieldsToArrowSchema(table_schema.value()->Fields());
+        requested_fields.insert(requested_fields.end(), value_schema->fields().begin(),
+                                value_schema->fields().end());
         PAIMON_RETURN_NOT_OK_FROM_ARROW(
             arrow::ExportSchema(*arrow::schema(requested_fields), read_schema.get()));
         ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });

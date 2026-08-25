@@ -32,7 +32,7 @@
 #include "paimon/core/global_index/indexed_split_impl.h"
 #include "paimon/core/io/merged_key_value_record_reader.h"
 #include "paimon/core/key_value.h"
-#include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
+#include "paimon/core/mergetree/compact/merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/core/operation/merge_file_split_read.h"
 #include "paimon/core/operation/raw_file_split_read.h"
@@ -42,6 +42,7 @@
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
 #include "paimon/core/table/source/realtime_split.h"
+#include "paimon/core/utils/primary_key_table_utils.h"
 #include "paimon/status.h"
 
 namespace paimon {
@@ -59,6 +60,7 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<FieldsComparator>& key_comparator,
+    const std::shared_ptr<InternalReadContext>& context,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     arrow::FieldVector prepared_fields = {
         DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
@@ -87,12 +89,16 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
         if (!reader) {
             return Status::Invalid("PK real-time store returned a null query reader");
         }
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> prepared_reader,
-                               AdaptPreparedBatchReader(std::move(reader), prepared_schema,
-                                                        OffsetRange(split->CommittedEndOffset(),
-                                                                    split->MemoryEndOffset()),
-                                                        key_schema, value_schema, memory_pool));
-        auto merge = std::make_unique<DeduplicateMergeFunction>(false);
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<KeyValueRecordReader> prepared_reader,
+            PreparedKeyValueReaderFactory::Create(
+                std::move(reader), prepared_schema,
+                OffsetRange(split->CommittedEndOffset(), split->MemoryEndOffset()), key_schema,
+                value_schema, memory_pool));
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<MergeFunction> merge,
+                               PrimaryKeyTableUtils::CreateMergeFunction(
+                                   value_schema, context->GetTableSchema()->PrimaryKeys(),
+                                   context->GetCoreOptions(), memory_pool));
         result.push_back(std::make_unique<MergedKeyValueRecordReader>(
             std::move(prepared_reader), key_comparator,
             std::make_shared<ReducerMergeFunctionWrapper>(std::move(merge))));
@@ -273,7 +279,7 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateRealtimeReader(
                 std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
                 CreateMemoryReaders(realtime_split, memory, merge_read->GetKeySchema(),
                                     merge_read->GetValueSchema(), merge_read->GetKeyComparator(),
-                                    GetMemoryPool()));
+                                    context_, GetMemoryPool()));
             PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
                                    merge_read->CreateRealtimeReader(realtime_split->DiskSplits(),
                                                                     std::move(memory_readers)));

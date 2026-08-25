@@ -362,7 +362,7 @@ class PrimaryKeyRealtimeStore::Impl {
         }
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> read_schema,
                                           arrow::ImportSchema(context.read_schema));
-        PAIMON_RETURN_NOT_OK(ValidatePreparedTransportSchema(read_schema));
+        PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(read_schema));
         std::vector<std::unique_ptr<BatchReader>> readers;
         for (const std::shared_ptr<Segment>& segment : typed->Segments()) {
             for (const StoredBatch& batch : segment->Batches()) {
@@ -411,7 +411,7 @@ PrimaryKeyRealtimeStore::~PrimaryKeyRealtimeStore() = default;
 
 Result<std::shared_ptr<PrimaryKeyRealtimeStore>> PrimaryKeyRealtimeStore::Create(
     const std::shared_ptr<arrow::Schema>& prepared_schema) {
-    PAIMON_RETURN_NOT_OK(ValidatePreparedTransportSchema(prepared_schema));
+    PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
     return std::shared_ptr<PrimaryKeyRealtimeStore>(
         new PrimaryKeyRealtimeStore(std::make_unique<Impl>(prepared_schema)));
 }

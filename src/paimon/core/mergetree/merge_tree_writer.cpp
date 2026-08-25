@@ -154,7 +154,7 @@ Status MergeTreeWriter::Write(std::unique_ptr<RecordBatch>&& moved_batch) {
     return Status::OK();
 }
 
-Status MergeTreeWriter::WriteSortedReaders(
+Status MergeTreeWriter::WriteSortedReadersToFiles(
     std::vector<std::unique_ptr<KeyValueRecordReader>>&& readers) {
     auto raw_readers_guard = ScopeGuard([&]() -> void {
         for (std::unique_ptr<KeyValueRecordReader>& reader : readers) {
@@ -311,7 +311,7 @@ Status MergeTreeWriter::FlushWriteBuffer(bool wait_for_latest_compaction,
         auto cleanup_guard = ScopeGuard([&]() { write_buffer_->Clear(); });
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
                                write_buffer_->CreateReaders());
-        PAIMON_RETURN_NOT_OK(WriteSortedReaders(std::move(readers)));
+        PAIMON_RETURN_NOT_OK(WriteSortedReadersToFiles(std::move(readers)));
     }
     PAIMON_RETURN_NOT_OK(TrySyncLatestCompaction(wait_for_latest_compaction));
     PAIMON_RETURN_NOT_OK(compact_manager_->TriggerCompaction(forced_full_compaction));
