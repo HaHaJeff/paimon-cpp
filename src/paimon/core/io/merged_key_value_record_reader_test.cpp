@@ -290,6 +290,63 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {
         "exact");
 }
 
+TEST_F(MergedKeyValueRecordReaderTest, TestCommitOffsetCoverage) {
+    std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
+    std::shared_ptr<arrow::Schema> value_schema = arrow::schema({key});
+    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema({key});
+    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
+    std::shared_ptr<arrow::Array> first_array =
+        arrow::ipc::internal::json::ArrayFromJSON(prepared_type,
+                                                  R"([[0, 10, 2, 1], [0, 11, 0, 3]])")
+            .ValueOrDie();
+    std::shared_ptr<arrow::Array> second_array =
+        arrow::ipc::internal::json::ArrayFromJSON(prepared_type,
+                                                  R"([[0, 12, 1, 2], [0, 13, 3, 4]])")
+            .ValueOrDie();
+    std::vector<std::unique_ptr<BatchReader>> batch_readers;
+    batch_readers.push_back(
+        std::make_unique<MockFileBatchReader>(first_array, prepared_type, /*read_batch_size=*/1));
+    batch_readers.push_back(
+        std::make_unique<MockFileBatchReader>(second_array, prepared_type, /*read_batch_size=*/1));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
+                         PreparedKeyValueReaderFactory::CreateForCommit(
+                             std::move(batch_readers), prepared_schema, OffsetRange(0, 4),
+                             value_schema, value_schema, pool_));
+    int64_t row_count = 0;
+    for (const std::unique_ptr<KeyValueRecordReader>& reader : readers) {
+        ASSERT_OK_AND_ASSIGN(
+            std::vector<KeyValue> rows,
+            (ReadResultCollector::CollectKeyValueResult<
+                KeyValueRecordReader, KeyValueRecordReader::Iterator>(reader.get())));
+        row_count += static_cast<int64_t>(rows.size());
+    }
+    ASSERT_EQ(4, row_count);
+}
+
+TEST_F(MergedKeyValueRecordReaderTest, TestRejectsDuplicateCommitOffset) {
+    std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
+    std::shared_ptr<arrow::Schema> value_schema = arrow::schema({key});
+    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema({key});
+    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
+    std::shared_ptr<arrow::Array> prepared_array =
+        arrow::ipc::internal::json::ArrayFromJSON(
+            prepared_type, R"([[0, 10, 0, 1], [0, 11, 0, 2], [0, 12, 2, 3]])")
+            .ValueOrDie();
+    std::vector<std::unique_ptr<BatchReader>> batch_readers;
+    batch_readers.push_back(std::make_unique<MockFileBatchReader>(prepared_array, prepared_type,
+                                                                  /*read_batch_size=*/1));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<KeyValueRecordReader>> readers,
+                         PreparedKeyValueReaderFactory::CreateForCommit(
+                             std::move(batch_readers), prepared_schema, OffsetRange(0, 3),
+                             value_schema, value_schema, pool_));
+    ASSERT_NOK_WITH_MSG((ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
+                                                                    KeyValueRecordReader::Iterator>(
+                            readers[0].get())),
+                        "did not cover the sealed range");
+}
+
 TEST_F(MergedKeyValueRecordReaderTest, TestBadCommitBatch) {
     std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
     std::shared_ptr<arrow::Field> value = MakeField("value", arrow::int32(), 1);

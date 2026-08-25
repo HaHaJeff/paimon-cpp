@@ -18,9 +18,7 @@
 
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 
-#include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -44,6 +42,7 @@
 #include "paimon/macros.h"
 #include "paimon/reader/batch_reader.h"
 #include "paimon/status.h"
+#include "paimon/utils/roaring_bitmap64.h"
 
 namespace paimon {
 
@@ -81,9 +80,10 @@ class RealtimeOffsetCoverage {
                 return Status::Invalid(
                     "PK real-time store commit reader offset is outside the sealed range");
             }
-            min_seen_offset_ = std::min(min_seen_offset_, offset);
-            max_seen_offset_ = std::max(max_seen_offset_, offset);
-            ++seen_count_;
+            if (!seen_offsets_.CheckedAdd(offset)) {
+                return Status::Invalid(
+                    "PK real-time store commit readers did not cover the sealed range");
+            }
         }
         return Status::OK();
     }
@@ -91,9 +91,7 @@ class RealtimeOffsetCoverage {
     Status FinishReader() {
         ++finished_reader_count_;
         if (finished_reader_count_ == reader_count_ &&
-            (seen_count_ != sealed_offsets_.Count() ||
-             (seen_count_ > 0 && (min_seen_offset_ != sealed_offsets_.begin ||
-                                  max_seen_offset_ != sealed_offsets_.end - 1)))) {
+            seen_offsets_.Cardinality() != sealed_offsets_.Count()) {
             return Status::Invalid(
                 "PK real-time store commit readers did not cover the sealed range");
         }
@@ -106,9 +104,7 @@ class RealtimeOffsetCoverage {
 
     OffsetRange sealed_offsets_;
     size_t reader_count_;
-    int64_t min_seen_offset_ = std::numeric_limits<int64_t>::max();
-    int64_t max_seen_offset_ = std::numeric_limits<int64_t>::min();
-    int64_t seen_count_ = 0;
+    RoaringBitmap64 seen_offsets_;
     size_t finished_reader_count_ = 0;
 };
 

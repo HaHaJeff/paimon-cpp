@@ -26,12 +26,14 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "fmt/format.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/realtime/arrow_array_pool_holder.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/utils/nested_projection_utils.h"
@@ -234,12 +236,17 @@ class StoredBatchReader final : public BatchReader {
         }
         auto array = std::make_unique<ArrowArray>();
         auto schema = std::make_unique<ArrowSchema>();
+        ScopeGuard export_guard([array_ptr = array.get(), schema_ptr = schema.get()]() {
+            ArrowArrayRelease(array_ptr);
+            ArrowSchemaRelease(schema_ptr);
+        });
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*data_, array.get(), schema.get()));
         if (arrow_pool_) {
             PAIMON_RETURN_NOT_OK(RetainArrowArrayMemoryPool(array.get(), arrow_pool_));
         }
         data_.reset();
         arrow_pool_.reset();
+        export_guard.Release();
         return ReadBatch(std::move(array), std::move(schema));
     }
 
