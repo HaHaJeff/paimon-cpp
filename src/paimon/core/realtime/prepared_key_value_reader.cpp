@@ -18,9 +18,10 @@
 
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -29,11 +30,8 @@
 #include "arrow/array/array_base.h"
 #include "arrow/array/array_nested.h"
 #include "arrow/array/array_primitive.h"
-#include "arrow/array/builder_primitive.h"
-#include "arrow/buffer.h"
 #include "arrow/c/bridge.h"
 #include "arrow/type.h"
-#include "arrow/util/bit_util.h"
 #include "fmt/format.h"
 #include "paimon/common/data/columnar/columnar_batch_context.h"
 #include "paimon/common/data/columnar/columnar_row_ref.h"
@@ -75,42 +73,35 @@ Result<std::shared_ptr<arrow::Array>> AlignArrayByPaimonIds(
 
 class RealtimeOffsetCoverage {
  public:
-    static Result<std::shared_ptr<RealtimeOffsetCoverage>> Create(
-        const OffsetRange& sealed_offsets, size_t reader_count,
-        const std::shared_ptr<arrow::MemoryPool>& arrow_pool) {
+    static Result<std::shared_ptr<RealtimeOffsetCoverage>> Create(const OffsetRange& sealed_offsets,
+                                                                  size_t reader_count) {
         if (sealed_offsets.begin < 0 || sealed_offsets.end < sealed_offsets.begin) {
             return Status::Invalid("PK real-time store returned an invalid sealed offset range");
         }
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            std::shared_ptr<arrow::Buffer> seen_offsets,
-            arrow::AllocateEmptyBitmap(sealed_offsets.Count(), arrow_pool.get()));
-        return std::shared_ptr<RealtimeOffsetCoverage>(new RealtimeOffsetCoverage(
-            sealed_offsets, reader_count, std::move(seen_offsets), arrow_pool));
+        return std::shared_ptr<RealtimeOffsetCoverage>(
+            new RealtimeOffsetCoverage(sealed_offsets, reader_count));
     }
 
     Status Add(const arrow::Int64Array& offsets) {
-        std::lock_guard<std::mutex> lock(mutex_);
         for (int64_t row = 0; row < offsets.length(); ++row) {
             const int64_t offset = offsets.Value(row);
             if (offset < sealed_offsets_.begin || offset >= sealed_offsets_.end) {
                 return Status::Invalid(
                     "PK real-time store commit reader offset is outside the sealed range");
             }
-            const int64_t index = offset - sealed_offsets_.begin;
-            if (arrow::bit_util::GetBit(seen_offsets_->data(), index)) {
-                return Status::Invalid(
-                    "PK real-time store commit readers contain duplicate REALTIME_OFFSET");
-            }
-            arrow::bit_util::SetBit(seen_offsets_->mutable_data(), index);
+            min_seen_offset_ = std::min(min_seen_offset_, offset);
+            max_seen_offset_ = std::max(max_seen_offset_, offset);
             ++seen_count_;
         }
         return Status::OK();
     }
 
     Status FinishReader() {
-        std::lock_guard<std::mutex> lock(mutex_);
         ++finished_reader_count_;
-        if (finished_reader_count_ == reader_count_ && seen_count_ != sealed_offsets_.Count()) {
+        if (finished_reader_count_ == reader_count_ &&
+            (seen_count_ != sealed_offsets_.Count() ||
+             (seen_count_ > 0 && (min_seen_offset_ != sealed_offsets_.begin ||
+                                  max_seen_offset_ != sealed_offsets_.end - 1)))) {
             return Status::Invalid(
                 "PK real-time store commit readers did not cover the sealed range");
         }
@@ -118,21 +109,15 @@ class RealtimeOffsetCoverage {
     }
 
  private:
-    RealtimeOffsetCoverage(const OffsetRange& sealed_offsets, size_t reader_count,
-                           std::shared_ptr<arrow::Buffer> seen_offsets,
-                           const std::shared_ptr<arrow::MemoryPool>& arrow_pool)
-        : sealed_offsets_(sealed_offsets),
-          reader_count_(reader_count),
-          arrow_pool_(arrow_pool),
-          seen_offsets_(std::move(seen_offsets)) {}
+    RealtimeOffsetCoverage(const OffsetRange& sealed_offsets, size_t reader_count)
+        : sealed_offsets_(sealed_offsets), reader_count_(reader_count) {}
 
     OffsetRange sealed_offsets_;
     size_t reader_count_;
-    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
-    std::shared_ptr<arrow::Buffer> seen_offsets_;
+    int64_t min_seen_offset_ = std::numeric_limits<int64_t>::max();
+    int64_t max_seen_offset_ = std::numeric_limits<int64_t>::min();
     int64_t seen_count_ = 0;
     size_t finished_reader_count_ = 0;
-    std::mutex mutex_;
 };
 
 Status CheckPreparedField(const std::shared_ptr<arrow::Schema>& schema, int32_t field_idx,
@@ -736,10 +721,8 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBa
             return Status::Invalid("PK real-time store returned a null commit reader");
         }
     }
-    std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(memory_pool);
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
-        RealtimeOffsetCoverage::Create(sealed_offsets, readers.size(), arrow_pool));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
+                           RealtimeOffsetCoverage::Create(sealed_offsets, readers.size()));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> adapted_reader,

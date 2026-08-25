@@ -538,7 +538,7 @@ class FailAfterPhysicalFileRealtimeStore final : public DelegatingRealtimeStore 
     std::shared_ptr<std::atomic<bool>> saw_artifacts_;
 };
 
-enum class CommitReaderMalformation { DROP_LAST, UNSORTED, SUBSTITUTE_OFFSET };
+enum class CommitReaderMalformation { DROP_LAST, UNSORTED, DUPLICATE_OFFSET, OUT_OF_RANGE_OFFSET };
 
 class CorruptingBatchReader final : public BatchReader {
  public:
@@ -552,8 +552,10 @@ class CorruptingBatchReader final : public BatchReader {
                 return DropLast();
             case CommitReaderMalformation::UNSORTED:
                 return SwapFirstTwo();
-            case CommitReaderMalformation::SUBSTITUTE_OFFSET:
-                return SubstituteOffset();
+            case CommitReaderMalformation::DUPLICATE_OFFSET:
+                return SubstituteOffset(/*offset=*/0);
+            case CommitReaderMalformation::OUT_OF_RANGE_OFFSET:
+                return SubstituteOffset(/*offset=*/-1);
         }
         return Status::Invalid("unknown commit reader malformation");
     }
@@ -613,7 +615,7 @@ class CorruptingBatchReader final : public BatchReader {
         return ReadBatch(std::move(output), std::move(schema));
     }
 
-    Result<ReadBatch> SubstituteOffset() {
+    Result<ReadBatch> SubstituteOffset(int64_t offset) {
         PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
         if (BatchReader::IsEofBatch(batch)) {
             return batch;
@@ -634,7 +636,7 @@ class CorruptingBatchReader final : public BatchReader {
         arrow::Int64Builder builder;
         PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Reserve(offsets->length()));
         for (int64_t row = 0; row < offsets->length(); ++row) {
-            builder.UnsafeAppend(0);
+            builder.UnsafeAppend(offset);
         }
         std::shared_ptr<arrow::Array> substituted_offsets;
         PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Finish(&substituted_offsets));
@@ -2387,9 +2389,14 @@ TEST_F(RealtimeWriteInteTest, TestPkRejectsMalformedCoverage) {
                                            "commit readers did not cover the sealed range");
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkRejectsEqualCardinalityOffsetSubstitution) {
-    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::SUBSTITUTE_OFFSET,
-                                           "duplicate REALTIME_OFFSET");
+TEST_F(RealtimeWriteInteTest, TestPkRejectsDuplicateOffset) {
+    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::DUPLICATE_OFFSET,
+                                           "commit readers did not cover the sealed range");
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRejectsOutOfRangeOffset) {
+    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::OUT_OF_RANGE_OFFSET,
+                                           "offset is outside the sealed range");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsUnsortedPluginRows) {
