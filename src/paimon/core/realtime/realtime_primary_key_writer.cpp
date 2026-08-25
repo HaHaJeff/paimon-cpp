@@ -172,9 +172,9 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
     prepared_fields.insert(prepared_fields.end(), write_schema->fields().begin(),
                            write_schema->fields().end());
     const RealtimePartitionBucket partition_bucket(partition, bucket);
-    const int64_t initial_max_sequence_number =
-        realtime_context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
-                                                               restored_max_sequence_number);
+    PAIMON_ASSIGN_OR_RAISE(int64_t initial_max_sequence_number,
+                           realtime_context->AdvanceMaterializedMaxSequenceNumber(
+                               partition_bucket, restored_max_sequence_number));
     return std::shared_ptr<RealtimePrimaryKeyWriter>(new RealtimePrimaryKeyWriter(
         store_state.store, merge_tree_writer, realtime_context, partition_bucket, write_schema,
         arrow::schema(std::move(prepared_fields)), arrow::schema(std::move(key_fields)),
@@ -246,8 +246,10 @@ Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
         std::move(prepared_batch), OffsetRange(next_offset_, next_offset_ + count)}));
     next_offset_ += count;
     last_sequence_number_ += count;
-    realtime_context_->AdvanceMaterializedMaxSequenceNumber(partition_bucket_,
-                                                            last_sequence_number_);
+    PAIMON_RETURN_NOT_OK(
+        realtime_context_
+            ->AdvanceMaterializedMaxSequenceNumber(partition_bucket_, last_sequence_number_)
+            .status());
     return Status::OK();
 }
 

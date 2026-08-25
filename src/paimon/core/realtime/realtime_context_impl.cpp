@@ -168,10 +168,16 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     return RealtimeStoreState{std::move(store), initial_offset};
 }
 
-int64_t RealtimeContextImpl::AdvanceMaterializedMaxSequenceNumber(
+Result<int64_t> RealtimeContextImpl::AdvanceMaterializedMaxSequenceNumber(
     const RealtimePartitionBucket& partition_bucket, int64_t max_sequence_number) {
     std::lock_guard<std::mutex> lock(mutex_);
-    StoreEntry& entry = stores_.at(partition_bucket);
+    auto iter = stores_.find(partition_bucket);
+    if (iter == stores_.end()) {
+        return Status::KeyError("real-time store not found for partition " +
+                                PartitionToString(partition_bucket.partition) + ", bucket " +
+                                std::to_string(partition_bucket.bucket));
+    }
+    StoreEntry& entry = iter->second;
     if (max_sequence_number > entry.materialized_max_sequence_number) {
         entry.materialized_max_sequence_number = max_sequence_number;
     }

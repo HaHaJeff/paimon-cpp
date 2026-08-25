@@ -71,8 +71,8 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
 
     Result<RealtimeStoreState> GetOrCreateRealtimeStore(RealtimeStoreCreateRequest&& request);
 
-    int64_t AdvanceMaterializedMaxSequenceNumber(const RealtimePartitionBucket& partition_bucket,
-                                                 int64_t max_sequence_number);
+    Result<int64_t> AdvanceMaterializedMaxSequenceNumber(
+        const RealtimePartitionBucket& partition_bucket, int64_t max_sequence_number);
 
     Result<std::vector<RealtimePartitionBucketView>> AcquireReadViews();
 

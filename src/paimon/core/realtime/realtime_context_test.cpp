@@ -192,14 +192,29 @@ TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
     ASSERT_OK(
         GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, GetDefaultPool()));
 
-    ASSERT_EQ(4, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
-                                                               /*max_sequence_number=*/4));
-    ASSERT_EQ(8, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
-                                                               /*max_sequence_number=*/8));
-    ASSERT_EQ(8, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
-                                                               /*max_sequence_number=*/6));
-    ASSERT_EQ(10, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
-                                                                /*max_sequence_number=*/10));
+    ASSERT_OK_AND_ASSIGN(int64_t first, context->AdvanceMaterializedMaxSequenceNumber(
+                                            partition_bucket, /*max_sequence_number=*/4));
+    ASSERT_EQ(4, first);
+    ASSERT_OK_AND_ASSIGN(int64_t second, context->AdvanceMaterializedMaxSequenceNumber(
+                                             partition_bucket, /*max_sequence_number=*/8));
+    ASSERT_EQ(8, second);
+    ASSERT_OK_AND_ASSIGN(int64_t third, context->AdvanceMaterializedMaxSequenceNumber(
+                                            partition_bucket, /*max_sequence_number=*/6));
+    ASSERT_EQ(8, third);
+    ASSERT_OK_AND_ASSIGN(int64_t fourth, context->AdvanceMaterializedMaxSequenceNumber(
+                                             partition_bucket, /*max_sequence_number=*/10));
+    ASSERT_EQ(10, fourth);
+}
+
+TEST(RealtimeContextTest, TestMaterializedSequenceRejectsMissingStore) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+
+    Result<int64_t> result = context->AdvanceMaterializedMaxSequenceNumber(
+        RealtimePartitionBucket({{"dt", "missing"}}, /*bucket=*/3),
+        /*max_sequence_number=*/4);
+    ASSERT_TRUE(result.status().IsKeyError());
+    ASSERT_NOK_WITH_MSG(result, "real-time store not found for partition {dt=missing}, bucket 3");
 }
 
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {

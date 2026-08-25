@@ -55,15 +55,21 @@ struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {
 using RealtimeStoreCreateConfig =
     std::variant<AppendRealtimeStoreCreateConfig, PrimaryKeyRealtimeStoreCreateConfig>;
 
+/// Parameters used by a `RealtimeStoreFactory` to create a store.
 struct PAIMON_EXPORT RealtimeStoreCreateRequest {
     /// Schema whose ownership is transferred to the factory. Append mode receives the complete
     /// table write schema. Primary-key mode receives the prepared transport schema:
     /// [_VALUE_KIND, _SEQUENCE_NUMBER, _REALTIME_OFFSET, table write fields].
     std::unique_ptr<::ArrowSchema> write_schema;
+    /// Table options available to the store implementation.
     std::map<std::string, std::string> options;
+    /// Memory pool for allocations retained by the store.
     std::shared_ptr<MemoryPool> memory_pool;
+    /// Partition values identifying the store.
     std::map<std::string, std::string> partition;
+    /// Bucket identifying the store within its partition.
     int32_t bucket = -1;
+    /// Mode-specific store configuration.
     RealtimeStoreCreateConfig mode_config;
 };
 

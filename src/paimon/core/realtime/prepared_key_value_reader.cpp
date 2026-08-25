@@ -690,6 +690,9 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
         return Status::Invalid("prepared batch reader cannot be null");
     }
     ScopeGuard close_guard([&owned_reader]() -> void { owned_reader->Close(); });
+    if (visible_offsets.has_value() && visible_offsets->begin > visible_offsets->end) {
+        return Status::Invalid("prepared visible offset range begin exceeds end");
+    }
     PAIMON_RETURN_NOT_OK(ValidatePreparedTransportSchema(prepared_schema));
     if (!key_schema) {
         return Status::Invalid("prepared key schema cannot be null");
@@ -763,23 +766,6 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBa
     }
     readers_guard.Release();
     return adapted_readers;
-}
-
-Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
-    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
-    const std::optional<OffsetRange>& visible_offsets,
-    const std::shared_ptr<arrow::Schema>& key_schema,
-    const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
-    if (!key_schema) {
-        return Status::Invalid("prepared key schema cannot be null");
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> key_fields,
-                           DataField::ConvertArrowSchemaToDataFields(key_schema));
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FieldsComparator> key_comparator,
-                           FieldsComparator::Create(key_fields, /*is_ascending_order=*/true));
-    return AdaptPreparedBatchReader(std::move(reader), prepared_schema, visible_offsets, key_schema,
-                                    value_schema, key_comparator, memory_pool);
 }
 
 }  // namespace paimon

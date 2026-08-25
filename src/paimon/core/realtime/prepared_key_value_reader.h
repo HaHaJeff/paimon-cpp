@@ -33,8 +33,10 @@ class BatchReader;
 class FieldsComparator;
 class MemoryPool;
 
+/// Validates the required leading fields of a prepared real-time transport schema.
 Status ValidatePreparedTransportSchema(const std::shared_ptr<arrow::Schema>& prepared_schema);
 
+/// Adapts a plugin query reader and limits its rows to `visible_offsets` when present.
 Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
     std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
     const std::optional<OffsetRange>& visible_offsets,
@@ -43,19 +45,13 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
     const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MemoryPool>& memory_pool);
 
+/// Adapts commit readers and validates that they collectively cover `sealed_offsets` exactly.
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBatchReaders(
     std::vector<std::unique_ptr<BatchReader>>&& readers,
     const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<FieldsComparator>& key_comparator,
-    const std::shared_ptr<MemoryPool>& memory_pool);
-
-Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
-    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
-    const std::optional<OffsetRange>& visible_offsets,
-    const std::shared_ptr<arrow::Schema>& key_schema,
-    const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<MemoryPool>& memory_pool);
 
 }  // namespace paimon

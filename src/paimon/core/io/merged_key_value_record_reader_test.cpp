@@ -65,6 +65,23 @@ std::shared_ptr<arrow::Schema> MakePreparedSchema(const arrow::FieldVector& valu
     return arrow::schema(prepared_fields);
 }
 
+Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderForTest(
+    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
+    const std::optional<OffsetRange>& visible_offsets,
+    const std::shared_ptr<arrow::Schema>& key_schema,
+    const std::shared_ptr<arrow::Schema>& value_schema,
+    const std::shared_ptr<MemoryPool>& memory_pool) {
+    if (!key_schema) {
+        return Status::Invalid("prepared key schema cannot be null");
+    }
+    PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> key_fields,
+                           DataField::ConvertArrowSchemaToDataFields(key_schema));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FieldsComparator> key_comparator,
+                           FieldsComparator::Create(key_fields, /*is_ascending_order=*/true));
+    return AdaptPreparedBatchReader(std::move(reader), prepared_schema, visible_offsets, key_schema,
+                                    value_schema, key_comparator, memory_pool);
+}
+
 class TrackingBatchReader : public BatchReader {
  public:
     TrackingBatchReader(std::unique_ptr<BatchReader>&& delegate, int32_t* close_count)
@@ -217,8 +234,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderOffsetFilter) {
     auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 2);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(2, 4),
-                                 key_schema, value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(2, 4),
+                                        key_schema, value_schema, pool_));
     ASSERT_OK_AND_ASSIGN(
         std::vector<KeyValue> results,
         (ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
@@ -230,6 +247,23 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderOffsetFilter) {
     std::vector<KeyValue> expected = KeyValueChecker::GenerateKeyValues(
         row_kinds, {103, 105}, levels, {{4}, {6}}, {{4, 40}, {6, 60}}, pool_);
     KeyValueChecker::CheckResult(expected, results, 1, 2);
+}
+
+TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderRejectsReversedVisibleOffsets) {
+    std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
+    std::shared_ptr<arrow::Schema> value_schema = arrow::schema({key});
+    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema({key});
+    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
+    std::shared_ptr<arrow::Array> prepared_array =
+        arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([[0, 10, 0, 1]])").ValueOrDie();
+    auto batch_reader =
+        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, /*batch_size=*/1);
+
+    Result<std::unique_ptr<KeyValueRecordReader>> result =
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(2, 1),
+                                        value_schema, value_schema, pool_);
+    ASSERT_TRUE(result.status().IsInvalid());
+    ASSERT_NOK_WITH_MSG(result, "prepared visible offset range begin exceeds end");
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestRejectsUnsortedPluginRowsAcrossBatches) {
@@ -247,9 +281,10 @@ TEST_F(MergedKeyValueRecordReaderTest, TestRejectsUnsortedPluginRowsAcrossBatche
             .ValueOrDie();
     auto batch_reader =
         std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, /*batch_size=*/1);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<KeyValueRecordReader> reader,
-                         AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema,
-                                                  std::nullopt, key_schema, value_schema, pool_));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<KeyValueRecordReader> reader,
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, std::nullopt,
+                                        key_schema, value_schema, pool_));
     Result<std::vector<KeyValue>> result =
         ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
                                                    KeyValueRecordReader::Iterator>(reader.get());
@@ -270,8 +305,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {
         std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> query_reader,
-        AdaptPreparedBatchReader(std::move(query_batch_reader), prepared_schema, OffsetRange(0, 1),
-                                 value_schema, value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(query_batch_reader), prepared_schema,
+                                        OffsetRange(0, 1), value_schema, value_schema, pool_));
     ASSERT_OK_AND_ASSIGN(
         std::vector<KeyValue> query_results,
         (ReadResultCollector::CollectKeyValueResult<
@@ -281,9 +316,10 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {
     ASSERT_EQ(query_results[0].value->GetInt(0), 1);
 
     auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
-    ASSERT_NOK_WITH_MSG(AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema,
-                                                 std::nullopt, value_schema, value_schema, pool_),
-                        "exact");
+    ASSERT_NOK_WITH_MSG(
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, std::nullopt,
+                                        value_schema, value_schema, pool_),
+        "exact");
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestBadCommitBatch) {
@@ -299,8 +335,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestBadCommitBatch) {
     auto batch_reader = std::make_unique<MockFileBatchReader>(actual, actual_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, std::nullopt,
-                                 arrow::schema({key}), value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, std::nullopt,
+                                        arrow::schema({key}), value_schema, pool_));
     ASSERT_NOK_WITH_MSG(reader->NextBatch(), "field count");
 }
 
@@ -319,8 +355,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestMissingCompositeKey) {
     auto batch_reader = std::make_unique<MockFileBatchReader>(actual, actual_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
-                                 arrow::schema({key0, key1}), value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
+                                        arrow::schema({key0, key1}), value_schema, pool_));
     ASSERT_NOK_WITH_MSG(reader->NextBatch(), "cannot find field id 1");
 }
 
@@ -341,8 +377,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestQueryAddRename) {
     auto batch_reader = std::make_unique<MockFileBatchReader>(actual, actual_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
-                                 arrow::schema({key}), value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
+                                        arrow::schema({key}), value_schema, pool_));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<KeyValueRecordReader::Iterator> iterator,
                          reader->NextBatch());
     ASSERT_OK_AND_ASSIGN(KeyValue key_value, iterator->Next());
@@ -361,8 +397,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestMergedReaderErrorRetry) {
     failing_reader->SetNextBatchStatus(Status::IOError("stable prepared error"));
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(failing_reader), prepared_schema, OffsetRange(0, 1),
-                                 value_schema, value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(failing_reader), prepared_schema,
+                                        OffsetRange(0, 1), value_schema, value_schema, pool_));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<FieldsComparator> key_comparator,
                          FieldsComparator::Create({DataField(0, key)}, true));
     MergedKeyValueRecordReader merged_reader(std::move(reader), key_comparator,
@@ -390,8 +426,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderSafeDecode) {
     auto batch_reader = std::make_unique<MockFileBatchReader>(invalid_array, invalid_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
-                                 value_schema, value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
+                                        value_schema, value_schema, pool_));
     ASSERT_NOK_WITH_MSG(
         (ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
                                                     KeyValueRecordReader::Iterator>(reader.get())),
@@ -448,8 +484,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedProjection) {
     auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
     ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReader(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
-                                 key_schema, query_value_schema, pool_));
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
+                                        key_schema, query_value_schema, pool_));
     ASSERT_OK_AND_ASSIGN(
         std::vector<KeyValue> results,
         (ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
@@ -516,8 +552,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderLifecycle) {
             &explicit_close_count);
         ASSERT_OK_AND_ASSIGN(
             std::unique_ptr<KeyValueRecordReader> reader,
-            AdaptPreparedBatchReader(std::move(tracking_reader), prepared_schema, OffsetRange(0, 1),
-                                     key_schema, value_schema, pool_));
+            AdaptPreparedBatchReaderForTest(std::move(tracking_reader), prepared_schema,
+                                            OffsetRange(0, 1), key_schema, value_schema, pool_));
         reader->Close();
     }
     ASSERT_EQ(explicit_close_count, 1);
@@ -529,8 +565,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderLifecycle) {
             &destructor_close_count);
         ASSERT_OK_AND_ASSIGN(
             std::unique_ptr<KeyValueRecordReader> reader,
-            AdaptPreparedBatchReader(std::move(tracking_reader), prepared_schema, OffsetRange(0, 1),
-                                     key_schema, value_schema, pool_));
+            AdaptPreparedBatchReaderForTest(std::move(tracking_reader), prepared_schema,
+                                            OffsetRange(0, 1), key_schema, value_schema, pool_));
     }
     ASSERT_EQ(destructor_close_count, 1);
 
@@ -540,8 +576,9 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderLifecycle) {
             std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1),
             &factory_failure_close_count);
         std::shared_ptr<arrow::Schema> invalid_schema = arrow::schema(value_schema->fields());
-        ASSERT_NOK(AdaptPreparedBatchReader(std::move(tracking_reader), invalid_schema,
-                                            OffsetRange(0, 1), key_schema, value_schema, pool_));
+        ASSERT_NOK(AdaptPreparedBatchReaderForTest(std::move(tracking_reader), invalid_schema,
+                                                   OffsetRange(0, 1), key_schema, value_schema,
+                                                   pool_));
         ASSERT_EQ(nullptr, tracking_reader);
     }
     ASSERT_EQ(factory_failure_close_count, 1);
@@ -555,8 +592,8 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderLifecycle) {
                                                                      &read_failure_close_count);
         ASSERT_OK_AND_ASSIGN(
             std::unique_ptr<KeyValueRecordReader> reader,
-            AdaptPreparedBatchReader(std::move(tracking_reader), prepared_schema, OffsetRange(0, 1),
-                                     key_schema, value_schema, pool_));
+            AdaptPreparedBatchReaderForTest(std::move(tracking_reader), prepared_schema,
+                                            OffsetRange(0, 1), key_schema, value_schema, pool_));
         ASSERT_NOK_WITH_MSG(reader->NextBatch(), "prepared reader failure");
         ASSERT_EQ(read_failure_close_count, 1);
     }
