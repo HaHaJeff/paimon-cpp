@@ -19,14 +19,12 @@
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 
 #include <limits>
-#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
-#include "arrow/c/helpers.h"
 #include "arrow/compute/api.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
@@ -38,6 +36,7 @@
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/core/mergetree/merge_tree_writer.h"
+#include "paimon/core/realtime/arrow_array_pool_holder.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
 #include "paimon/core/utils/commit_increment.h"
@@ -46,42 +45,6 @@
 namespace paimon {
 
 namespace {
-
-struct PreparedArrayPrivateData {
-    void (*release)(ArrowArray*);
-    void* private_data;
-    std::shared_ptr<arrow::MemoryPool> arrow_pool;
-};
-
-void ReleasePreparedArray(ArrowArray* array) {
-    std::unique_ptr<PreparedArrayPrivateData> data(
-        static_cast<PreparedArrayPrivateData*>(array->private_data));
-    array->release = data->release;
-    array->private_data = data->private_data;
-    array->release(array);
-}
-
-Status RetainPreparedArrayPool(ArrowArray* array,
-                               const std::shared_ptr<arrow::MemoryPool>& arrow_pool) {
-    if (!array || !array->release) {
-        return Status::Invalid("cannot retain prepared batch memory pool");
-    }
-    if (!arrow_pool) {
-        ArrowArrayRelease(array);
-        return Status::Invalid("cannot retain prepared batch memory pool");
-    }
-    std::unique_ptr<PreparedArrayPrivateData> data;
-    try {
-        data = std::make_unique<PreparedArrayPrivateData>(
-            PreparedArrayPrivateData{array->release, array->private_data, arrow_pool});
-    } catch (const std::bad_alloc&) {
-        ArrowArrayRelease(array);
-        return Status::OutOfMemory("failed to retain prepared batch memory pool");
-    }
-    array->private_data = data.release();
-    array->release = ReleasePreparedArray;
-    return Status::OK();
-}
 
 Result<std::shared_ptr<arrow::StructArray>> PrepareBatch(
     std::unique_ptr<RecordBatch>&& batch, const std::shared_ptr<arrow::Schema>& write_schema,
@@ -252,7 +215,7 @@ Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
                      first_sequence, next_offset_, arrow_pool_.get()));
     auto output = std::make_unique<ArrowArray>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*prepared, output.get()));
-    PAIMON_RETURN_NOT_OK(RetainPreparedArrayPool(output.get(), arrow_pool_));
+    PAIMON_RETURN_NOT_OK(RetainArrowArrayMemoryPool(output.get(), arrow_pool_));
     RecordBatchBuilder builder(output.get());
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<RecordBatch> prepared_batch, builder.Finish());
     PAIMON_RETURN_NOT_OK(realtime_store_->Write(RealtimeWriteBatch{
