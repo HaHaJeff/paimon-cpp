@@ -111,10 +111,7 @@ Result<std::unique_ptr<BatchReader>> AppendOnlyTableRead::CreateReader(
                 realtime_context_impl->ReleaseReadView(realtime_split->OpaqueTicket()));
         }
     }
-    std::unique_ptr<BatchReader> result =
-        std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());
-    cleanup_guard.Release();
-    return result;
+    return std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());
 }
 
 Result<std::unique_ptr<BatchReader>> AppendOnlyTableRead::CreateRealtimeReader(

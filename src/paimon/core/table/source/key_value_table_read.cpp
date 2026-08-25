@@ -38,7 +38,6 @@
 #include "paimon/core/operation/raw_file_split_read.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
-#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/core/realtime/realtime_reader.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
@@ -68,7 +67,7 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
         DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
         DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
             ->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false)};
+        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
     prepared_fields.insert(prepared_fields.end(), full_value_schema->fields().begin(),
                            full_value_schema->fields().end());
     std::shared_ptr<arrow::Schema> prepared_schema = arrow::schema(std::move(prepared_fields));
@@ -243,10 +242,7 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
                 realtime_context_impl->ReleaseReadView(realtime_split->OpaqueTicket()));
         }
     }
-    std::unique_ptr<BatchReader> result =
-        std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());
-    cleanup_guard.Release();
-    return result;
+    return std::make_unique<ConcatBatchReader>(std::move(readers), GetMemoryPool());
 }
 
 Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateRealtimeReader(

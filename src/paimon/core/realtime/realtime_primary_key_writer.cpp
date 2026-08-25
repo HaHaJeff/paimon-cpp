@@ -38,7 +38,6 @@
 #include "paimon/core/mergetree/merge_tree_writer.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
-#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/core/utils/commit_increment.h"
 #include "paimon/macros.h"
 
@@ -169,7 +168,7 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
         DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
         DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
             ->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false)};
+        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
     prepared_fields.insert(prepared_fields.end(), write_schema->fields().begin(),
                            write_schema->fields().end());
     const RealtimePartitionBucket partition_bucket(partition, bucket);

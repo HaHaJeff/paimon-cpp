@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -177,12 +178,10 @@ class ReadViewCheckingBatchReader final : public BatchReader {
     std::weak_ptr<RealtimeReadView> read_view_;
 };
 
-class QueryTrackingRealtimeStore final : public RealtimeStore {
+class DelegatingRealtimeStore : public RealtimeStore {
  public:
-    QueryTrackingRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
-                               const std::shared_ptr<std::atomic<bool>>& saw_query_predicate,
-                               const std::shared_ptr<std::weak_ptr<RealtimeReadView>>& query_view)
-        : delegate_(delegate), saw_query_predicate_(saw_query_predicate), query_view_(query_view) {}
+    explicit DelegatingRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate)
+        : delegate_(delegate) {}
 
     Status Write(RealtimeWriteBatch&& batch) override {
         return delegate_->Write(std::move(batch));
@@ -196,6 +195,64 @@ class QueryTrackingRealtimeStore final : public RealtimeStore {
         const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
         return delegate_->CreateCommitReaders(segment);
     }
+
+    Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
+        return delegate_->AcquireReadView();
+    }
+
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
+        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
+        const RealtimeQueryContext& context) override {
+        return delegate_->CreateQueryReaders(view, offset_begin, context);
+    }
+
+    Status AdvanceCommittedOffset(int64_t committed_offset) override {
+        return delegate_->AdvanceCommittedOffset(committed_offset);
+    }
+
+    uint64_t GetMemoryUsage() const override {
+        return delegate_->GetMemoryUsage();
+    }
+
+ protected:
+    std::shared_ptr<RealtimeStore> delegate_;
+};
+
+class DecoratingRealtimeStoreFactory final : public RealtimeStoreFactory {
+ public:
+    using Decorator =
+        std::function<std::shared_ptr<RealtimeStore>(const std::shared_ptr<RealtimeStore>&)>;
+
+    explicit DecoratingRealtimeStoreFactory(Decorator decorator)
+        : decorator_(std::move(decorator)) {}
+
+    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
+                               delegate_.Create(std::move(request)));
+        return decorator_(delegate);
+    }
+
+ private:
+    ArrowRealtimeStoreFactory delegate_;
+    Decorator decorator_;
+};
+
+template <typename Store, typename... Args>
+std::shared_ptr<RealtimeStoreFactory> MakeDecoratingFactory(Args... args) {
+    return std::make_shared<DecoratingRealtimeStoreFactory>(
+        [=](const std::shared_ptr<RealtimeStore>& delegate) -> std::shared_ptr<RealtimeStore> {
+            return std::make_shared<Store>(delegate, args...);
+        });
+}
+
+class QueryTrackingRealtimeStore final : public DelegatingRealtimeStore {
+ public:
+    QueryTrackingRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
+                               const std::shared_ptr<std::atomic<bool>>& saw_query_predicate,
+                               const std::shared_ptr<std::weak_ptr<RealtimeReadView>>& query_view)
+        : DelegatingRealtimeStore(delegate),
+          saw_query_predicate_(saw_query_predicate),
+          query_view_(query_view) {}
 
     Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeReadView> delegate_view,
@@ -225,36 +282,7 @@ class QueryTrackingRealtimeStore final : public RealtimeStore {
         return readers;
     }
 
-    Status AdvanceCommittedOffset(int64_t committed_offset) override {
-        return delegate_->AdvanceCommittedOffset(committed_offset);
-    }
-
-    uint64_t GetMemoryUsage() const override {
-        return delegate_->GetMemoryUsage();
-    }
-
  private:
-    std::shared_ptr<RealtimeStore> delegate_;
-    std::shared_ptr<std::atomic<bool>> saw_query_predicate_;
-    std::shared_ptr<std::weak_ptr<RealtimeReadView>> query_view_;
-};
-
-class QueryTrackingRealtimeStoreFactory final : public RealtimeStoreFactory {
- public:
-    explicit QueryTrackingRealtimeStoreFactory(
-        const std::shared_ptr<std::atomic<bool>>& saw_query_predicate,
-        const std::shared_ptr<std::weak_ptr<RealtimeReadView>>& query_view)
-        : saw_query_predicate_(saw_query_predicate), query_view_(query_view) {}
-
-    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
-                               delegate_.Create(std::move(request)));
-        return std::shared_ptr<RealtimeStore>(std::make_shared<QueryTrackingRealtimeStore>(
-            delegate, saw_query_predicate_, query_view_));
-    }
-
- private:
-    ArrowRealtimeStoreFactory delegate_;
     std::shared_ptr<std::atomic<bool>> saw_query_predicate_;
     std::shared_ptr<std::weak_ptr<RealtimeReadView>> query_view_;
 };
@@ -292,19 +320,11 @@ struct CloseTrackingReaderState {
     int32_t commit_null_index = -1;
 };
 
-class CloseTrackingRealtimeStore final : public RealtimeStore {
+class CloseTrackingRealtimeStore final : public DelegatingRealtimeStore {
  public:
     CloseTrackingRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
                                const std::shared_ptr<CloseTrackingReaderState>& state)
-        : delegate_(delegate), state_(state) {}
-
-    Status Write(RealtimeWriteBatch&& batch) override {
-        return delegate_->Write(std::move(batch));
-    }
-
-    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
-        return delegate_->SealForCommit();
-    }
+        : DelegatingRealtimeStore(delegate), state_(state) {}
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
@@ -316,10 +336,6 @@ class CloseTrackingRealtimeStore final : public RealtimeStore {
         }
         PAIMON_RETURN_NOT_OK(InsertNullReader(state_->commit_null_index, &readers));
         return readers;
-    }
-
-    Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
-        return delegate_->AcquireReadView();
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
@@ -335,14 +351,6 @@ class CloseTrackingRealtimeStore final : public RealtimeStore {
         return readers;
     }
 
-    Status AdvanceCommittedOffset(int64_t committed_offset) override {
-        return delegate_->AdvanceCommittedOffset(committed_offset);
-    }
-
-    uint64_t GetMemoryUsage() const override {
-        return delegate_->GetMemoryUsage();
-    }
-
  private:
     static Status InsertNullReader(int32_t index,
                                    std::vector<std::unique_ptr<BatchReader>>* readers) {
@@ -356,25 +364,6 @@ class CloseTrackingRealtimeStore final : public RealtimeStore {
         return Status::OK();
     }
 
-    std::shared_ptr<RealtimeStore> delegate_;
-    std::shared_ptr<CloseTrackingReaderState> state_;
-};
-
-class CloseTrackingRealtimeStoreFactory final : public RealtimeStoreFactory {
- public:
-    explicit CloseTrackingRealtimeStoreFactory(
-        const std::shared_ptr<CloseTrackingReaderState>& state)
-        : state_(state) {}
-
-    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
-                               delegate_.Create(std::move(request)));
-        return std::shared_ptr<RealtimeStore>(
-            std::make_shared<CloseTrackingRealtimeStore>(delegate, state_));
-    }
-
- private:
-    ArrowRealtimeStoreFactory delegate_;
     std::shared_ptr<CloseTrackingReaderState> state_;
 };
 
@@ -421,18 +410,10 @@ class SplitBatchReader final : public BatchReader {
     int64_t next_row_ = 0;
 };
 
-class SplitCommitReaderRealtimeStore final : public RealtimeStore {
+class SplitCommitReaderRealtimeStore final : public DelegatingRealtimeStore {
  public:
     explicit SplitCommitReaderRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate)
-        : delegate_(delegate) {}
-
-    Status Write(RealtimeWriteBatch&& batch) override {
-        return delegate_->Write(std::move(batch));
-    }
-
-    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
-        return delegate_->SealForCommit();
-    }
+        : DelegatingRealtimeStore(delegate) {}
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
@@ -443,48 +424,39 @@ class SplitCommitReaderRealtimeStore final : public RealtimeStore {
         }
         return readers;
     }
-
-    Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
-        return delegate_->AcquireReadView();
-    }
-
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
-        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
-        const RealtimeQueryContext& context) override {
-        return delegate_->CreateQueryReaders(view, offset_begin, context);
-    }
-
-    Status AdvanceCommittedOffset(int64_t committed_offset) override {
-        return delegate_->AdvanceCommittedOffset(committed_offset);
-    }
-
-    uint64_t GetMemoryUsage() const override {
-        return delegate_->GetMemoryUsage();
-    }
-
- private:
-    std::shared_ptr<RealtimeStore> delegate_;
 };
 
-class SplitCommitReaderRealtimeStoreFactory final : public RealtimeStoreFactory {
- public:
-    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
-                               delegate_.Create(std::move(request)));
-        return std::shared_ptr<RealtimeStore>(
-            std::make_shared<SplitCommitReaderRealtimeStore>(delegate));
-    }
+enum class CommitReaderMalformation { DROP_LAST, UNSORTED, SUBSTITUTE_OFFSET };
 
- private:
-    ArrowRealtimeStoreFactory delegate_;
-};
-
-class DropLastBatchReader final : public BatchReader {
+class CorruptingBatchReader final : public BatchReader {
  public:
-    explicit DropLastBatchReader(std::unique_ptr<BatchReader> delegate)
-        : delegate_(std::move(delegate)) {}
+    CorruptingBatchReader(std::unique_ptr<BatchReader> delegate,
+                          CommitReaderMalformation malformation)
+        : delegate_(std::move(delegate)), malformation_(malformation) {}
 
     Result<ReadBatch> NextBatch() override {
+        switch (malformation_) {
+            case CommitReaderMalformation::DROP_LAST:
+                return DropLast();
+            case CommitReaderMalformation::UNSORTED:
+                return SwapFirstTwo();
+            case CommitReaderMalformation::SUBSTITUTE_OFFSET:
+                return SubstituteOffset();
+        }
+        return Status::Invalid("unknown commit reader malformation");
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return delegate_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        buffered_.reset();
+        delegate_->Close();
+    }
+
+ private:
+    Result<ReadBatch> DropLast() {
         if (!buffered_.has_value()) {
             PAIMON_ASSIGN_OR_RAISE(ReadBatch first, delegate_->NextBatch());
             if (BatchReader::IsEofBatch(first)) {
@@ -502,72 +474,34 @@ class DropLastBatchReader final : public BatchReader {
         return result;
     }
 
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return delegate_->GetReaderMetrics();
-    }
-
-    void Close() override {
-        buffered_.reset();
-        delegate_->Close();
-    }
-
- private:
-    std::unique_ptr<BatchReader> delegate_;
-    std::optional<ReadBatch> buffered_;
-};
-
-class SwapFirstTwoBatchReader final : public BatchReader {
- public:
-    explicit SwapFirstTwoBatchReader(std::unique_ptr<BatchReader> delegate)
-        : delegate_(std::move(delegate)) {}
-
-    Result<ReadBatch> NextBatch() override {
-        if (!initialized_) {
-            initialized_ = true;
-            PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
-            if (BatchReader::IsEofBatch(batch)) {
-                return MakeEofBatch();
-            }
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                std::shared_ptr<arrow::Array> array,
-                arrow::ImportArray(batch.first.get(), batch.second.get()));
-            if (array->length() < 2) {
-                return Status::Invalid("cannot make a one-row reader unsorted");
-            }
-            arrow::ArrayVector pieces = {array->Slice(1, 1), array->Slice(0, 1)};
-            if (array->length() > 2) {
-                pieces.push_back(array->Slice(2));
-            }
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> swapped,
-                                              arrow::Concatenate(pieces));
-            auto output = std::make_unique<ArrowArray>();
-            auto schema = std::make_unique<ArrowSchema>();
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(
-                arrow::ExportArray(*swapped, output.get(), schema.get()));
-            return ReadBatch(std::move(output), std::move(schema));
+    Result<ReadBatch> SwapFirstTwo() {
+        if (corrupted_) {
+            return delegate_->NextBatch();
         }
-        return delegate_->NextBatch();
+        corrupted_ = true;
+        PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
+        if (BatchReader::IsEofBatch(batch)) {
+            return MakeEofBatch();
+        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            std::shared_ptr<arrow::Array> array,
+            arrow::ImportArray(batch.first.get(), batch.second.get()));
+        if (array->length() < 2) {
+            return Status::Invalid("cannot make a one-row reader unsorted");
+        }
+        arrow::ArrayVector pieces = {array->Slice(1, 1), array->Slice(0, 1)};
+        if (array->length() > 2) {
+            pieces.push_back(array->Slice(2));
+        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> swapped,
+                                          arrow::Concatenate(pieces));
+        auto output = std::make_unique<ArrowArray>();
+        auto schema = std::make_unique<ArrowSchema>();
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*swapped, output.get(), schema.get()));
+        return ReadBatch(std::move(output), std::move(schema));
     }
 
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return delegate_->GetReaderMetrics();
-    }
-
-    void Close() override {
-        delegate_->Close();
-    }
-
- private:
-    bool initialized_ = false;
-    std::unique_ptr<BatchReader> delegate_;
-};
-
-class SubstituteOffsetBatchReader final : public BatchReader {
- public:
-    explicit SubstituteOffsetBatchReader(std::unique_ptr<BatchReader> delegate)
-        : delegate_(std::move(delegate)) {}
-
-    Result<ReadBatch> NextBatch() override {
+    Result<ReadBatch> SubstituteOffset() {
         PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
         if (BatchReader::IsEofBatch(batch)) {
             return batch;
@@ -602,86 +536,29 @@ class SubstituteOffsetBatchReader final : public BatchReader {
         return ReadBatch(std::move(output), std::move(schema));
     }
 
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return delegate_->GetReaderMetrics();
-    }
-
-    void Close() override {
-        delegate_->Close();
-    }
-
- private:
     std::unique_ptr<BatchReader> delegate_;
+    CommitReaderMalformation malformation_;
+    bool corrupted_ = false;
+    std::optional<ReadBatch> buffered_;
 };
 
-enum class CommitReaderMalformation { DROP_LAST, UNSORTED, SUBSTITUTE_OFFSET };
-
-class MalformedCoverageRealtimeStore final : public RealtimeStore {
+class MalformedCoverageRealtimeStore final : public DelegatingRealtimeStore {
  public:
     MalformedCoverageRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
                                    CommitReaderMalformation malformation)
-        : delegate_(delegate), malformation_(malformation) {}
+        : DelegatingRealtimeStore(delegate), malformation_(malformation) {}
 
-    Status Write(RealtimeWriteBatch&& batch) override {
-        return delegate_->Write(std::move(batch));
-    }
-    Result<std::optional<std::shared_ptr<RealtimeSegmentHandle>>> SealForCommit() override {
-        return delegate_->SealForCommit();
-    }
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
         const std::shared_ptr<RealtimeSegmentHandle>& segment) override {
         PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
                                delegate_->CreateCommitReaders(segment));
         for (std::unique_ptr<BatchReader>& reader : readers) {
-            switch (malformation_) {
-                case CommitReaderMalformation::DROP_LAST:
-                    reader = std::make_unique<DropLastBatchReader>(std::move(reader));
-                    break;
-                case CommitReaderMalformation::UNSORTED:
-                    reader = std::make_unique<SwapFirstTwoBatchReader>(std::move(reader));
-                    break;
-                case CommitReaderMalformation::SUBSTITUTE_OFFSET:
-                    reader = std::make_unique<SubstituteOffsetBatchReader>(std::move(reader));
-                    break;
-            }
+            reader = std::make_unique<CorruptingBatchReader>(std::move(reader), malformation_);
         }
         return readers;
     }
-    Result<std::shared_ptr<RealtimeReadView>> AcquireReadView() override {
-        return delegate_->AcquireReadView();
-    }
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
-        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
-        const RealtimeQueryContext& context) override {
-        return delegate_->CreateQueryReaders(view, offset_begin, context);
-    }
-    Status AdvanceCommittedOffset(int64_t committed_offset) override {
-        return delegate_->AdvanceCommittedOffset(committed_offset);
-    }
-    uint64_t GetMemoryUsage() const override {
-        return delegate_->GetMemoryUsage();
-    }
 
  private:
-    std::shared_ptr<RealtimeStore> delegate_;
-    CommitReaderMalformation malformation_;
-};
-
-class MalformedCoverageRealtimeStoreFactory final : public RealtimeStoreFactory {
- public:
-    explicit MalformedCoverageRealtimeStoreFactory(
-        CommitReaderMalformation malformation = CommitReaderMalformation::DROP_LAST)
-        : malformation_(malformation) {}
-
-    Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) override {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> delegate,
-                               delegate_.Create(std::move(request)));
-        return std::shared_ptr<RealtimeStore>(
-            std::make_shared<MalformedCoverageRealtimeStore>(delegate, malformation_));
-    }
-
- private:
-    ArrowRealtimeStoreFactory delegate_;
     CommitReaderMalformation malformation_;
 };
 
@@ -1062,16 +939,6 @@ class RealtimeWriteInteTest : public ::testing::Test {
         return commit->Expire();
     }
 
-    Status CommitMessages(const std::vector<std::shared_ptr<CommitMessage>>& messages,
-                          int64_t commit_identifier) const {
-        CommitContextBuilder builder(table_path_, commit_user_);
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<CommitContext> context,
-                               builder.SetOptions(options_).Finish());
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreCommit> commit,
-                               FileStoreCommit::Create(std::move(context)));
-        return commit->Commit(messages, commit_identifier);
-    }
-
     Result<std::shared_ptr<Plan>> CreatePlan(
         const std::shared_ptr<RealtimeContext>& realtime_context,
         const std::shared_ptr<Predicate>& predicate) const {
@@ -1413,7 +1280,7 @@ class RealtimeWriteInteTest : public ::testing::Test {
             CreateTable(/*partition_keys=*/{"pt"});
         }
         auto close_state = std::make_shared<CloseTrackingReaderState>();
-        auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(close_state);
+        auto factory = MakeDecoratingFactory<CloseTrackingRealtimeStore>(close_state);
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                              RealtimeContext::Create(factory));
         ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -1524,7 +1391,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRead) {
     auto saw_query_predicate = std::make_shared<std::atomic<bool>>(false);
     auto query_view = std::make_shared<std::weak_ptr<RealtimeReadView>>();
     auto factory =
-        std::make_shared<QueryTrackingRealtimeStoreFactory>(saw_query_predicate, query_view);
+        MakeDecoratingFactory<QueryTrackingRealtimeStore>(saw_query_predicate, query_view);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2257,7 +2124,12 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
             std::max(compacted_live_max_sequence_number, file->max_sequence_number);
     }
     ASSERT_LT(compacted_live_max_sequence_number, kHistoricalMaxSequenceNumber);
-    ASSERT_OK(CommitMessages(compact_messages, /*commit_identifier=*/4));
+    CommitContextBuilder commit_builder(table_path_, commit_user_);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<CommitContext> commit_context,
+                         commit_builder.SetOptions(options_).Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreCommit> commit,
+                         FileStoreCommit::Create(std::move(commit_context)));
+    ASSERT_OK(commit->Commit(compact_messages, /*commit_identifier=*/4));
     ASSERT_OK(compact_writer->Close());
 
     ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(options_));
@@ -2304,7 +2176,7 @@ TEST_F(RealtimeWriteInteTest, TestPkCompaction) {
 
 TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
     CreatePkTable();
-    auto factory = std::make_shared<SplitCommitReaderRealtimeStoreFactory>();
+    auto factory = MakeDecoratingFactory<SplitCommitReaderRealtimeStore>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2332,7 +2204,8 @@ TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsMalformedCoverage) {
     CreatePkTable();
-    auto factory = std::make_shared<MalformedCoverageRealtimeStoreFactory>();
+    auto factory =
+        MakeDecoratingFactory<MalformedCoverageRealtimeStore>(CommitReaderMalformation::DROP_LAST);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2348,7 +2221,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRejectsMalformedCoverage) {
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsEqualCardinalityOffsetSubstitution) {
     CreatePkTable();
-    auto factory = std::make_shared<MalformedCoverageRealtimeStoreFactory>(
+    auto factory = MakeDecoratingFactory<MalformedCoverageRealtimeStore>(
         CommitReaderMalformation::SUBSTITUTE_OFFSET);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
@@ -2366,7 +2239,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRejectsEqualCardinalityOffsetSubstitution) {
 TEST_F(RealtimeWriteInteTest, TestPkRejectsUnsortedPluginRows) {
     CreatePkTable();
     auto factory =
-        std::make_shared<MalformedCoverageRealtimeStoreFactory>(CommitReaderMalformation::UNSORTED);
+        MakeDecoratingFactory<MalformedCoverageRealtimeStore>(CommitReaderMalformation::UNSORTED);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2383,7 +2256,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRejectsUnsortedPluginRows) {
 TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
     CreatePkTable();
     auto state = std::make_shared<CloseTrackingReaderState>();
-    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    auto factory = MakeDecoratingFactory<CloseTrackingRealtimeStore>(state);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2421,7 +2294,7 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
 TEST_F(RealtimeWriteInteTest, TestPkQueryReaderCloseFailure) {
     CreatePkTable();
     auto state = std::make_shared<CloseTrackingReaderState>();
-    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    auto factory = MakeDecoratingFactory<CloseTrackingRealtimeStore>(state);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2462,7 +2335,7 @@ TEST_F(RealtimeWriteInteTest, TestAppendQueryReaderCloseFailure) {
     CreateTable(/*partition_keys=*/{});
     auto state = std::make_shared<CloseTrackingReaderState>();
     state->query_null_index = 1;
-    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    auto factory = MakeDecoratingFactory<CloseTrackingRealtimeStore>(state);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
@@ -2496,7 +2369,7 @@ TEST_F(RealtimeWriteInteTest, TestPkCommitReaderCloseFailure) {
     CreatePkTable();
     auto state = std::make_shared<CloseTrackingReaderState>();
     state->commit_null_index = 1;
-    auto factory = std::make_shared<CloseTrackingRealtimeStoreFactory>(state);
+    auto factory = MakeDecoratingFactory<CloseTrackingRealtimeStore>(state);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
                          RealtimeContext::Create(factory));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,

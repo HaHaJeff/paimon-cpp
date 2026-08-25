@@ -34,7 +34,6 @@
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/core/core_options.h"
-#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/macros.h"
 #include "paimon/memory/memory_pool.h"
@@ -48,7 +47,7 @@ std::shared_ptr<arrow::Schema> PreparedSchema() {
         {DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
          DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
              ->WithNullable(false),
-         DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false),
+         DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset()),
          DataField::ConvertDataFieldToArrowField(DataField(0, arrow::field("id", arrow::int64()))),
          DataField::ConvertDataFieldToArrowField(
              DataField(1, arrow::field("value", arrow::utf8())))});
@@ -59,7 +58,7 @@ std::shared_ptr<arrow::Schema> NestedPreparedSchema() {
         {DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
          DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
              ->WithNullable(false),
-         DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false),
+         DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset()),
          DataField::ConvertDataFieldToArrowField(DataField(0, arrow::field("id", arrow::int64()))),
          DataField::ConvertDataFieldToArrowField(DataField(
              1,

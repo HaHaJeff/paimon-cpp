@@ -189,6 +189,9 @@ TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
     const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/0);
 
+    ASSERT_OK(
+        GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, GetDefaultPool()));
+
     ASSERT_EQ(4, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
                                                                /*max_sequence_number=*/4));
     ASSERT_EQ(8, context->AdvanceMaterializedMaxSequenceNumber(partition_bucket,
@@ -243,6 +246,28 @@ TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
     ASSERT_EQ(std::vector<int64_t>({8}), factory->stores[1]->committed_offsets);
 }
 
+TEST(RealtimeContextTest, TestRemovedInactivePartitionDoesNotRequireReopen) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    const std::map<std::string, std::string> active_partition = {{"dt", "2026-08-02"}};
+    const std::map<std::string, std::string> inactive_partition = {{"dt", "2026-08-03"}};
+    const RealtimePartitionBucket active_partition_bucket(active_partition, /*bucket=*/0);
+    const RealtimePartitionBucket inactive_partition_bucket(inactive_partition, /*bucket=*/0);
+
+    ASSERT_OK(context->AdvanceCommittedProgress(
+        5, {{active_partition_bucket, /*offset=*/7}, {inactive_partition_bucket, /*offset=*/9}}));
+    ASSERT_OK_AND_ASSIGN(RealtimeStoreState active_state,
+                         GetOrCreateAppendStore(context, active_partition, 0, MakeWriteSchema(), {},
+                                                GetDefaultPool()));
+    ASSERT_EQ(7, active_state.initial_offset);
+
+    ASSERT_OK(context->AdvanceCommittedProgress(6, {{active_partition_bucket, /*offset=*/7}}));
+    ASSERT_OK_AND_ASSIGN(RealtimeStoreState inactive_state,
+                         GetOrCreateAppendStore(context, inactive_partition, 0, MakeWriteSchema(),
+                                                {}, GetDefaultPool()));
+    ASSERT_EQ(0, inactive_state.initial_offset);
+}
+
 TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
@@ -277,6 +302,39 @@ TEST(RealtimeContextTest, TestRetriesOnlyIncompleteReclamation) {
     ASSERT_EQ(2, factory->stores[1]->advance_count);
     ASSERT_EQ(1, factory->stores[2]->advance_count);
     ASSERT_EQ(std::vector<int64_t>({8}), factory->stores[1]->committed_offsets);
+}
+
+TEST(RealtimeContextTest, TestRequiresReopenWhenCommittedProgressMovesBackwards) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    const std::map<std::string, std::string> first_partition = {{"dt", "2026-08-02"}};
+    const std::map<std::string, std::string> second_partition = {{"dt", "2026-08-03"}};
+    const RealtimePartitionBucket first_partition_bucket(first_partition, /*bucket=*/0);
+    const RealtimePartitionBucket second_partition_bucket(second_partition, /*bucket=*/0);
+
+    ASSERT_OK(GetOrCreateAppendStore(context, first_partition, 0, MakeWriteSchema(), {},
+                                     GetDefaultPool()));
+    ASSERT_OK(GetOrCreateAppendStore(context, second_partition, 0, MakeWriteSchema(), {},
+                                     GetDefaultPool()));
+    ASSERT_OK(context->AdvanceCommittedProgress(
+        5, {{first_partition_bucket, /*offset=*/7}, {second_partition_bucket, /*offset=*/9}}));
+    ASSERT_EQ(std::vector<int64_t>({7}), factory->stores[0]->committed_offsets);
+    ASSERT_EQ(std::vector<int64_t>({9}), factory->stores[1]->committed_offsets);
+
+    ASSERT_NOK_WITH_MSG(
+        context->AdvanceCommittedProgress(
+            6, {{first_partition_bucket, /*offset=*/6}, {second_partition_bucket, /*offset=*/10}}),
+        "recreate RealtimeContext");
+    ASSERT_NOK_WITH_MSG(
+        context->AdvanceCommittedProgress(6, {{first_partition_bucket, /*offset=*/10}}),
+        "recreate RealtimeContext");
+    ASSERT_EQ(std::vector<int64_t>({7}), factory->stores[0]->committed_offsets);
+    ASSERT_EQ(std::vector<int64_t>({9}), factory->stores[1]->committed_offsets);
+
+    ASSERT_OK(context->AdvanceCommittedProgress(
+        6, {{first_partition_bucket, /*offset=*/10}, {second_partition_bucket, /*offset=*/11}}));
+    ASSERT_EQ(std::vector<int64_t>({7, 10}), factory->stores[0]->committed_offsets);
+    ASSERT_EQ(std::vector<int64_t>({9, 11}), factory->stores[1]->committed_offsets);
 }
 
 TEST(RealtimeContextTest, TestPinsResolvesAndReleasesReadViewTicket) {

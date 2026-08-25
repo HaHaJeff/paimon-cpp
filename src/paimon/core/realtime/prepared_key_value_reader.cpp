@@ -47,7 +47,6 @@
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/fields_comparator.h"
 #include "paimon/common/utils/scope_guard.h"
-#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"
 #include "paimon/reader/batch_reader.h"
@@ -672,7 +671,7 @@ Status ValidatePreparedTransportSchema(const std::shared_ptr<arrow::Schema>& pre
     PAIMON_RETURN_NOT_OK(
         CheckPreparedField(prepared_schema, kSequenceNumberIndex, SpecialFields::SequenceNumber()));
     PAIMON_RETURN_NOT_OK(
-        CheckPreparedField(prepared_schema, kRealtimeOffsetIndex, RealtimeOffsetField()));
+        CheckPreparedField(prepared_schema, kRealtimeOffsetIndex, SpecialFields::RealtimeOffset()));
     return Status::OK();
 }
 

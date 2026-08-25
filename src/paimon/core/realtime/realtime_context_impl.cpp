@@ -161,8 +161,7 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     RealtimeStoreCreateConfig mode_config = request.mode_config;
     Result<std::shared_ptr<RealtimeStore>> store_result = factory_->Create(std::move(request));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store, std::move(store_result));
-    stores_.emplace(key,
-                    RealtimeStoreRegistryEntry{store, requested_schema, std::move(mode_config)});
+    stores_.emplace(key, StoreEntry{store, requested_schema, std::move(mode_config)});
     if (offset_iter != committed_offsets_.end()) {
         reclaimed_offsets_.emplace(key, offset_iter->second);
     }
@@ -172,12 +171,11 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
 int64_t RealtimeContextImpl::AdvanceMaterializedMaxSequenceNumber(
     const RealtimePartitionBucket& partition_bucket, int64_t max_sequence_number) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto [iter, inserted] =
-        materialized_max_sequence_numbers_.emplace(partition_bucket, max_sequence_number);
-    if (!inserted && max_sequence_number > iter->second) {
-        iter->second = max_sequence_number;
+    StoreEntry& entry = stores_.at(partition_bucket);
+    if (max_sequence_number > entry.materialized_max_sequence_number) {
+        entry.materialized_max_sequence_number = max_sequence_number;
     }
-    return iter->second;
+    return entry.materialized_max_sequence_number;
 }
 
 Result<std::vector<RealtimePartitionBucketView>> RealtimeContextImpl::AcquireReadViews() {

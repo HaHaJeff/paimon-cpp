@@ -36,7 +36,6 @@
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
-#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/realtime/offset_range.h"
 #include "paimon/testing/mock/mock_file_batch_reader.h"
@@ -44,7 +43,6 @@
 #include "paimon/testing/utils/key_value_checker.h"
 #include "paimon/testing/utils/read_result_collector.h"
 #include "paimon/testing/utils/testharness.h"
-#include "paimon/utils/special_field_ids.h"
 
 namespace paimon::test {
 
@@ -62,7 +60,7 @@ std::shared_ptr<arrow::Schema> MakePreparedSchema(const arrow::FieldVector& valu
         DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
         DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
             ->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false)};
+        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
     prepared_fields.insert(prepared_fields.end(), value_fields.begin(), value_fields.end());
     return arrow::schema(prepared_fields);
 }
@@ -104,14 +102,6 @@ class MergedKeyValueRecordReaderTest : public testing::Test {
     std::shared_ptr<MemoryPool> pool_;
     std::shared_ptr<ReducerMergeFunctionWrapper> merge_function_wrapper_;
 };
-
-TEST_F(MergedKeyValueRecordReaderTest, TestRealtimeOffsetField) {
-    const DataField& field = RealtimeOffsetField();
-    ASSERT_EQ(SpecialFieldIds::REALTIME_OFFSET, field.Id());
-    ASSERT_EQ("_REALTIME_OFFSET", field.Name());
-    ASSERT_EQ(arrow::Type::INT64, field.Type()->id());
-    ASSERT_FALSE(field.Nullable());
-}
 
 TEST_F(MergedKeyValueRecordReaderTest, TestMergeAcrossUnderlyingBatches) {
     std::vector<DataField> fields = {DataField(0, arrow::field("k0", arrow::int32())),

@@ -36,7 +36,6 @@
 #include "paimon/core/operation/file_store_scan.h"
 #include "paimon/core/operation/key_value_file_store_scan.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
-#include "paimon/core/realtime/realtime_fields.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/utils/file_store_path_factory.h"
@@ -136,16 +135,16 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         partition_map =
             std::map<std::string, std::string>(partition_values.begin(), partition_values.end());
         PAIMON_ASSIGN_OR_RAISE(realtime_context_impl, RealtimeContextImpl::Cast(realtime_context_));
-        if (schema_->GetFieldByName(RealtimeOffsetField().Name())) {
+        if (schema_->GetFieldByName(SpecialFields::RealtimeOffset().Name())) {
             return Status::Invalid("PK real-time write schema contains reserved transport field " +
-                                   RealtimeOffsetField().Name());
+                                   SpecialFields::RealtimeOffset().Name());
         }
         arrow::FieldVector prepared_fields = {
             DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
                 ->WithNullable(false),
             DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
                 ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(RealtimeOffsetField())->WithNullable(false)};
+            DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
         prepared_fields.insert(prepared_fields.end(), schema_->fields().begin(),
                                schema_->fields().end());
         auto c_write_schema = std::make_unique<ArrowSchema>();
