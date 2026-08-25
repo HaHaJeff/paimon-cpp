@@ -237,7 +237,7 @@ Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& 
             return Status::NotImplemented(
                 "PK real-time union read does not support read-optimized scans");
         }
-        PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options, table_schema));
+        PAIMON_RETURN_NOT_OK(PrimaryKeyRealtimeStore::ValidateOptions(core_options, table_schema));
     }
     if (context.IsStreamingMode()) {
         return Status::Invalid("real-time union read currently supports batch scans only");

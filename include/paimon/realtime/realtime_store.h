@@ -108,7 +108,7 @@ class PAIMON_EXPORT RealtimeReadView {
 /// Parameters used by a `RealtimeStore` to create readers for a query.
 struct PAIMON_EXPORT RealtimeQueryContext {
     /// Append mode receives the requested output fields before the mandatory leading
-    /// `_VALUE_KIND` field is added. Primary-key mode receives the complete prepared schema.
+    /// `_VALUE_KIND` field is added. Primary-key mode receives the requested prepared schema.
     /// This schema is borrowed and remains valid only during `CreateQueryReaders`; plugins must
     /// import or copy it synchronously.
     ::ArrowSchema* read_schema;
@@ -165,10 +165,11 @@ class PAIMON_EXPORT RealtimeStore {
     ///
     /// Append-mode batches contain `_VALUE_KIND` followed by the requested fields except a
     /// duplicate `_VALUE_KIND`, and collectively expose every matching row exactly once.
-    /// Primary-key batches use the prepared transport schema and may contain multiple mutations
-    /// per key; each reader's complete stream is sorted by full primary key then sequence number,
-    /// and the readers collectively expose every raw mutation exactly once. Paimon retains `view`
-    /// for the lifetime of the resulting framework reader.
+    /// Primary-key batches use the requested prepared transport schema, including nested field-ID
+    /// alignment, and may contain multiple mutations per key; each reader's complete stream is
+    /// sorted by full primary key then sequence number, and the readers collectively expose every
+    /// raw mutation exactly once. Paimon retains `view` for the lifetime of the resulting framework
+    /// reader.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
         const RealtimeQueryContext& context) = 0;

@@ -30,6 +30,7 @@
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/macros.h"
@@ -38,6 +39,12 @@
 
 namespace paimon::test {
 namespace {
+
+std::shared_ptr<arrow::Field> FieldWithId(const std::string& name,
+                                          const std::shared_ptr<arrow::DataType>& type,
+                                          int32_t field_id) {
+    return DataField::ConvertDataFieldToArrowField(DataField(field_id, arrow::field(name, type)));
+}
 
 std::shared_ptr<arrow::Schema> PreparedSchema() {
     return arrow::schema(
@@ -93,6 +100,18 @@ std::unique_ptr<RecordBatch> MakeBatch(const std::shared_ptr<arrow::Schema>& sch
     return RecordBatchBuilder(c_array.get()).Finish().value();
 }
 
+std::unique_ptr<RecordBatch> MakeSlicedBatch(const std::shared_ptr<arrow::Schema>& schema,
+                                             const std::string& json, int64_t offset,
+                                             int64_t length) {
+    std::shared_ptr<arrow::Array> array =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema->fields()), json)
+            .ValueOrDie()
+            ->Slice(offset, length);
+    auto c_array = std::make_unique<ArrowArray>();
+    EXPECT_TRUE(arrow::ExportArray(*array, c_array.get()).ok());
+    return RecordBatchBuilder(c_array.get()).Finish().value();
+}
+
 void AssertOffsetsZero(const ArrowArray* array) {
     ASSERT_NE(nullptr, array);
     ASSERT_EQ(0, array->offset);
@@ -125,7 +144,7 @@ Result<std::string> ReadJson(const std::vector<std::unique_ptr<BatchReader>>& re
 
 TEST(PrimaryKeyRealtimeStoreOptionsTest, TestSupportedOptions) {
     ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
-    ASSERT_OK(ValidatePrimaryKeyRealtimeOptions(options, *PkSchema()));
+    ASSERT_OK(PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema()));
 }
 
 TEST(PrimaryKeyRealtimeStoreOptionsTest, TestUnsupportedOptions) {
@@ -143,16 +162,18 @@ TEST(PrimaryKeyRealtimeStoreOptionsTest, TestUnsupportedOptions) {
     };
     for (const std::map<std::string, std::string>& option_map : unsupported_options) {
         ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
-        ASSERT_NOK(ValidatePrimaryKeyRealtimeOptions(options, *PkSchema()));
+        ASSERT_NOK(PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema()));
     }
 }
 
 TEST(PrimaryKeyRealtimeStoreOptionsTest, TestRejectsFloatingPrimaryKeys) {
     ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
-    ASSERT_NOK_WITH_MSG(ValidatePrimaryKeyRealtimeOptions(options, *PkSchema(arrow::float32())),
-                        "FLOAT or DOUBLE primary keys");
-    ASSERT_NOK_WITH_MSG(ValidatePrimaryKeyRealtimeOptions(options, *PkSchema(arrow::float64())),
-                        "FLOAT or DOUBLE primary keys");
+    ASSERT_NOK_WITH_MSG(
+        PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema(arrow::float32())),
+        "FLOAT or DOUBLE primary keys");
+    ASSERT_NOK_WITH_MSG(
+        PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema(arrow::float64())),
+        "FLOAT or DOUBLE primary keys");
 }
 
 TEST(PrimaryKeyRealtimeStoreOptionsTest, TestRejectsEnabledGlobalIndex) {
@@ -160,7 +181,7 @@ TEST(PrimaryKeyRealtimeStoreOptionsTest, TestRejectsEnabledGlobalIndex) {
                                                            {Options::PK_BTREE_INDEX_COLUMNS, "id"}};
     ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
     ASSERT_NOK_WITH_MSG(
-        ValidatePrimaryKeyRealtimeOptions(options, *PkSchema(arrow::int64(), option_map)),
+        PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema(arrow::int64(), option_map)),
         "does not support global indexes");
 }
 
@@ -306,7 +327,9 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderPerStoredBatch) {
     ASSERT_OK(
         store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 2, 1, 1, "one"]])"), OffsetRange(1, 2)}));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-    RealtimeQueryContext context{/*read_schema=*/nullptr, /*predicate=*/nullptr,
+    auto c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*PreparedSchema(), c_schema.get()).ok());
+    RealtimeQueryContext context{/*read_schema=*/c_schema.get(), /*predicate=*/nullptr,
                                  /*enable_predicate_pushdown=*/false};
     ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
                          store->CreateQueryReaders(view, /*offset_begin=*/0, context));
@@ -314,6 +337,121 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderPerStoredBatch) {
     ASSERT_OK_AND_ASSIGN(std::string actual, ReadJson(readers));
     ASSERT_NE(std::string::npos, actual.find("\"one\""));
     ASSERT_NE(std::string::npos, actual.find("\"two\""));
+}
+
+TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderProjectsTopLevelFieldsById) {
+    const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                         PrimaryKeyRealtimeStore::Create(stored_schema));
+    ASSERT_OK(store->Write(RealtimeWriteBatch{
+        MakeSlicedBatch(stored_schema,
+                        R"([[0, 1, 0, 6, "six"], [0, 2, 1, 7, "seven"], [0, 3, 2, 8, "eight"]])", 1,
+                        1),
+        OffsetRange(0, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
+
+    arrow::FieldVector requested_fields(stored_schema->fields().begin(),
+                                        stored_schema->fields().begin() + 3);
+    requested_fields.push_back(FieldWithId("renamed_value", arrow::utf8(), 1));
+    requested_fields.push_back(FieldWithId("added", arrow::int32(), 2));
+    std::shared_ptr<arrow::Schema> requested_schema = arrow::schema(std::move(requested_fields));
+    auto c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*requested_schema, c_schema.get()).ok());
+    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
+                                 /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         store->CreateQueryReaders(view, /*offset_begin=*/0, context));
+    ASSERT_EQ(1, readers.size());
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    arrow::Result<std::shared_ptr<arrow::Array>> import_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(import_result.ok()) << import_result.status().ToString();
+    std::shared_ptr<arrow::Array> array = std::move(import_result).ValueOrDie();
+    ASSERT_TRUE(array->type()->Equals(arrow::struct_(requested_schema->fields())));
+    std::shared_ptr<arrow::StructArray> projected = checked_pointer_cast<arrow::StructArray>(array);
+    ASSERT_EQ(5, projected->num_fields());
+    ASSERT_EQ("seven", checked_pointer_cast<arrow::StringArray>(projected->field(3))->GetString(0));
+    ASSERT_TRUE(projected->field(4)->IsNull(0));
+}
+
+TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
+    const std::shared_ptr<arrow::Field> stored_a = FieldWithId("a", arrow::int32(), 10);
+    const std::shared_ptr<arrow::Field> stored_b = FieldWithId("b", arrow::int32(), 11);
+    const std::shared_ptr<arrow::Field> stored_x = FieldWithId("x", arrow::int32(), 20);
+    const std::shared_ptr<arrow::Field> stored_y = FieldWithId("y", arrow::int32(), 21);
+    arrow::FieldVector stored_fields = {
+        DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
+        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
+            ->WithNullable(false),
+        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset()),
+        FieldWithId("id", arrow::int64(), 0),
+        FieldWithId("items", arrow::list(arrow::struct_({stored_a, stored_b})), 1),
+        FieldWithId("attrs", arrow::map(arrow::utf8(), arrow::struct_({stored_x, stored_y})), 2)};
+    std::shared_ptr<arrow::Schema> stored_schema = arrow::schema(std::move(stored_fields));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                         PrimaryKeyRealtimeStore::Create(stored_schema));
+    ASSERT_OK(store->Write(RealtimeWriteBatch{
+        MakeSlicedBatch(
+            stored_schema,
+            R"([[0, 1, 0, 6, [[1, 2]], [["before", [3, 4]]]], [0, 2, 1, 7, [[100, 200], null], [["k1", [7, 8]], ["k2", null]]], [0, 3, 2, 8, [[9, 10]], [["after", [11, 12]]]]])",
+            1, 1),
+        OffsetRange(0, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
+
+    const std::shared_ptr<arrow::Field> requested_b = FieldWithId("renamed_b", arrow::int32(), 11);
+    const std::shared_ptr<arrow::Field> requested_a = FieldWithId("renamed_a", arrow::int32(), 10);
+    const std::shared_ptr<arrow::Field> requested_item_missing =
+        FieldWithId("added_item", arrow::int32(), 12);
+    const std::shared_ptr<arrow::Field> requested_y = FieldWithId("renamed_y", arrow::int32(), 21);
+    const std::shared_ptr<arrow::Field> requested_x = FieldWithId("renamed_x", arrow::int32(), 20);
+    const std::shared_ptr<arrow::Field> requested_attr_missing =
+        FieldWithId("added_attr", arrow::int32(), 22);
+    arrow::FieldVector requested_fields(stored_schema->fields().begin(),
+                                        stored_schema->fields().begin() + 3);
+    requested_fields.push_back(FieldWithId(
+        "renamed_items",
+        arrow::list(arrow::struct_({requested_b, requested_item_missing, requested_a})), 1));
+    requested_fields.push_back(
+        FieldWithId("renamed_attrs",
+                    arrow::map(arrow::utf8(),
+                               arrow::struct_({requested_y, requested_attr_missing, requested_x})),
+                    2));
+    std::shared_ptr<arrow::Schema> requested_schema = arrow::schema(std::move(requested_fields));
+    auto c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*requested_schema, c_schema.get()).ok());
+    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
+                                 /*enable_predicate_pushdown=*/false};
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
+                         store->CreateQueryReaders(view, /*offset_begin=*/0, context));
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
+    arrow::Result<std::shared_ptr<arrow::Array>> import_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(import_result.ok()) << import_result.status().ToString();
+    std::shared_ptr<arrow::Array> array = std::move(import_result).ValueOrDie();
+    ASSERT_TRUE(array->type()->Equals(arrow::struct_(requested_schema->fields())));
+    std::shared_ptr<arrow::StructArray> projected = checked_pointer_cast<arrow::StructArray>(array);
+    const std::shared_ptr<arrow::ListArray> items =
+        checked_pointer_cast<arrow::ListArray>(projected->field(3));
+    const std::shared_ptr<arrow::StructArray> item_values =
+        checked_pointer_cast<arrow::StructArray>(items->value_slice(0));
+    ASSERT_EQ(200, checked_pointer_cast<arrow::Int32Array>(item_values->field(0))->Value(0));
+    ASSERT_TRUE(item_values->field(1)->IsNull(0));
+    ASSERT_EQ(100, checked_pointer_cast<arrow::Int32Array>(item_values->field(2))->Value(0));
+    ASSERT_TRUE(item_values->IsNull(1));
+
+    const std::shared_ptr<arrow::MapArray> attrs =
+        checked_pointer_cast<arrow::MapArray>(projected->field(4));
+    const int64_t attr_offset = attrs->value_offset(0);
+    const int64_t attr_length = attrs->value_length(0);
+    const std::shared_ptr<arrow::StringArray> attr_keys =
+        checked_pointer_cast<arrow::StringArray>(attrs->keys()->Slice(attr_offset, attr_length));
+    ASSERT_EQ("k1", attr_keys->GetString(0));
+    const std::shared_ptr<arrow::StructArray> attr_values =
+        checked_pointer_cast<arrow::StructArray>(attrs->items()->Slice(attr_offset, attr_length));
+    ASSERT_EQ(8, checked_pointer_cast<arrow::Int32Array>(attr_values->field(0))->Value(0));
+    ASSERT_TRUE(attr_values->field(1)->IsNull(0));
+    ASSERT_EQ(7, checked_pointer_cast<arrow::Int32Array>(attr_values->field(2))->Value(0));
+    ASSERT_TRUE(attr_values->IsNull(1));
 }
 
 }  // namespace

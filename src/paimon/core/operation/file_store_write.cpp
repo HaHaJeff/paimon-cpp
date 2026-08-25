@@ -198,7 +198,7 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
     } else {
         // pk table
         if (ctx->GetRealtimeContext()) {
-            PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(options, *schema));
+            PAIMON_RETURN_NOT_OK(PrimaryKeyRealtimeStore::ValidateOptions(options, *schema));
             if (ignore_previous_files) {
                 return Status::NotImplemented(
                     "PK realtime v1 requires restore from the latest snapshot");

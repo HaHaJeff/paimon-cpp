@@ -44,6 +44,7 @@
 #include "paimon/common/data/shredding/map_shared_shredding_utils.h"
 #include "paimon/common/data/shredding/map_shredding_defs.h"
 #include "paimon/common/table/special_fields.h"
+#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/core/io/data_file_meta.h"
@@ -110,7 +111,7 @@ class TestingMemoryPool final : public MemoryPool {
     std::unique_ptr<MemoryPool> delegate_ = GetMemoryPool();
 };
 
-}
+}  // namespace
 
 class KeyValueFileStoreWriteTest : public ::testing::Test {
  protected:
@@ -255,10 +256,23 @@ class KeyValueFileStoreWriteTest : public ::testing::Test {
         if (views.size() != 1) {
             return Status::Invalid("expected exactly one real-time store");
         }
-        RealtimeQueryContext query_context{nullptr, nullptr, false};
-        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
-                               views[0].store->CreateQueryReaders(
-                                   views[0].read_view, 0, query_context));
+        std::shared_ptr<arrow::Schema> prepared_schema = arrow::schema({
+            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
+                ->WithNullable(false),
+            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
+                ->WithNullable(false),
+            DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset()),
+            DataField::ConvertDataFieldToArrowField(
+                DataField(0, arrow::field("id", arrow::int64(), false))),
+            DataField::ConvertDataFieldToArrowField(
+                DataField(1, arrow::field("value", arrow::utf8()))),
+        });
+        auto c_schema = std::make_unique<ArrowSchema>();
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*prepared_schema, c_schema.get()));
+        RealtimeQueryContext query_context{c_schema.get(), nullptr, false};
+        PAIMON_ASSIGN_OR_RAISE(
+            std::vector<std::unique_ptr<BatchReader>> readers,
+            views[0].store->CreateQueryReaders(views[0].read_view, 0, query_context));
         std::vector<std::tuple<int8_t, int64_t, std::string, int64_t, int64_t>> rows;
         for (const std::unique_ptr<BatchReader>& reader : readers) {
             while (true) {
@@ -466,8 +480,8 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeWrite) {
 }
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
-    const std::map<std::string, std::string> options = {
-        {Options::BUCKET, "1"}, {Options::REALTIME_ENABLED, "true"}};
+    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"},
+                                                        {Options::REALTIME_ENABLED, "true"}};
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
         arrow::field("_REALTIME_OFFSET", arrow::int64()),
@@ -490,8 +504,8 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
 }
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimePool) {
-    const std::map<std::string, std::string> options = {
-        {Options::BUCKET, "1"}, {Options::REALTIME_ENABLED, "true"}};
+    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"},
+                                                        {Options::REALTIME_ENABLED, "true"}};
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
         arrow::field("value", arrow::utf8()),
@@ -549,8 +563,8 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimePool) {
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimeLimits) {
     const int64_t max = std::numeric_limits<int64_t>::max();
-    const std::map<std::string, std::string> options = {
-        {Options::BUCKET, "1"}, {Options::REALTIME_ENABLED, "true"}};
+    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"},
+                                                        {Options::REALTIME_ENABLED, "true"}};
     const std::shared_ptr<arrow::Schema> schema = arrow::schema({
         arrow::field("id", arrow::int64(), false),
         arrow::field("value", arrow::utf8()),

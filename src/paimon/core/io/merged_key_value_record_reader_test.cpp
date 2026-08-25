@@ -325,10 +325,10 @@ TEST_F(MergedKeyValueRecordReaderTest, TestMissingCompositeKey) {
         std::unique_ptr<KeyValueRecordReader> reader,
         AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
                                         arrow::schema({key0, key1}), value_schema, pool_));
-    ASSERT_NOK_WITH_MSG(reader->NextBatch(), "cannot find field id 1");
+    ASSERT_NOK_WITH_MSG(reader->NextBatch(), "field count");
 }
 
-TEST_F(MergedKeyValueRecordReaderTest, TestQueryAddRename) {
+TEST_F(MergedKeyValueRecordReaderTest, TestQueryReaderRequiresStoreAlignedSchema) {
     std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
     std::shared_ptr<arrow::Field> old_value = MakeField("old_value", arrow::int32(), 1);
     std::shared_ptr<arrow::Field> renamed_value = MakeField("renamed_value", arrow::int32(), 1);
@@ -347,11 +347,7 @@ TEST_F(MergedKeyValueRecordReaderTest, TestQueryAddRename) {
         std::unique_ptr<KeyValueRecordReader> reader,
         AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
                                         arrow::schema({key}), value_schema, pool_));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<KeyValueRecordReader::Iterator> iterator,
-                         reader->NextBatch());
-    ASSERT_OK_AND_ASSIGN(KeyValue key_value, iterator->Next());
-    ASSERT_EQ(20, key_value.value->GetInt(1));
-    ASSERT_TRUE(key_value.value->IsNullAt(2));
+    ASSERT_NOK_WITH_MSG(reader->NextBatch(), "field count");
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestMergedReaderErrorRetry) {
@@ -402,35 +398,9 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderSafeDecode) {
         "prepared batch field");
 }
 
-TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedProjection) {
+TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedValues) {
     std::shared_ptr<arrow::Field> id = MakeField("id", arrow::int32(), 0);
-    std::shared_ptr<arrow::Field> item_a = MakeField("a", arrow::int32(), 10);
-    std::shared_ptr<arrow::Field> item_b = MakeField("b", arrow::int32(), 11);
-    std::shared_ptr<arrow::Field> items =
-        MakeField("items", arrow::list(arrow::field("item", arrow::struct_({item_a, item_b}))), 2);
-    std::shared_ptr<arrow::Field> attr_x = MakeField("x", arrow::int32(), 20);
-    std::shared_ptr<arrow::Field> attr_y = MakeField("y", arrow::int32(), 21);
-    std::shared_ptr<arrow::Field> attrs =
-        MakeField("attrs", arrow::map(arrow::utf8(), arrow::struct_({attr_x, attr_y})), 3);
-    std::shared_ptr<arrow::Field> key_left = MakeField("left", arrow::int32(), 30);
-    std::shared_ptr<arrow::Field> key_right = MakeField("right", arrow::int32(), 31);
-    std::shared_ptr<arrow::Field> keyed_values = MakeField(
-        "keyed_values", arrow::map(arrow::struct_({key_left, key_right}), arrow::int32()), 4);
-    std::shared_ptr<arrow::Schema> full_value_schema =
-        arrow::schema({id, items, attrs, keyed_values});
     std::shared_ptr<arrow::Schema> key_schema = arrow::schema({id});
-    std::shared_ptr<arrow::Schema> prepared_schema =
-        MakePreparedSchema(full_value_schema->fields());
-    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
-    auto prepared_array = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([
-        [0, 9, 9, 0, [[1, 2]], [["prefix", [3, 4]]], [[[5, 6], 7]]],
-        [0, 10, 0, 1, [[100, 200], [300, 400]], [["k1", [7, 8]], ["k2", [9, 10]]], [[[11, 12], 13], [[21, 22], 23]]],
-        [0, 11, 11, 2, [[8, 9]], [["suffix", [10, 11]]], [[[12, 13], 14]]]
-    ])")
-            .ValueOrDie());
-    prepared_array = checked_pointer_cast<arrow::StructArray>(prepared_array->Slice(1, 1));
-
     std::shared_ptr<arrow::Field> query_item_b = MakeField("renamed_b", arrow::int32(), 11);
     std::shared_ptr<arrow::Field> query_item_a = MakeField("renamed_a", arrow::int32(), 10);
     std::shared_ptr<arrow::Field> query_items = MakeField(
@@ -448,6 +418,14 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderNestedProjection) {
                   arrow::map(arrow::struct_({query_key_right, query_key_left}), arrow::int32()), 4);
     std::shared_ptr<arrow::Schema> query_value_schema =
         arrow::schema({id, query_items, query_attrs, query_keyed_values});
+    std::shared_ptr<arrow::Schema> prepared_schema =
+        MakePreparedSchema(query_value_schema->fields());
+    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
+    std::shared_ptr<arrow::Array> prepared_array =
+        arrow::ipc::internal::json::ArrayFromJSON(
+            prepared_type,
+            R"([[0, 10, 0, 1, [[200, 100], [400, 300]], [["k1", [8, 7]], ["k2", [10, 9]]], [[[12, 11], 13], [[22, 21], 23]]]])")
+            .ValueOrDie();
 
     auto batch_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
     ASSERT_OK_AND_ASSIGN(

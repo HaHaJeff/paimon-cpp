@@ -20,24 +20,29 @@
 
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "fmt/format.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/types/data_field.h"
+#include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/index/pk/primary_key_index_definitions.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/schema/table_schema.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"
 
 namespace paimon {
 
-Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options, const TableSchema& schema) {
+Status PrimaryKeyRealtimeStore::ValidateOptions(const CoreOptions& options,
+                                                const TableSchema& schema) {
     if (options.GetBucket() <= 0) {
         return Status::NotImplemented("PK realtime v1 requires fixed buckets");
     }
@@ -86,20 +91,119 @@ Status ValidatePrimaryKeyRealtimeOptions(const CoreOptions& options, const Table
 
 namespace {
 
-uint64_t GetArrayMemoryUsage(const std::shared_ptr<arrow::ArrayData>& data) {
-    uint64_t total = 0;
-    for (const std::shared_ptr<arrow::Buffer>& buffer : data->buffers) {
-        if (buffer) {
-            total += static_cast<uint64_t>(buffer->size());
+Result<std::shared_ptr<arrow::Array>> AlignArrayByPaimonIds(
+    const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
+    arrow::MemoryPool* pool);
+
+bool TypesExactlyEqual(const std::shared_ptr<arrow::DataType>& data_type,
+                       const std::shared_ptr<arrow::DataType>& read_type) {
+    if (!data_type->Equals(read_type) || data_type->num_fields() != read_type->num_fields()) {
+        return false;
+    }
+    for (int32_t i = 0; i < data_type->num_fields(); ++i) {
+        if (!data_type->field(i)->Equals(read_type->field(i), /*check_metadata=*/true) ||
+            !TypesExactlyEqual(data_type->field(i)->type(), read_type->field(i)->type())) {
+            return false;
         }
     }
-    for (const std::shared_ptr<arrow::ArrayData>& child : data->child_data) {
-        total += GetArrayMemoryUsage(child);
+    return true;
+}
+
+Result<std::shared_ptr<arrow::Array>> AlignStructArrayByPaimonIds(
+    const std::shared_ptr<arrow::StructArray>& array,
+    const std::shared_ptr<arrow::StructType>& read_type, arrow::MemoryPool* pool) {
+    const std::shared_ptr<arrow::StructType> data_type =
+        checked_pointer_cast<arrow::StructType>(array->type());
+    std::unordered_map<int32_t, int32_t> data_field_indexes;
+    data_field_indexes.reserve(data_type->num_fields());
+    for (int32_t i = 0; i < data_type->num_fields(); ++i) {
+        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
+                               NestedProjectionUtils::GetPaimonFieldId(data_type->field(i)));
+        if (!data_field_indexes.emplace(field_id, i).second) {
+            return Status::Invalid(fmt::format("duplicate field id {} in stored schema", field_id));
+        }
     }
-    if (data->dictionary) {
-        total += GetArrayMemoryUsage(data->dictionary);
+
+    std::unordered_map<int32_t, bool> requested_field_ids;
+    requested_field_ids.reserve(read_type->num_fields());
+    std::vector<std::shared_ptr<arrow::ArrayData>> children;
+    children.reserve(read_type->num_fields());
+    for (const std::shared_ptr<arrow::Field>& read_field : read_type->fields()) {
+        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
+                               NestedProjectionUtils::GetPaimonFieldId(read_field));
+        if (!requested_field_ids.emplace(field_id, true).second) {
+            return Status::Invalid(
+                fmt::format("duplicate field id {} in requested schema", field_id));
+        }
+        const auto data_iter = data_field_indexes.find(field_id);
+        if (data_iter == data_field_indexes.end()) {
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                std::shared_ptr<arrow::Array> null_child,
+                arrow::MakeArrayOfNull(read_field->type(), array->offset() + array->length(),
+                                       pool));
+            children.push_back(null_child->data());
+            continue;
+        }
+        std::shared_ptr<arrow::Array> child =
+            arrow::MakeArray(array->data()->child_data[data_iter->second]);
+        PAIMON_ASSIGN_OR_RAISE(child, AlignArrayByPaimonIds(child, read_field->type(), pool));
+        children.push_back(child->data());
     }
-    return total;
+
+    std::shared_ptr<arrow::ArrayData> aligned = array->data()->Copy();
+    aligned->type = read_type;
+    aligned->child_data = std::move(children);
+    return arrow::MakeArray(std::move(aligned));
+}
+
+Result<std::shared_ptr<arrow::Array>> AlignArrayByPaimonIds(
+    const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
+    arrow::MemoryPool* pool) {
+    if (TypesExactlyEqual(array->type(), read_type)) {
+        return array;
+    }
+    if (array->type_id() != read_type->id()) {
+        return Status::Invalid(fmt::format("stored value type {} does not match requested type {}",
+                                           array->type()->ToString(), read_type->ToString()));
+    }
+    switch (read_type->id()) {
+        case arrow::Type::STRUCT:
+            return AlignStructArrayByPaimonIds(checked_pointer_cast<arrow::StructArray>(array),
+                                               checked_pointer_cast<arrow::StructType>(read_type),
+                                               pool);
+        case arrow::Type::LIST: {
+            std::shared_ptr<arrow::Array> values =
+                checked_pointer_cast<arrow::ListArray>(array)->values();
+            PAIMON_ASSIGN_OR_RAISE(
+                values, AlignArrayByPaimonIds(values, read_type->field(0)->type(), pool));
+            std::shared_ptr<arrow::ArrayData> aligned = array->data()->Copy();
+            aligned->type = read_type;
+            aligned->child_data = {values->data()};
+            return arrow::MakeArray(std::move(aligned));
+        }
+        case arrow::Type::MAP: {
+            const std::shared_ptr<arrow::MapArray> map =
+                checked_pointer_cast<arrow::MapArray>(array);
+            const std::shared_ptr<arrow::MapType> map_type =
+                checked_pointer_cast<arrow::MapType>(read_type);
+            std::shared_ptr<arrow::Array> keys = map->keys();
+            PAIMON_ASSIGN_OR_RAISE(keys, AlignArrayByPaimonIds(keys, map_type->key_type(), pool));
+            std::shared_ptr<arrow::Array> items = map->items();
+            PAIMON_ASSIGN_OR_RAISE(items,
+                                   AlignArrayByPaimonIds(items, map_type->item_type(), pool));
+            std::shared_ptr<arrow::ArrayData> entries = array->data()->child_data[0]->Copy();
+            entries->type = arrow::struct_({map_type->key_field(), map_type->item_field()});
+            entries->child_data = {keys->data(), items->data()};
+            std::shared_ptr<arrow::ArrayData> aligned = array->data()->Copy();
+            aligned->type = read_type;
+            aligned->child_data = {std::move(entries)};
+            return arrow::MakeArray(std::move(aligned));
+        }
+        default:
+            return Status::Invalid(
+                fmt::format("stored leaf type {} does not match requested type {}",
+                            array->type()->ToString(), read_type->ToString()));
+    }
 }
 
 struct StoredBatch {
@@ -201,8 +305,8 @@ class PrimaryKeyRealtimeStore::Impl {
         std::shared_ptr<arrow::StructArray> prepared =
             checked_pointer_cast<arrow::StructArray>(array);
         std::lock_guard<std::mutex> lock(mutex_);
-        building_.push_back(
-            StoredBatch{prepared, write_batch.offset_range, GetArrayMemoryUsage(prepared->data())});
+        building_.push_back(StoredBatch{prepared, write_batch.offset_range,
+                                        ArrowUtils::GetArrayMemoryUsage(prepared->data())});
         building_memory_usage_ += building_.back().memory_usage;
         return Status::OK();
     }
@@ -247,15 +351,28 @@ class PrimaryKeyRealtimeStore::Impl {
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
-        const std::shared_ptr<RealtimeReadView>& view, int64_t, const RealtimeQueryContext&) {
+        const std::shared_ptr<RealtimeReadView>& view, int64_t,
+        const RealtimeQueryContext& context) {
         std::shared_ptr<ReadView> typed = std::dynamic_pointer_cast<ReadView>(view);
         if (!typed) {
             return Status::Invalid("read view was not created by the PK real-time store");
         }
+        if (context.read_schema == nullptr || context.read_schema->release == nullptr) {
+            return Status::Invalid("PK real-time query read schema is null");
+        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> read_schema,
+                                          arrow::ImportSchema(context.read_schema));
+        PAIMON_RETURN_NOT_OK(ValidatePreparedTransportSchema(read_schema));
         std::vector<std::unique_ptr<BatchReader>> readers;
         for (const std::shared_ptr<Segment>& segment : typed->Segments()) {
             for (const StoredBatch& batch : segment->Batches()) {
-                readers.push_back(std::make_unique<StoredBatchReader>(batch));
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::shared_ptr<arrow::Array> projected,
+                    AlignArrayByPaimonIds(batch.data, arrow::struct_(read_schema->fields()),
+                                          arrow::default_memory_pool()));
+                StoredBatch query_batch{checked_pointer_cast<arrow::StructArray>(projected),
+                                        batch.offset_range, /*memory_usage=*/0};
+                readers.push_back(std::make_unique<StoredBatchReader>(query_batch));
             }
         }
         return readers;

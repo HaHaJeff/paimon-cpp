@@ -148,8 +148,8 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     PAIMON_RETURN_NOT_OK_FROM_ARROW(
         arrow::ExportSchema(*requested_schema, request.write_schema.get()));
     RealtimeStoreMode mode = request.mode;
-    Result<std::shared_ptr<RealtimeStore>> store_result = factory_->Create(std::move(request));
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store, std::move(store_result));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store,
+                           factory_->Create(std::move(request)));
     stores_.emplace(key, StoreEntry{store, requested_schema, mode});
     if (offset_iter != committed_offsets_.end()) {
         reclaimed_offsets_.emplace(key, offset_iter->second);

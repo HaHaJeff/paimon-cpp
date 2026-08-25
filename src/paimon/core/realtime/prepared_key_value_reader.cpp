@@ -23,12 +23,10 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "arrow/array/array_base.h"
-#include "arrow/array/array_nested.h"
 #include "arrow/array/array_primitive.h"
 #include "arrow/c/bridge.h"
 #include "arrow/type.h"
@@ -39,7 +37,6 @@
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/types/row_kind.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
-#include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/scope_guard.h"
@@ -65,10 +62,6 @@ void CloseReaders(const std::vector<std::unique_ptr<Reader>>& readers) {
         }
     }
 }
-
-Result<std::shared_ptr<arrow::Array>> AlignArrayByPaimonIds(
-    const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
-    arrow::MemoryPool* arrow_pool);
 
 class RealtimeOffsetCoverage {
  public:
@@ -158,61 +151,29 @@ Result<int32_t> FindFieldIndexByPaimonId(const arrow::FieldVector& fields, int32
     return Status::Invalid(fmt::format("cannot find field id {} in prepared schema", field_id));
 }
 
-Status ValidateProjectionType(const std::shared_ptr<arrow::DataType>& prepared_type,
-                              const std::shared_ptr<arrow::DataType>& query_type) {
-    if (prepared_type->id() != query_type->id()) {
-        return Status::Invalid(fmt::format("prepared value type {} does not match query type {}",
-                                           prepared_type->ToString(), query_type->ToString()));
-    }
-    switch (query_type->id()) {
-        case arrow::Type::STRUCT: {
-            const arrow::FieldVector& prepared_fields = prepared_type->fields();
-            for (const std::shared_ptr<arrow::Field>& query_field : query_type->fields()) {
-                PAIMON_ASSIGN_OR_RAISE(int32_t query_id,
-                                       NestedProjectionUtils::GetPaimonFieldId(query_field));
-                PAIMON_ASSIGN_OR_RAISE(int32_t prepared_idx,
-                                       FindFieldIndexByPaimonId(prepared_fields, query_id));
-                PAIMON_RETURN_NOT_OK(ValidateProjectionType(prepared_fields[prepared_idx]->type(),
-                                                            query_field->type()));
-            }
-            return Status::OK();
-        }
-        case arrow::Type::LIST:
-            return ValidateProjectionType(prepared_type->field(0)->type(),
-                                          query_type->field(0)->type());
-        case arrow::Type::MAP: {
-            const std::shared_ptr<arrow::MapType> prepared_map =
-                checked_pointer_cast<arrow::MapType>(prepared_type);
-            const std::shared_ptr<arrow::MapType> query_map =
-                checked_pointer_cast<arrow::MapType>(query_type);
-            PAIMON_RETURN_NOT_OK(
-                ValidateProjectionType(prepared_map->key_type(), query_map->key_type()));
-            return ValidateProjectionType(prepared_map->item_type(), query_map->item_type());
-        }
-        default:
-            if (!prepared_type->Equals(*query_type)) {
-                return Status::Invalid(
-                    fmt::format("prepared leaf type {} does not match query type {}",
-                                prepared_type->ToString(), query_type->ToString()));
-            }
-            return Status::OK();
-    }
-}
-
-Status ValidateProjectionSchema(const std::shared_ptr<arrow::Schema>& prepared_schema,
-                                const std::shared_ptr<arrow::Schema>& query_schema) {
+Result<std::vector<int32_t>> ResolveFieldIndexes(
+    const std::shared_ptr<arrow::Schema>& prepared_schema,
+    const std::shared_ptr<arrow::Schema>& row_schema) {
     arrow::FieldVector prepared_value_fields(
         prepared_schema->fields().begin() + kPreparedValueStartIndex,
         prepared_schema->fields().end());
-    for (const std::shared_ptr<arrow::Field>& query_field : query_schema->fields()) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t query_id,
-                               NestedProjectionUtils::GetPaimonFieldId(query_field));
-        PAIMON_ASSIGN_OR_RAISE(int32_t prepared_idx,
-                               FindFieldIndexByPaimonId(prepared_value_fields, query_id));
-        PAIMON_RETURN_NOT_OK(ValidateProjectionType(prepared_value_fields[prepared_idx]->type(),
-                                                    query_field->type()));
+    std::vector<int32_t> result;
+    result.reserve(row_schema->num_fields());
+    for (const std::shared_ptr<arrow::Field>& row_field : row_schema->fields()) {
+        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
+                               NestedProjectionUtils::GetPaimonFieldId(row_field));
+        PAIMON_ASSIGN_OR_RAISE(int32_t value_index,
+                               FindFieldIndexByPaimonId(prepared_value_fields, field_id));
+        const std::shared_ptr<arrow::Field>& prepared_field = prepared_value_fields[value_index];
+        if (!prepared_field->type()->Equals(row_field->type())) {
+            return Status::Invalid(fmt::format(
+                "prepared field id {} type {} does not match row "
+                "type {}",
+                field_id, prepared_field->type()->ToString(), row_field->type()->ToString()));
+        }
+        result.push_back(value_index + kPreparedValueStartIndex);
     }
-    return Status::OK();
+    return result;
 }
 
 Status ValidateExactCommitSchema(const std::shared_ptr<arrow::Schema>& prepared_schema,
@@ -229,162 +190,21 @@ Status ValidateExactCommitSchema(const std::shared_ptr<arrow::Schema>& prepared_
     return Status::OK();
 }
 
-Result<std::shared_ptr<arrow::Array>> AlignStructArrayByPaimonIds(
-    const std::shared_ptr<arrow::StructArray>& array,
-    const std::shared_ptr<arrow::StructType>& read_type, arrow::MemoryPool* arrow_pool) {
-    const std::shared_ptr<arrow::StructType> data_type =
-        checked_pointer_cast<arrow::StructType>(array->type());
-    std::unordered_map<int32_t, int32_t> data_field_id_to_idx;
-    data_field_id_to_idx.reserve(data_type->num_fields());
-    for (int32_t i = 0; i < data_type->num_fields(); ++i) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
-                               NestedProjectionUtils::GetPaimonFieldId(data_type->field(i)));
-        if (!data_field_id_to_idx.emplace(field_id, i).second) {
-            return Status::Invalid(
-                fmt::format("duplicate field id {} in prepared value struct", field_id));
-        }
-    }
-
-    arrow::ArrayVector aligned_arrays;
-    aligned_arrays.reserve(read_type->num_fields());
-    for (const std::shared_ptr<arrow::Field>& read_field : read_type->fields()) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t read_field_id,
-                               NestedProjectionUtils::GetPaimonFieldId(read_field));
-        auto data_iter = data_field_id_to_idx.find(read_field_id);
-        if (data_iter == data_field_id_to_idx.end()) {
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                std::shared_ptr<arrow::Array> null_child,
-                arrow::MakeArrayOfNull(read_field->type(), array->offset() + array->length(),
-                                       arrow_pool));
-            aligned_arrays.push_back(std::move(null_child));
-            continue;
-        }
-        std::shared_ptr<arrow::Array> child =
-            arrow::MakeArray(array->data()->child_data[data_iter->second]);
-        PAIMON_ASSIGN_OR_RAISE(child, AlignArrayByPaimonIds(child, read_field->type(), arrow_pool));
-        aligned_arrays.push_back(std::move(child));
-    }
-
-    std::shared_ptr<arrow::ArrayData> aligned_data = array->data()->Copy();
-    aligned_data->type = read_type;
-    aligned_data->child_data.clear();
-    aligned_data->child_data.reserve(aligned_arrays.size());
-    for (const std::shared_ptr<arrow::Array>& aligned_array : aligned_arrays) {
-        aligned_data->child_data.push_back(aligned_array->data());
-    }
-    return arrow::MakeArray(std::move(aligned_data));
-}
-
-Result<std::shared_ptr<arrow::Array>> AlignListArrayByPaimonIds(
-    const std::shared_ptr<arrow::ListArray>& array,
-    const std::shared_ptr<arrow::ListType>& read_type, arrow::MemoryPool* arrow_pool) {
-    std::shared_ptr<arrow::Array> values = array->values();
-    PAIMON_ASSIGN_OR_RAISE(values,
-                           AlignArrayByPaimonIds(values, read_type->value_type(), arrow_pool));
-    std::shared_ptr<arrow::ArrayData> new_data = array->data()->Copy();
-    new_data->type = read_type;
-    new_data->child_data = {values->data()};
-    return arrow::MakeArray(new_data);
-}
-
-Result<std::shared_ptr<arrow::Array>> AlignMapArrayByPaimonIds(
-    const std::shared_ptr<arrow::MapArray>& array, const std::shared_ptr<arrow::MapType>& read_type,
-    arrow::MemoryPool* arrow_pool) {
-    std::shared_ptr<arrow::Array> keys = array->keys();
-    PAIMON_ASSIGN_OR_RAISE(keys, AlignArrayByPaimonIds(keys, read_type->key_type(), arrow_pool));
-    std::shared_ptr<arrow::Array> items = array->items();
-    PAIMON_ASSIGN_OR_RAISE(items, AlignArrayByPaimonIds(items, read_type->item_type(), arrow_pool));
-
-    const std::shared_ptr<arrow::ArrayData>& entries_data = array->data()->child_data[0];
-    std::shared_ptr<arrow::ArrayData> new_entries = entries_data->Copy();
-    new_entries->type = arrow::struct_({read_type->key_field(), read_type->item_field()});
-    new_entries->child_data = {keys->data(), items->data()};
-
-    std::shared_ptr<arrow::ArrayData> new_data = array->data()->Copy();
-    new_data->type = read_type;
-    new_data->child_data = {std::move(new_entries)};
-    return arrow::MakeArray(new_data);
-}
-
-Result<std::shared_ptr<arrow::Array>> AlignArrayByPaimonIds(
-    const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
-    arrow::MemoryPool* arrow_pool) {
-    if (array->type()->id() != read_type->id()) {
-        return Status::Invalid(fmt::format("prepared value type {} does not match query type {}",
-                                           array->type()->ToString(), read_type->ToString()));
-    }
-    switch (read_type->id()) {
-        case arrow::Type::STRUCT:
-            return AlignStructArrayByPaimonIds(checked_pointer_cast<arrow::StructArray>(array),
-                                               checked_pointer_cast<arrow::StructType>(read_type),
-                                               arrow_pool);
-        case arrow::Type::LIST:
-            return AlignListArrayByPaimonIds(checked_pointer_cast<arrow::ListArray>(array),
-                                             checked_pointer_cast<arrow::ListType>(read_type),
-                                             arrow_pool);
-        case arrow::Type::MAP:
-            return AlignMapArrayByPaimonIds(checked_pointer_cast<arrow::MapArray>(array),
-                                            checked_pointer_cast<arrow::MapType>(read_type),
-                                            arrow_pool);
-        default:
-            if (!array->type()->Equals(*read_type)) {
-                return Status::Invalid(
-                    fmt::format("prepared leaf type {} does not match query type {}",
-                                array->type()->ToString(), read_type->ToString()));
-            }
-            return array;
-    }
-}
-
-Result<arrow::ArrayVector> ProjectFieldsByPaimonIds(
-    const std::shared_ptr<arrow::StructArray>& data_batch,
-    const std::shared_ptr<arrow::Schema>& prepared_schema,
-    const std::shared_ptr<arrow::Schema>& query_schema, arrow::MemoryPool* arrow_pool) {
-    std::unordered_map<int32_t, int32_t> prepared_field_id_to_idx;
-    prepared_field_id_to_idx.reserve(prepared_schema->num_fields());
-    for (int32_t i = kPreparedValueStartIndex; i < prepared_schema->num_fields(); ++i) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
-                               NestedProjectionUtils::GetPaimonFieldId(prepared_schema->field(i)));
-        if (!prepared_field_id_to_idx.emplace(field_id, i).second) {
-            return Status::Invalid(
-                fmt::format("duplicate field id {} in prepared schema", field_id));
-        }
-    }
-
-    arrow::ArrayVector result;
-    result.reserve(query_schema->num_fields());
-    for (const std::shared_ptr<arrow::Field>& query_field : query_schema->fields()) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t query_field_id,
-                               NestedProjectionUtils::GetPaimonFieldId(query_field));
-        auto prepared_iter = prepared_field_id_to_idx.find(query_field_id);
-        if (prepared_iter == prepared_field_id_to_idx.end()) {
-            return Status::Invalid(
-                fmt::format("cannot find field id {} in prepared schema", query_field_id));
-        }
-        std::shared_ptr<arrow::Array> field_array = data_batch->field(prepared_iter->second);
-        PAIMON_ASSIGN_OR_RAISE(field_array,
-                               AlignArrayByPaimonIds(field_array, query_field->type(), arrow_pool));
-        result.push_back(std::move(field_array));
-    }
-    return result;
-}
-
 class PreparedKeyValueReader final : public KeyValueRecordReader {
  public:
     PreparedKeyValueReader(std::unique_ptr<BatchReader>&& reader,
                            const std::shared_ptr<arrow::Schema>& prepared_schema,
                            const std::optional<OffsetRange>& visible_offsets,
-                           const std::shared_ptr<arrow::Schema>& key_schema,
-                           const std::shared_ptr<arrow::Schema>& value_schema,
+                           std::vector<int32_t>&& key_field_indexes,
+                           std::vector<int32_t>&& value_field_indexes,
                            const std::shared_ptr<MemoryPool>& pool,
                            const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage)
         : reader_(std::move(reader)),
           prepared_schema_(prepared_schema),
           visible_offsets_(visible_offsets),
-          key_schema_(key_schema),
-          value_schema_(value_schema),
+          key_field_indexes_(std::move(key_field_indexes)),
+          value_field_indexes_(std::move(value_field_indexes)),
           pool_(pool),
-          arrow_pool_(GetArrowPool(pool)),
           offset_coverage_(offset_coverage) {}
 
     ~PreparedKeyValueReader() override {
@@ -449,14 +269,21 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatchImpl() {
         while (true) {
             ResetBatchState();
-            PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader_->NextBatch());
-            if (BatchReader::IsEofBatch(batch)) {
+            BatchReader::ReadBatchWithBitmap batch_with_bitmap;
+            if (visible_offsets_.has_value()) {
+                PAIMON_ASSIGN_OR_RAISE(batch_with_bitmap, reader_->NextBatchWithBitmap());
+            } else {
+                PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader_->NextBatch());
+                batch_with_bitmap.first = std::move(batch);
+            }
+            if (BatchReader::IsEofBatch(batch_with_bitmap)) {
                 if (offset_coverage_ && !offset_coverage_finished_) {
                     offset_coverage_finished_ = true;
                     PAIMON_RETURN_NOT_OK(offset_coverage_->FinishReader());
                 }
                 return std::unique_ptr<KeyValueRecordReader::Iterator>();
             }
+            auto& [batch, selection] = batch_with_bitmap;
             auto& [c_array, c_schema] = batch;
             PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> arrow_array,
                                               arrow::ImportArray(c_array.get(), c_schema.get()));
@@ -473,15 +300,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                     "schema: ",
                     transport_status.ToString());
             }
-            if (visible_offsets_.has_value()) {
-                PAIMON_RETURN_NOT_OK(ValidateProjectionSchema(
-                    arrow::schema(data_batch->type()->fields()), key_schema_));
-                PAIMON_ASSIGN_OR_RAISE(
-                    arrow_array,
-                    AlignArrayByPaimonIds(data_batch, arrow::struct_(prepared_schema_->fields()),
-                                          arrow_pool_.get()));
-                data_batch = checked_pointer_cast<arrow::StructArray>(arrow_array);
-            }
             PAIMON_RETURN_NOT_OK(ValidatePreparedBatch(data_batch));
 
             std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> offset_array =
@@ -495,15 +313,19 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                 data_batch->field(kValueKindIndex));
             sequence_number_array_ = checked_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
                 data_batch->field(kSequenceNumberIndex));
-            PAIMON_ASSIGN_OR_RAISE(arrow::ArrayVector key_fields,
-                                   ProjectFieldsByPaimonIds(data_batch, prepared_schema_,
-                                                            key_schema_, arrow_pool_.get()));
-            PAIMON_ASSIGN_OR_RAISE(arrow::ArrayVector value_fields,
-                                   ProjectFieldsByPaimonIds(data_batch, prepared_schema_,
-                                                            value_schema_, arrow_pool_.get()));
+            arrow::ArrayVector key_fields;
+            key_fields.reserve(key_field_indexes_.size());
+            for (int32_t index : key_field_indexes_) {
+                key_fields.push_back(data_batch->field(index));
+            }
+            arrow::ArrayVector value_fields;
+            value_fields.reserve(value_field_indexes_.size());
+            for (int32_t index : value_field_indexes_) {
+                value_fields.push_back(data_batch->field(index));
+            }
             key_ctx_ = std::make_shared<ColumnarBatchContext>(key_fields, pool_);
             value_ctx_ = std::make_shared<ColumnarBatchContext>(value_fields, pool_);
-            if (!SelectVisibleRows(*offset_array)) {
+            if (!SelectRows(*offset_array, std::move(selection))) {
                 continue;
             }
             ArrowUtils::TraverseArray(data_batch);
@@ -544,28 +366,30 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         return Status::OK();
     }
 
-    bool SelectVisibleRows(const arrow::Int64Array& offsets) {
+    bool SelectRows(const arrow::Int64Array& offsets, RoaringBitmap32&& selection) {
         if (!visible_offsets_.has_value()) {
+            selected_rows_.reserve(offsets.length());
+            for (int64_t row = 0; row < offsets.length(); ++row) {
+                selected_rows_.push_back(row);
+            }
             return true;
         }
-        visible_rows_.emplace();
-        visible_rows_->reserve(offsets.length());
-        for (int64_t row = 0; row < offsets.length(); ++row) {
+        for (auto iter = selection.Begin(); iter != selection.End(); ++iter) {
+            const int32_t row = *iter;
             const int64_t offset = offsets.Value(row);
             if (offset >= visible_offsets_->begin && offset < visible_offsets_->end) {
-                visible_rows_->push_back(row);
+                selected_rows_.push_back(row);
             }
         }
-        return !visible_rows_->empty();
+        return !selected_rows_.empty();
     }
 
     int64_t RowCount() const {
-        return visible_rows_.has_value() ? static_cast<int64_t>(visible_rows_->size())
-                                         : row_kind_array_->length();
+        return static_cast<int64_t>(selected_rows_.size());
     }
 
     int64_t RowAt(int64_t ordinal) const {
-        return visible_rows_.has_value() ? (*visible_rows_)[ordinal] : ordinal;
+        return selected_rows_[ordinal];
     }
 
     void ResetBatchState() {
@@ -573,7 +397,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         value_ctx_.reset();
         row_kind_array_.reset();
         sequence_number_array_.reset();
-        visible_rows_.reset();
+        selected_rows_.clear();
     }
 
  private:
@@ -582,17 +406,16 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     std::unique_ptr<BatchReader> reader_;
     std::shared_ptr<arrow::Schema> prepared_schema_;
     std::optional<OffsetRange> visible_offsets_;
-    std::shared_ptr<arrow::Schema> key_schema_;
-    std::shared_ptr<arrow::Schema> value_schema_;
+    std::vector<int32_t> key_field_indexes_;
+    std::vector<int32_t> value_field_indexes_;
     std::shared_ptr<MemoryPool> pool_;
-    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     std::shared_ptr<RealtimeOffsetCoverage> offset_coverage_;
     bool offset_coverage_finished_ = false;
     std::shared_ptr<ColumnarBatchContext> key_ctx_;
     std::shared_ptr<ColumnarBatchContext> value_ctx_;
     std::shared_ptr<arrow::NumericArray<arrow::Int8Type>> row_kind_array_;
     std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> sequence_number_array_;
-    std::optional<std::vector<int64_t>> visible_rows_;
+    std::vector<int64_t> selected_rows_;
 };
 
 }  // namespace
@@ -637,14 +460,16 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
     if (!memory_pool) {
         return Status::Invalid("prepared reader memory pool cannot be null");
     }
-    PAIMON_RETURN_NOT_OK(ValidateProjectionSchema(prepared_schema, key_schema));
-    PAIMON_RETURN_NOT_OK(ValidateProjectionSchema(prepared_schema, value_schema));
     if (!visible_offsets.has_value()) {
         PAIMON_RETURN_NOT_OK(ValidateExactCommitSchema(prepared_schema, value_schema));
     }
-    std::unique_ptr<KeyValueRecordReader> result(
-        new PreparedKeyValueReader(std::move(owned_reader), prepared_schema, visible_offsets,
-                                   key_schema, value_schema, memory_pool, offset_coverage));
+    PAIMON_ASSIGN_OR_RAISE(std::vector<int32_t> key_field_indexes,
+                           ResolveFieldIndexes(prepared_schema, key_schema));
+    PAIMON_ASSIGN_OR_RAISE(std::vector<int32_t> value_field_indexes,
+                           ResolveFieldIndexes(prepared_schema, value_schema));
+    std::unique_ptr<KeyValueRecordReader> result(new PreparedKeyValueReader(
+        std::move(owned_reader), prepared_schema, visible_offsets, std::move(key_field_indexes),
+        std::move(value_field_indexes), memory_pool, offset_coverage));
     close_guard.Release();
     return result;
 }
@@ -685,10 +510,10 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBa
                            RealtimeOffsetCoverage::Create(sealed_offsets, readers.size()));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> adapted_reader,
-                               AdaptPreparedBatchReaderImpl(
-                                   std::move(reader), prepared_schema, std::nullopt, key_schema,
-                                   value_schema, memory_pool, offset_coverage));
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<KeyValueRecordReader> adapted_reader,
+            AdaptPreparedBatchReaderImpl(std::move(reader), prepared_schema, std::nullopt,
+                                         key_schema, value_schema, memory_pool, offset_coverage));
         adapted_readers.push_back(std::move(adapted_reader));
     }
     readers_guard.Release();

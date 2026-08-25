@@ -59,17 +59,14 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<FieldsComparator>& key_comparator,
-    const std::shared_ptr<InternalReadContext>& context,
     const std::shared_ptr<MemoryPool>& memory_pool) {
-    std::shared_ptr<arrow::Schema> full_value_schema =
-        DataField::ConvertDataFieldsToArrowSchema(context->GetTableSchema()->Fields());
     arrow::FieldVector prepared_fields = {
         DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
         DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
             ->WithNullable(false),
         DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
-    prepared_fields.insert(prepared_fields.end(), full_value_schema->fields().begin(),
-                           full_value_schema->fields().end());
+    prepared_fields.insert(prepared_fields.end(), value_schema->fields().begin(),
+                           value_schema->fields().end());
     std::shared_ptr<arrow::Schema> prepared_schema = arrow::schema(std::move(prepared_fields));
     auto c_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*prepared_schema, c_schema.get()));
@@ -276,7 +273,7 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateRealtimeReader(
                 std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers,
                 CreateMemoryReaders(realtime_split, memory, merge_read->GetKeySchema(),
                                     merge_read->GetValueSchema(), merge_read->GetKeyComparator(),
-                                    context_, GetMemoryPool()));
+                                    GetMemoryPool()));
             PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
                                    merge_read->CreateRealtimeReader(realtime_split->DiskSplits(),
                                                                     std::move(memory_readers)));

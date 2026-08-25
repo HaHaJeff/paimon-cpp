@@ -246,10 +246,8 @@ Status RealtimePrimaryKeyWriter::Write(std::unique_ptr<RecordBatch>&& batch) {
         std::move(prepared_batch), OffsetRange(next_offset_, next_offset_ + count)}));
     next_offset_ += count;
     last_sequence_number_ += count;
-    PAIMON_RETURN_NOT_OK(
-        realtime_context_
-            ->AdvanceMaterializedMaxSequenceNumber(partition_bucket_, last_sequence_number_)
-            .status());
+    PAIMON_RETURN_NOT_OK(realtime_context_->AdvanceMaterializedMaxSequenceNumber(
+        partition_bucket_, last_sequence_number_));
     return Status::OK();
 }
 
