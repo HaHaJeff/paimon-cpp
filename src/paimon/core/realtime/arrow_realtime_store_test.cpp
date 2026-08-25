@@ -237,7 +237,8 @@ TEST_F(ArrowRealtimeStoreTest, TestFullStatisticsPrunesNonMatchingBatch) {
                                        pool_,
                                        /*partition=*/{},
                                        /*bucket=*/0,
-                                       AppendRealtimeStoreCreateConfig{StatisticsMode::FULL}};
+                                       RealtimeStoreMode::APPEND_ONLY,
+                                       StatisticsMode::FULL};
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeStore> realtime_store,
                          factory.Create(std::move(request)));
     std::shared_ptr<ArrowRealtimeStore> store =
@@ -272,6 +273,18 @@ TEST_F(ArrowRealtimeStoreTest, TestFullStatisticsPrunesNonMatchingBatch) {
     ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatchWithBitmap unfiltered_batch,
                          unfiltered_readers[0]->NextBatchWithBitmap());
     ASSERT_EQ(std::vector<int64_t>({0, 1}), ReadIds(unfiltered_batch));
+}
+
+TEST_F(ArrowRealtimeStoreTest, TestFactoryRejectsInvalidMode) {
+    ArrowRealtimeStoreFactory factory;
+    std::unique_ptr<ArrowSchema> write_schema = MakeReadSchema(schema_);
+    RealtimeStoreCreateRequest request{std::move(write_schema),
+                                       /*options=*/{},
+                                       pool_,
+                                       /*partition=*/{},
+                                       /*bucket=*/0,
+                                       static_cast<RealtimeStoreMode>(-1)};
+    ASSERT_NOK_WITH_MSG(factory.Create(std::move(request)), "invalid real-time store mode: -1");
 }
 
 TEST_F(ArrowRealtimeStoreTest, TestMissingStatisticsRetainsNonMatchingBatch) {

@@ -71,15 +71,8 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderForTest(
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<MemoryPool>& memory_pool) {
-    if (!key_schema) {
-        return Status::Invalid("prepared key schema cannot be null");
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> key_fields,
-                           DataField::ConvertArrowSchemaToDataFields(key_schema));
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FieldsComparator> key_comparator,
-                           FieldsComparator::Create(key_fields, /*is_ascending_order=*/true));
     return AdaptPreparedBatchReader(std::move(reader), prepared_schema, visible_offsets, key_schema,
-                                    value_schema, key_comparator, memory_pool);
+                                    value_schema, memory_pool);
 }
 
 class TrackingBatchReader : public BatchReader {
@@ -264,31 +257,6 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderRejectsReversedVisibleO
                                         value_schema, value_schema, pool_);
     ASSERT_TRUE(result.status().IsInvalid());
     ASSERT_NOK_WITH_MSG(result, "prepared visible offset range begin exceeds end");
-}
-
-TEST_F(MergedKeyValueRecordReaderTest, TestRejectsUnsortedPluginRowsAcrossBatches) {
-    std::vector<DataField> value_fields = {DataField(0, arrow::field("id", arrow::int32()))};
-    std::shared_ptr<arrow::Schema> value_schema =
-        DataField::ConvertDataFieldsToArrowSchema(value_fields);
-    std::shared_ptr<arrow::Schema> key_schema = arrow::schema({value_schema->field(0)});
-    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema(value_schema->fields());
-    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
-    std::shared_ptr<arrow::Array> prepared_array =
-        arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([
-            [0, 10, 0, 2],
-            [0, 11, 1, 1]
-        ])")
-            .ValueOrDie();
-    auto batch_reader =
-        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, /*batch_size=*/1);
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, std::nullopt,
-                                        key_schema, value_schema, pool_));
-    Result<std::vector<KeyValue>> result =
-        ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
-                                                   KeyValueRecordReader::Iterator>(reader.get());
-    ASSERT_NOK_WITH_MSG(result, "not globally sorted by primary key and sequence number");
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {

@@ -25,7 +25,6 @@
 #include <optional>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "arrow/c/abi.h"
@@ -43,14 +42,10 @@ namespace paimon {
 class MemoryPool;
 class Predicate;
 
-struct PAIMON_EXPORT AppendRealtimeStoreCreateConfig {
-    StatisticsMode statistics_mode;
+enum class PAIMON_EXPORT RealtimeStoreMode {
+    APPEND_ONLY,
+    PRIMARY_KEY,
 };
-
-struct PAIMON_EXPORT PrimaryKeyRealtimeStoreCreateConfig {};
-
-using RealtimeStoreCreateConfig =
-    std::variant<AppendRealtimeStoreCreateConfig, PrimaryKeyRealtimeStoreCreateConfig>;
 
 /// Parameters used by a `RealtimeStoreFactory` to create a store.
 struct PAIMON_EXPORT RealtimeStoreCreateRequest {
@@ -66,8 +61,10 @@ struct PAIMON_EXPORT RealtimeStoreCreateRequest {
     std::map<std::string, std::string> partition;
     /// Bucket identifying the store within its partition.
     int32_t bucket = -1;
-    /// Mode-specific store configuration.
-    RealtimeStoreCreateConfig mode_config;
+    /// Table mode implemented by the store.
+    RealtimeStoreMode mode = RealtimeStoreMode::APPEND_ONLY;
+    /// Statistics collected by append-only stores.
+    StatisticsMode statistics_mode = StatisticsMode::NONE;
 };
 
 /// A record batch and its framework-assigned contiguous offset range.

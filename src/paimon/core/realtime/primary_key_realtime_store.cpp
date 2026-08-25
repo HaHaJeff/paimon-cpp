@@ -201,13 +201,9 @@ class PrimaryKeyRealtimeStore::Impl {
         std::shared_ptr<arrow::StructArray> prepared =
             checked_pointer_cast<arrow::StructArray>(array);
         std::lock_guard<std::mutex> lock(mutex_);
-        if (last_offset_ && write_batch.offset_range.begin != last_offset_.value()) {
-            return Status::Invalid("PK real-time offset ranges must be contiguous");
-        }
         building_.push_back(
             StoredBatch{prepared, write_batch.offset_range, GetArrayMemoryUsage(prepared->data())});
         building_memory_usage_ += building_.back().memory_usage;
-        last_offset_ = write_batch.offset_range.end;
         return Status::OK();
     }
 
@@ -290,7 +286,6 @@ class PrimaryKeyRealtimeStore::Impl {
     std::vector<StoredBatch> building_;
     std::vector<std::shared_ptr<Segment>> sealed_;
     uint64_t building_memory_usage_ = 0;
-    std::optional<int64_t> last_offset_;
 };
 
 PrimaryKeyRealtimeStore::PrimaryKeyRealtimeStore(std::unique_ptr<Impl>&& impl)

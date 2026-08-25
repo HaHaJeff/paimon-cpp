@@ -48,10 +48,6 @@
 namespace paimon {
 namespace {
 
-bool SameMode(const RealtimeStoreCreateConfig& left, const RealtimeStoreCreateConfig& right) {
-    return left.index() == right.index();
-}
-
 std::string PartitionToString(const std::map<std::string, std::string>& partition) {
     std::string result = "{";
     for (auto iter = partition.begin(); iter != partition.end(); ++iter) {
@@ -122,7 +118,7 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
         initial_offset = offset_iter->second;
     }
     if (iter != stores_.end()) {
-        if (!SameMode(iter->second.mode_config, request.mode_config) ||
+        if (iter->second.mode != request.mode ||
             !iter->second.write_schema->Equals(*requested_schema, /*check_metadata=*/true)) {
             return Status::Invalid("real-time store schema or mode mismatch for partition " +
                                    PartitionToString(key.partition) + ", bucket " +
@@ -151,10 +147,10 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     }
     PAIMON_RETURN_NOT_OK_FROM_ARROW(
         arrow::ExportSchema(*requested_schema, request.write_schema.get()));
-    RealtimeStoreCreateConfig mode_config = request.mode_config;
+    RealtimeStoreMode mode = request.mode;
     Result<std::shared_ptr<RealtimeStore>> store_result = factory_->Create(std::move(request));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeStore> store, std::move(store_result));
-    stores_.emplace(key, StoreEntry{store, requested_schema, std::move(mode_config)});
+    stores_.emplace(key, StoreEntry{store, requested_schema, mode});
     if (offset_iter != committed_offsets_.end()) {
         reclaimed_offsets_.emplace(key, offset_iter->second);
     }

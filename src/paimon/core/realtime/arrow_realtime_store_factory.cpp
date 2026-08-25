@@ -42,17 +42,19 @@ Result<std::shared_ptr<RealtimeStore>> ArrowRealtimeStoreFactory::Create(
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> imported_schema,
                                       arrow::ImportSchema(request.write_schema.get()));
-    if (std::holds_alternative<AppendRealtimeStoreCreateConfig>(request.mode_config)) {
-        const AppendRealtimeStoreCreateConfig& append_config =
-            std::get<AppendRealtimeStoreCreateConfig>(request.mode_config);
-        std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(request.memory_pool);
-        return std::make_shared<ArrowRealtimeStore>(imported_schema, append_config.statistics_mode,
-                                                    request.memory_pool, arrow_pool);
+    switch (request.mode) {
+        case RealtimeStoreMode::APPEND_ONLY: {
+            std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(request.memory_pool);
+            return std::make_shared<ArrowRealtimeStore>(imported_schema, request.statistics_mode,
+                                                        request.memory_pool, arrow_pool);
+        }
+        case RealtimeStoreMode::PRIMARY_KEY: {
+            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                                   PrimaryKeyRealtimeStore::Create(imported_schema));
+            return std::shared_ptr<RealtimeStore>(std::move(store));
+        }
     }
-
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                           PrimaryKeyRealtimeStore::Create(imported_schema));
-    return std::shared_ptr<RealtimeStore>(std::move(store));
+    return Status::Invalid("invalid real-time store mode: ", static_cast<int32_t>(request.mode));
 }
 
 }  // namespace paimon

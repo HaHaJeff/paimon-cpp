@@ -90,12 +90,11 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
         if (!reader) {
             return Status::Invalid("PK real-time store returned a null query reader");
         }
-        PAIMON_ASSIGN_OR_RAISE(
-            std::unique_ptr<KeyValueRecordReader> prepared_reader,
-            AdaptPreparedBatchReader(
-                std::move(reader), prepared_schema,
-                OffsetRange(split->CommittedEndOffset(), split->MemoryEndOffset()), key_schema,
-                value_schema, key_comparator, memory_pool));
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> prepared_reader,
+                               AdaptPreparedBatchReader(std::move(reader), prepared_schema,
+                                                        OffsetRange(split->CommittedEndOffset(),
+                                                                    split->MemoryEndOffset()),
+                                                        key_schema, value_schema, memory_pool));
         auto merge = std::make_unique<DeduplicateMergeFunction>(false);
         result.push_back(std::make_unique<MergedKeyValueRecordReader>(
             std::move(prepared_reader), key_comparator,

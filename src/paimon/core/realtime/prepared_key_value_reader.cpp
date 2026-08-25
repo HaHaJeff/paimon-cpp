@@ -42,7 +42,6 @@
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
-#include "paimon/common/utils/fields_comparator.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"
@@ -377,7 +376,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                            const std::optional<OffsetRange>& visible_offsets,
                            const std::shared_ptr<arrow::Schema>& key_schema,
                            const std::shared_ptr<arrow::Schema>& value_schema,
-                           const std::shared_ptr<FieldsComparator>& key_comparator,
                            const std::shared_ptr<MemoryPool>& pool,
                            const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage)
         : reader_(std::move(reader)),
@@ -385,7 +383,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
           visible_offsets_(visible_offsets),
           key_schema_(key_schema),
           value_schema_(value_schema),
-          key_comparator_(key_comparator),
           pool_(pool),
           arrow_pool_(GetArrowPool(pool)),
           offset_coverage_(offset_coverage) {}
@@ -506,7 +503,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                                                             value_schema_, arrow_pool_.get()));
             key_ctx_ = std::make_shared<ColumnarBatchContext>(key_fields, pool_);
             value_ctx_ = std::make_shared<ColumnarBatchContext>(value_fields, pool_);
-            PAIMON_RETURN_NOT_OK(ValidateOrdering(key_ctx_, sequence_number_array_));
             if (!SelectVisibleRows(*offset_array)) {
                 continue;
             }
@@ -544,32 +540,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
             data_batch->field(kSequenceNumberIndex)->null_count() != 0 ||
             data_batch->field(kRealtimeOffsetIndex)->null_count() != 0) {
             return Status::Invalid("prepared transport columns must not contain nulls");
-        }
-        return Status::OK();
-    }
-
-    Status ValidateOrdering(
-        const std::shared_ptr<ColumnarBatchContext>& key_context,
-        const std::shared_ptr<arrow::NumericArray<arrow::Int64Type>>& sequences) {
-        if (sequences->length() == 0) {
-            return Status::OK();
-        }
-        for (int64_t row = 0; row < sequences->length(); ++row) {
-            ColumnarRowRef current_key(key_context, row);
-            if (previous_key_context_) {
-                ColumnarRowRef previous_key(previous_key_context_, previous_key_row_);
-                const int32_t key_comparison =
-                    key_comparator_->CompareTo(previous_key, current_key);
-                if (key_comparison > 0 ||
-                    (key_comparison == 0 && previous_sequence_ > sequences->Value(row))) {
-                    return Status::Invalid(
-                        "PK real-time plugin reader is not globally sorted by primary key and "
-                        "sequence number");
-                }
-            }
-            previous_key_context_ = key_context;
-            previous_key_row_ = row;
-            previous_sequence_ = sequences->Value(row);
         }
         return Status::OK();
     }
@@ -614,7 +584,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     std::optional<OffsetRange> visible_offsets_;
     std::shared_ptr<arrow::Schema> key_schema_;
     std::shared_ptr<arrow::Schema> value_schema_;
-    std::shared_ptr<FieldsComparator> key_comparator_;
     std::shared_ptr<MemoryPool> pool_;
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     std::shared_ptr<RealtimeOffsetCoverage> offset_coverage_;
@@ -624,9 +593,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     std::shared_ptr<arrow::NumericArray<arrow::Int8Type>> row_kind_array_;
     std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> sequence_number_array_;
     std::optional<std::vector<int64_t>> visible_rows_;
-    std::shared_ptr<ColumnarBatchContext> previous_key_context_;
-    int64_t previous_key_row_ = 0;
-    int64_t previous_sequence_ = 0;
 };
 
 }  // namespace
@@ -651,7 +617,6 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
     const std::optional<OffsetRange>& visible_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MemoryPool>& memory_pool,
     const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage) {
     std::unique_ptr<BatchReader> owned_reader = std::move(reader);
@@ -669,9 +634,6 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
     if (!value_schema) {
         return Status::Invalid("prepared value schema cannot be null");
     }
-    if (!key_comparator) {
-        return Status::Invalid("prepared key comparator cannot be null");
-    }
     if (!memory_pool) {
         return Status::Invalid("prepared reader memory pool cannot be null");
     }
@@ -680,9 +642,9 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
     if (!visible_offsets.has_value()) {
         PAIMON_RETURN_NOT_OK(ValidateExactCommitSchema(prepared_schema, value_schema));
     }
-    std::unique_ptr<KeyValueRecordReader> result(new PreparedKeyValueReader(
-        std::move(owned_reader), prepared_schema, visible_offsets, key_schema, value_schema,
-        key_comparator, memory_pool, offset_coverage));
+    std::unique_ptr<KeyValueRecordReader> result(
+        new PreparedKeyValueReader(std::move(owned_reader), prepared_schema, visible_offsets,
+                                   key_schema, value_schema, memory_pool, offset_coverage));
     close_guard.Release();
     return result;
 }
@@ -694,10 +656,9 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
     const std::optional<OffsetRange>& visible_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     return AdaptPreparedBatchReaderImpl(std::move(reader), prepared_schema, visible_offsets,
-                                        key_schema, value_schema, key_comparator, memory_pool,
+                                        key_schema, value_schema, memory_pool,
                                         /*offset_coverage=*/nullptr);
 }
 
@@ -706,7 +667,6 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBa
     const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     std::vector<std::unique_ptr<KeyValueRecordReader>> adapted_readers;
     ScopeGuard readers_guard([&readers, &adapted_readers]() {
@@ -728,7 +688,7 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBa
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> adapted_reader,
                                AdaptPreparedBatchReaderImpl(
                                    std::move(reader), prepared_schema, std::nullopt, key_schema,
-                                   value_schema, key_comparator, memory_pool, offset_coverage));
+                                   value_schema, memory_pool, offset_coverage));
         adapted_readers.push_back(std::move(adapted_reader));
     }
     readers_guard.Release();

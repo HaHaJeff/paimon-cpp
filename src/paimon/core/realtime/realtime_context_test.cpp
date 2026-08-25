@@ -117,10 +117,11 @@ Result<RealtimeStoreState> GetOrCreateAppendStore(
     const std::shared_ptr<RealtimeContextImpl>& context,
     const std::map<std::string, std::string>& partition, int32_t bucket,
     std::unique_ptr<ArrowSchema> write_schema, const std::map<std::string, std::string>& options,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
+    const std::shared_ptr<MemoryPool>& memory_pool,
+    StatisticsMode statistics_mode = StatisticsMode::NONE) {
     return context->GetOrCreateRealtimeStore(
         RealtimeStoreCreateRequest{std::move(write_schema), options, memory_pool, partition, bucket,
-                                   AppendRealtimeStoreCreateConfig{StatisticsMode::NONE}});
+                                   RealtimeStoreMode::APPEND_ONLY, statistics_mode});
 }
 
 TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
@@ -130,9 +131,10 @@ TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
                          GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0,
                                                 MakeWriteSchema(), {{"k", "v"}}, GetDefaultPool()));
     ASSERT_EQ(0, first.initial_offset);
-    ASSERT_OK_AND_ASSIGN(RealtimeStoreState second,
-                         GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0,
-                                                MakeWriteSchema(), {}, GetDefaultPool()));
+    ASSERT_OK_AND_ASSIGN(
+        RealtimeStoreState second,
+        GetOrCreateAppendStore(context, {{"dt", "2026-08-02"}}, 0, MakeWriteSchema(), {},
+                               GetDefaultPool(), StatisticsMode::FULL));
     ASSERT_EQ(first.store, second.store);
     ASSERT_EQ(0, second.initial_offset);
     ASSERT_EQ(1, factory->stores.size());
@@ -158,6 +160,21 @@ TEST(RealtimeContextTest, TestReusesStoreAndCapturesRegisteredViews) {
     ASSERT_EQ(2, factory->stores[0]->acquire_count);
     ASSERT_EQ(1, factory->stores[1]->acquire_count);
     ASSERT_EQ(1, factory->stores[2]->acquire_count);
+}
+
+TEST(RealtimeContextTest, TestRejectsMismatchedModeOnStoreReuse) {
+    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
+    const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
+    ASSERT_OK(
+        GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, GetDefaultPool()));
+
+    ASSERT_NOK_WITH_MSG(
+        context->GetOrCreateRealtimeStore(RealtimeStoreCreateRequest{
+            MakeWriteSchema(), {}, GetDefaultPool(), partition, 0, RealtimeStoreMode::PRIMARY_KEY}),
+        "schema or mode mismatch for partition {dt=2026-08-02}, bucket 0; recreate the "
+        "RealtimeContext");
+    ASSERT_EQ(1, factory->stores.size());
 }
 
 TEST(RealtimeContextTest, TestRejectsMismatchedSchemaOnStoreReuse) {

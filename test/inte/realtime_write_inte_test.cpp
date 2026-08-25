@@ -538,7 +538,7 @@ class FailAfterPhysicalFileRealtimeStore final : public DelegatingRealtimeStore 
     std::shared_ptr<std::atomic<bool>> saw_artifacts_;
 };
 
-enum class CommitReaderMalformation { DROP_LAST, UNSORTED, DUPLICATE_OFFSET, OUT_OF_RANGE_OFFSET };
+enum class CommitReaderMalformation { DROP_LAST, DUPLICATE_OFFSET, OUT_OF_RANGE_OFFSET };
 
 class CorruptingBatchReader final : public BatchReader {
  public:
@@ -550,8 +550,6 @@ class CorruptingBatchReader final : public BatchReader {
         switch (malformation_) {
             case CommitReaderMalformation::DROP_LAST:
                 return DropLast();
-            case CommitReaderMalformation::UNSORTED:
-                return SwapFirstTwo();
             case CommitReaderMalformation::DUPLICATE_OFFSET:
                 return SubstituteOffset(/*offset=*/0);
             case CommitReaderMalformation::OUT_OF_RANGE_OFFSET:
@@ -586,33 +584,6 @@ class CorruptingBatchReader final : public BatchReader {
         ReadBatch result = std::move(buffered_.value());
         buffered_ = std::move(next);
         return result;
-    }
-
-    Result<ReadBatch> SwapFirstTwo() {
-        if (corrupted_) {
-            return delegate_->NextBatch();
-        }
-        corrupted_ = true;
-        PAIMON_ASSIGN_OR_RAISE(ReadBatch batch, delegate_->NextBatch());
-        if (BatchReader::IsEofBatch(batch)) {
-            return MakeEofBatch();
-        }
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            std::shared_ptr<arrow::Array> array,
-            arrow::ImportArray(batch.first.get(), batch.second.get()));
-        if (array->length() < 2) {
-            return Status::Invalid("cannot make a one-row reader unsorted");
-        }
-        arrow::ArrayVector pieces = {array->Slice(1, 1), array->Slice(0, 1)};
-        if (array->length() > 2) {
-            pieces.push_back(array->Slice(2));
-        }
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> swapped,
-                                          arrow::Concatenate(pieces));
-        auto output = std::make_unique<ArrowArray>();
-        auto schema = std::make_unique<ArrowSchema>();
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*swapped, output.get(), schema.get()));
-        return ReadBatch(std::move(output), std::move(schema));
     }
 
     Result<ReadBatch> SubstituteOffset(int64_t offset) {
@@ -652,7 +623,6 @@ class CorruptingBatchReader final : public BatchReader {
 
     std::unique_ptr<BatchReader> delegate_;
     CommitReaderMalformation malformation_;
-    bool corrupted_ = false;
     std::optional<ReadBatch> buffered_;
 };
 
@@ -2397,12 +2367,6 @@ TEST_F(RealtimeWriteInteTest, TestPkRejectsDuplicateOffset) {
 TEST_F(RealtimeWriteInteTest, TestPkRejectsOutOfRangeOffset) {
     CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::OUT_OF_RANGE_OFFSET,
                                            "offset is outside the sealed range");
-}
-
-TEST_F(RealtimeWriteInteTest, TestPkRejectsUnsortedPluginRows) {
-    CheckPkRejectsCommitReaderMalformation(
-        CommitReaderMalformation::UNSORTED,
-        "not globally sorted by primary key and sequence number");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {

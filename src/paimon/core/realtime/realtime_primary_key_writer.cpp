@@ -288,7 +288,7 @@ Status RealtimePrimaryKeyWriter::FlushSegment(const std::shared_ptr<RealtimeSegm
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<std::unique_ptr<KeyValueRecordReader>> prepared_readers,
         AdaptPreparedCommitBatchReaders(std::move(readers), prepared_schema_, sealed_offsets,
-                                        key_schema_, write_schema_, key_comparator_, memory_pool_));
+                                        key_schema_, write_schema_, memory_pool_));
     std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
     sorted_readers.reserve(prepared_readers.size());
     for (std::unique_ptr<KeyValueRecordReader>& prepared_reader : prepared_readers) {

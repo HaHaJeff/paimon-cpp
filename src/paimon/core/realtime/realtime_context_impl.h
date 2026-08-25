@@ -99,7 +99,7 @@ class PAIMON_EXPORT RealtimeContextImpl final : public RealtimeContext {
     struct StoreEntry {
         std::shared_ptr<RealtimeStore> store;
         std::shared_ptr<arrow::Schema> write_schema;
-        RealtimeStoreCreateConfig mode_config;
+        RealtimeStoreMode mode;
         int64_t materialized_max_sequence_number = -1;
     };
 

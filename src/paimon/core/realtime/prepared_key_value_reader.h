@@ -30,7 +30,6 @@
 
 namespace paimon {
 class BatchReader;
-class FieldsComparator;
 class MemoryPool;
 
 /// Validates the required leading fields of a prepared real-time transport schema.
@@ -42,16 +41,14 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReader(
     const std::optional<OffsetRange>& visible_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MemoryPool>& memory_pool);
 
-/// Adapts commit readers and validates that they collectively cover `sealed_offsets` exactly.
+/// Adapts commit readers and validates their offsets against `sealed_offsets`.
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> AdaptPreparedCommitBatchReaders(
     std::vector<std::unique_ptr<BatchReader>>&& readers,
     const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<MemoryPool>& memory_pool);
 
 }  // namespace paimon

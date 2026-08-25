@@ -178,9 +178,6 @@ TEST(PrimaryKeyRealtimeStoreTest, TestWriteAndSealValidation) {
 
     ASSERT_OK(store->Write(RealtimeWriteBatch{
         MakeBatch(R"([[0, 1, 0, 1, "one"], [0, 2, 1, 2, "two"]])"), OffsetRange(0, 2)}));
-    ASSERT_NOK_WITH_MSG(store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 3, 3, 3, "three"]])"),
-                                                        OffsetRange(3, 4)}),
-                        "offset ranges must be contiguous");
     ASSERT_OK(store->Write(
         RealtimeWriteBatch{MakeBatch(R"([[0, 3, 2, 3, "three"]])"), OffsetRange(2, 3)}));
 
@@ -188,9 +185,6 @@ TEST(PrimaryKeyRealtimeStoreTest, TestWriteAndSealValidation) {
     ASSERT_TRUE(segment.has_value());
     ASSERT_EQ(OffsetRange(0, 3), segment.value()->GetOffsetRange());
     ASSERT_GT(store->GetMemoryUsage(), 0);
-    ASSERT_NOK_WITH_MSG(
-        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 4, 4, 4, "four"]])"), OffsetRange(4, 5)}),
-        "offset ranges must be contiguous");
     ASSERT_OK(store->Write(
         RealtimeWriteBatch{MakeBatch(R"([[0, 4, 3, 4, "four"]])"), OffsetRange(3, 4)}));
 }
