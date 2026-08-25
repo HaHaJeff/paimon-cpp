@@ -954,6 +954,27 @@ class RealtimeWriteInteTest : public ::testing::Test {
         return scan->CreatePlan();
     }
 
+    Result<std::unique_ptr<BatchReader>> CreateQueryReader(
+        const std::shared_ptr<Plan>& plan,
+        const std::shared_ptr<RealtimeContext>& realtime_context) const {
+        ReadContextBuilder read_builder(table_path_);
+        read_builder.SetOptions(options_)
+            .SetReadFieldNames({"id", "payload", "pt"})
+            .WithRealtimeContext(realtime_context)
+            .WithMemoryPool(pool_);
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableRead> table_read,
+                               TableRead::Create(std::move(read_context)));
+        return table_read->CreateReader(plan->Splits());
+    }
+
+    Result<std::unique_ptr<BatchReader>> CreateQueryReader(
+        const std::shared_ptr<RealtimeContext>& realtime_context) const {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Plan> plan,
+                               CreatePlan(realtime_context, /*predicate=*/nullptr));
+        return CreateQueryReader(plan, realtime_context);
+    }
+
     Result<CollectedReadResult> ReadPlan(const std::shared_ptr<Plan>& plan,
                                          const std::shared_ptr<RealtimeContext>& realtime_context,
                                          const std::vector<std::string>& read_fields,
@@ -1326,6 +1347,23 @@ class RealtimeWriteInteTest : public ::testing::Test {
         expected_rows.insert(expected_rows.end(), p1_rows.begin(), p1_rows.end());
         ASSERT_OK_AND_ASSIGN(std::vector<Row> actual_rows, ReadRows(plan, realtime_context));
         ASSERT_EQ(expected_rows, actual_rows);
+        ASSERT_OK(writer->Close());
+    }
+
+    void CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation malformation,
+                                                const std::string& expected_error) {
+        CreatePkTable();
+        auto factory = MakeDecoratingFactory<MalformedCoverageRealtimeStore>(malformation);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                             RealtimeContext::Create(factory));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                             CreateRealtimeWriter(realtime_context));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                             MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
+                                       /*partitioned=*/false));
+        ASSERT_OK(writer->Write(std::move(batch)));
+        ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
+                            expected_error);
         ASSERT_OK(writer->Close());
     }
 
@@ -2203,54 +2241,19 @@ TEST_F(RealtimeWriteInteTest, TestPkPluginContract) {
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsMalformedCoverage) {
-    CreatePkTable();
-    auto factory =
-        MakeDecoratingFactory<MalformedCoverageRealtimeStore>(CommitReaderMalformation::DROP_LAST);
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create(factory));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
-                                   /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(batch)));
-    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
-                        "commit readers did not cover the sealed range");
-    ASSERT_OK(writer->Close());
+    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::DROP_LAST,
+                                           "commit readers did not cover the sealed range");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsEqualCardinalityOffsetSubstitution) {
-    CreatePkTable();
-    auto factory = MakeDecoratingFactory<MalformedCoverageRealtimeStore>(
-        CommitReaderMalformation::SUBSTITUTE_OFFSET);
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create(factory));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
-                                   /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(batch)));
-    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
-                        "duplicate REALTIME_OFFSET");
-    ASSERT_OK(writer->Close());
+    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::SUBSTITUTE_OFFSET,
+                                           "duplicate REALTIME_OFFSET");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsUnsortedPluginRows) {
-    CreatePkTable();
-    auto factory =
-        MakeDecoratingFactory<MalformedCoverageRealtimeStore>(CommitReaderMalformation::UNSORTED);
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create(factory));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
-                                   /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(batch)));
-    ASSERT_NOK_WITH_MSG(writer->PrepareCommitWithProgress(/*commit_identifier=*/0),
-                        "not globally sorted by primary key and sequence number");
-    ASSERT_OK(writer->Close());
+    CheckPkRejectsCommitReaderMalformation(
+        CommitReaderMalformation::UNSORTED,
+        "not globally sorted by primary key and sequence number");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
@@ -2265,27 +2268,19 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
                          MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false));
     ASSERT_OK(writer->Write(std::move(batch)));
 
-    auto create_reader = [&]() -> Result<std::unique_ptr<BatchReader>> {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Plan> plan,
-                               CreatePlan(realtime_context, /*predicate=*/nullptr));
-        ReadContextBuilder read_builder(table_path_);
-        read_builder.SetOptions(options_)
-            .SetReadFieldNames({"id", "payload", "pt"})
-            .WithRealtimeContext(realtime_context)
-            .WithMemoryPool(pool_);
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableRead> table_read,
-                               TableRead::Create(std::move(read_context)));
-        return table_read->CreateReader(plan->Splits());
+    auto release_reader = [&](bool explicit_close) -> Status {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
+                               CreateQueryReader(realtime_context));
+        if (explicit_close) {
+            reader->Close();
+        }
+        return Status::OK();
     };
 
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> explicitly_closed_reader, create_reader());
-    explicitly_closed_reader->Close();
-    explicitly_closed_reader.reset();
+    ASSERT_OK(release_reader(/*explicit_close=*/true));
     ASSERT_EQ(1, state->query_close_count->load(std::memory_order_acquire));
 
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> destroyed_reader, create_reader());
-    destroyed_reader.reset();
+    ASSERT_OK(release_reader(/*explicit_close=*/false));
     ASSERT_EQ(2, state->query_close_count->load(std::memory_order_acquire));
 
     ASSERT_OK(writer->Close());
@@ -2309,23 +2304,10 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderCloseFailure) {
                          MakeBatch({Row{2, "two", "p0"}}, /*partitioned=*/false));
     ASSERT_OK(writer->Write(std::move(second_batch)));
 
-    auto create_reader = [&]() -> Result<std::unique_ptr<BatchReader>> {
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Plan> plan,
-                               CreatePlan(realtime_context, /*predicate=*/nullptr));
-        ReadContextBuilder read_builder(table_path_);
-        read_builder.SetOptions(options_)
-            .SetReadFieldNames({"id", "payload", "pt"})
-            .WithRealtimeContext(realtime_context)
-            .WithMemoryPool(pool_);
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableRead> table_read,
-                               TableRead::Create(std::move(read_context)));
-        return table_read->CreateReader(plan->Splits());
-    };
-
     for (int32_t null_index = 0; null_index <= 1; ++null_index) {
         state->query_null_index = null_index;
-        ASSERT_NOK_WITH_MSG(create_reader(), "PK real-time store returned a null query reader");
+        ASSERT_NOK_WITH_MSG(CreateQueryReader(realtime_context),
+                            "PK real-time store returned a null query reader");
         ASSERT_EQ(null_index + 1, state->query_close_count->load(std::memory_order_acquire));
     }
     ASSERT_OK(writer->Close());
@@ -2347,15 +2329,7 @@ TEST_F(RealtimeWriteInteTest, TestAppendQueryReaderCloseFailure) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
                          CreatePlan(realtime_context, /*predicate=*/nullptr));
 
-    ReadContextBuilder read_builder(table_path_);
-    read_builder.SetOptions(options_)
-        .SetReadFieldNames({"id", "payload", "pt"})
-        .WithRealtimeContext(realtime_context)
-        .WithMemoryPool(pool_);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
-                         TableRead::Create(std::move(read_context)));
-    ASSERT_NOK_WITH_MSG(table_read->CreateReader(plan->Splits()),
+    ASSERT_NOK_WITH_MSG(CreateQueryReader(plan, realtime_context),
                         "append-only real-time store returned a null query reader");
     ASSERT_EQ(1, state->query_close_count->load(std::memory_order_acquire));
 
