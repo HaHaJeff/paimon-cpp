@@ -219,7 +219,7 @@ Result<std::unique_ptr<TableScan>> TableScan::Create(std::unique_ptr<ScanContext
 namespace {
 
 Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& core_options,
-                            const ScanContext& context) {
+                            const ScanContext& context, bool read_optimized) {
     if (!context.GetRealtimeContext()) {
         return Status::OK();
     }
@@ -233,6 +233,10 @@ Status ValidateRealtimeScan(const TableSchema& table_schema, const CoreOptions& 
         return Status::Invalid("real-time union read does not support data evolution");
     }
     if (!table_schema.PrimaryKeys().empty()) {
+        if (read_optimized) {
+            return Status::NotImplemented(
+                "PK real-time union read does not support read-optimized scans");
+        }
         PAIMON_RETURN_NOT_OK(ValidatePrimaryKeyRealtimeOptions(core_options, table_schema));
     }
     if (context.IsStreamingMode()) {
@@ -282,7 +286,8 @@ Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanCo
                            CoreOptions::FromMap(options, context->GetSpecificFileSystem(), {}));
     core_options.WithCache(context->GetCache());
 
-    PAIMON_RETURN_NOT_OK(ValidateRealtimeScan(*table_schema, core_options, *context));
+    PAIMON_RETURN_NOT_OK(
+        ValidateRealtimeScan(*table_schema, core_options, *context, read_optimized));
     // validate options
     if (core_options.GetBucket() == -1) {
         if (!table_schema->PrimaryKeys().empty()) {
