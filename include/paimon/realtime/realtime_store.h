@@ -163,12 +163,12 @@ class PAIMON_EXPORT RealtimeStore {
     /// Creates readers over rows in `view`. Append mode returns rows whose offsets are greater than
     /// or equal to `offset_begin`; primary-key mode ignores `offset_begin`.
     ///
-    /// Append-mode batches contain `_VALUE_KIND` followed by the requested fields except a duplicate
-    /// `_VALUE_KIND`, and collectively expose every matching row exactly once. Primary-key batches
-    /// use the prepared transport schema and may contain multiple mutations per key; each reader's
-    /// complete stream is sorted by full primary key then sequence number, and the readers
-    /// collectively expose every raw mutation exactly once. Paimon retains `view` for the lifetime
-    /// of the resulting framework reader.
+    /// Append-mode batches contain `_VALUE_KIND` followed by the requested fields except a
+    /// duplicate `_VALUE_KIND`, and collectively expose every matching row exactly once.
+    /// Primary-key batches use the prepared transport schema and may contain multiple mutations
+    /// per key; each reader's complete stream is sorted by full primary key then sequence number,
+    /// and the readers collectively expose every raw mutation exactly once. Paimon retains `view`
+    /// for the lifetime of the resulting framework reader.
     virtual Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
         const RealtimeQueryContext& context) = 0;

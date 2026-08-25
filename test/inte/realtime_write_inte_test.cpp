@@ -28,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <thread>
@@ -77,6 +78,61 @@
 
 namespace paimon::test {
 namespace {
+
+class FailAllocationMemoryPool final : public MemoryPool {
+ public:
+    explicit FailAllocationMemoryPool(const std::shared_ptr<MemoryPool>& delegate)
+        : delegate_(delegate) {}
+
+    void FailAfterAllocations(int64_t successful_allocations) {
+        allocations_before_failure_.store(successful_allocations, std::memory_order_release);
+    }
+
+    void* Malloc(uint64_t size, uint64_t alignment = 0) override {
+        if (ShouldFail()) {
+            throw std::bad_alloc();
+        }
+        return delegate_->Malloc(size, alignment);
+    }
+
+    void* Realloc(void* p, size_t old_size, size_t new_size, uint64_t alignment = 0) override {
+        if (ShouldFail()) {
+            throw std::bad_alloc();
+        }
+        return delegate_->Realloc(p, old_size, new_size, alignment);
+    }
+
+    void Free(void* p, uint64_t size) override {
+        delegate_->Free(p, size);
+    }
+
+    void Free(void* p, uint64_t size, uint64_t alignment) override {
+        delegate_->Free(p, size, alignment);
+    }
+
+    uint64_t CurrentUsage() const override {
+        return delegate_->CurrentUsage();
+    }
+
+    uint64_t MaxMemoryUsage() const override {
+        return delegate_->MaxMemoryUsage();
+    }
+
+ private:
+    bool ShouldFail() {
+        int64_t remaining = allocations_before_failure_.load(std::memory_order_acquire);
+        while (remaining >= 0) {
+            if (allocations_before_failure_.compare_exchange_weak(remaining, remaining - 1,
+                                                                  std::memory_order_acq_rel)) {
+                return remaining == 0;
+            }
+        }
+        return false;
+    }
+
+    std::shared_ptr<MemoryPool> delegate_;
+    std::atomic<int64_t> allocations_before_failure_{-1};
+};
 
 class TrackingRealtimeReadView final : public RealtimeReadView {
  public:
@@ -2106,6 +2162,7 @@ TEST_F(RealtimeWriteInteTest, TestPkRecovery) {
     ASSERT_EQ(1, NewFiles(progress).size());
     ASSERT_EQ(2, NewFiles(progress)[0]->min_sequence_number);
     ASSERT_EQ(memory_sequences.back(), NewFiles(progress)[0]->max_sequence_number);
+    ASSERT_EQ(1, NewFiles(progress)[0]->delete_row_count);
     ASSERT_OK(Commit(progress, /*commit_identifier=*/1));
     ASSERT_OK(first_writer->Close());
     first_context.reset();
@@ -4452,6 +4509,73 @@ TEST_F(RealtimeWriteInteTest, TestRestoreOffsetFromCommittedSnapshot) {
     RealtimePartitionBucket partition_bucket(/*partition=*/{}, /*bucket=*/0);
     ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap second_committed_offsets, ReadCommittedOffsets());
     ASSERT_EQ(5, second_committed_offsets.at(partition_bucket));
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkWriteFailureRecovery) {
+    CreatePkTable();
+    const std::vector<Row> seed_rows = {{99, "seed", "p0"}};
+    ReplayPkWalAndCommit(seed_rows, /*row_kinds=*/{}, /*commit_identifier=*/0, seed_rows);
+
+    const std::vector<Row> wal = {
+        {1, "one", "p0"}, {1, "one-new", "p0"}, {2, "deleted", "p0"}, {3, "three", "p0"}};
+    const std::vector<RecordBatch::RowKind> row_kinds = {
+        RecordBatch::RowKind::INSERT, RecordBatch::RowKind::UPDATE_AFTER,
+        RecordBatch::RowKind::DELETE, RecordBatch::RowKind::INSERT};
+    std::shared_ptr<FailAllocationMemoryPool> failing_pool =
+        std::make_shared<FailAllocationMemoryPool>(pool_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> failed_context,
+                         RealtimeContext::Create());
+    WriteContextBuilder failed_builder(table_path_, commit_user_);
+    failed_builder.SetOptions(options_)
+        .WithStreamingMode(true)
+        .WithRealtimeContext(failed_context)
+        .WithMemoryPool(failing_pool);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> failed_write_context,
+                         failed_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> failed_writer,
+                         FileStoreWrite::Create(std::move(failed_write_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> empty_batch,
+                         MakeUnpartitionedBatchFromJson("[]"));
+    ASSERT_OK(failed_writer->Write(std::move(empty_batch)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> failed_batch,
+                         MakeBatch(wal, /*partitioned=*/false, /*bucket=*/0, row_kinds));
+    failing_pool->FailAfterAllocations(1);
+    Status failed_write = failed_writer->Write(std::move(failed_batch));
+    ASSERT_TRUE(failed_write.IsOutOfMemory()) << failed_write.ToString();
+    ASSERT_OK(failed_writer->Close());
+    failed_writer.reset();
+    failed_context.reset();
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> rows_after_failure, ReadRows());
+    ASSERT_EQ(seed_rows, rows_after_failure);
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> replay_context,
+                         RealtimeContext::Create());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> replay_writer,
+                         CreateRealtimeWriter(replay_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> replay_batch,
+                         MakeBatch(wal, /*partitioned=*/false, /*bucket=*/0, row_kinds));
+    ASSERT_OK(replay_writer->Write(std::move(replay_batch)));
+    const std::vector<Row> expected_rows = {
+        {1, "one-new", "p0"}, {3, "three", "p0"}, {99, "seed", "p0"}};
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> replayed_rows, ReadRows(replay_context));
+    ASSERT_EQ(expected_rows, replayed_rows);
+    ASSERT_OK_AND_ASSIGN(std::vector<RealtimeCommitProgress> progress,
+                         replay_writer->PrepareCommitWithProgress(/*commit_identifier=*/1));
+    ASSERT_EQ(1, progress.size());
+    ASSERT_EQ(OffsetRange(1, 5), progress[0].offset_range);
+    ASSERT_EQ(1, NewFiles(progress).size());
+    ASSERT_EQ(1, NewFiles(progress)[0]->delete_row_count);
+    ASSERT_OK_AND_ASSIGN(int64_t snapshot_id, Commit(progress, /*commit_identifier=*/1));
+    ASSERT_OK(replay_writer->RefreshCommittedSnapshot(snapshot_id));
+    ASSERT_OK(replay_writer->Close());
+    replay_writer.reset();
+    replay_context.reset();
+
+    ASSERT_OK_AND_ASSIGN(std::vector<Row> persisted_rows, ReadRows());
+    ASSERT_EQ(expected_rows, persisted_rows);
+    ASSERT_OK_AND_ASSIGN(RealtimeOffsetMap committed_offsets, ReadCommittedOffsets());
+    ASSERT_EQ(5, committed_offsets.at(RealtimePartitionBucket(/*partition=*/{}, /*bucket=*/0)));
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkExternalCommitRecovery) {

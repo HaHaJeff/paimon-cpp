@@ -53,7 +53,7 @@ class PrimaryKeyRealtimeStore final : public RealtimeStore {
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
         const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
         const RealtimeQueryContext& context) override;
-    Status AdvanceCommittedOffset(int64_t committed_offset) override;
+    Status AdvanceCommittedOffset(int64_t committed_end_offset) override;
     uint64_t GetMemoryUsage() const override;
 
  private:

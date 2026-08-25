@@ -18,8 +18,10 @@
 
 #include "paimon/core/io/single_file_writer.h"
 
+#include <functional>
 #include <map>
-#include <utility>
+#include <memory>
+#include <string>
 
 #include "arrow/api.h"
 #include "arrow/c/abi.h"

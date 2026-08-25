@@ -150,7 +150,7 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
     const std::shared_ptr<Split>& split) {
     std::shared_ptr<RealtimeSplit> realtime_split = std::dynamic_pointer_cast<RealtimeSplit>(split);
     if (realtime_split) {
-        return CreateRealtimeReader(realtime_split, true);
+        return CreateRealtimeReader(realtime_split, /*release_ticket=*/true);
     }
 
     std::shared_ptr<Split> dispatch_split = split;
@@ -221,7 +221,8 @@ Result<std::unique_ptr<BatchReader>> KeyValueTableRead::CreateReader(
             std::dynamic_pointer_cast<RealtimeSplit>(split);
         if (realtime_split) {
             PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
-                                   CreateRealtimeReader(realtime_split, false));
+                                   CreateRealtimeReader(realtime_split,
+                                                        /*release_ticket=*/false));
             readers.push_back(std::move(reader));
             realtime_splits.push_back(std::move(realtime_split));
         } else {

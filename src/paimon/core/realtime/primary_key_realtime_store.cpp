@@ -418,9 +418,9 @@ class PrimaryKeyRealtimeStore::Impl {
         return readers;
     }
 
-    Status AdvanceCommittedOffset(int64_t committed_end) {
+    Status AdvanceCommittedOffset(int64_t committed_end_offset) {
         std::lock_guard<std::mutex> lock(mutex_);
-        while (!sealed_.empty() && sealed_.front()->GetOffsetRange().end <= committed_end) {
+        while (!sealed_.empty() && sealed_.front()->GetOffsetRange().end <= committed_end_offset) {
             sealed_.erase(sealed_.begin());
         }
         return Status::OK();
@@ -499,8 +499,8 @@ Result<std::vector<std::unique_ptr<BatchReader>>> PrimaryKeyRealtimeStore::Creat
     const RealtimeQueryContext& context) {
     return impl_->CreateQueryReaders(view, offset, context);
 }
-Status PrimaryKeyRealtimeStore::AdvanceCommittedOffset(int64_t offset) {
-    return impl_->AdvanceCommittedOffset(offset);
+Status PrimaryKeyRealtimeStore::AdvanceCommittedOffset(int64_t committed_end_offset) {
+    return impl_->AdvanceCommittedOffset(committed_end_offset);
 }
 uint64_t PrimaryKeyRealtimeStore::GetMemoryUsage() const {
     return impl_->GetMemoryUsage();
