@@ -18,7 +18,10 @@
 
 #include "paimon/core/realtime/primary_key_realtime_store.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -31,10 +34,9 @@
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
-#include "paimon/core/core_options.h"
-#include "paimon/core/schema/table_schema.h"
 #include "paimon/macros.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/realtime/arrow_realtime_store_factory.h"
 #include "paimon/testing/utils/testharness.h"
 
 namespace paimon::test {
@@ -69,16 +71,6 @@ std::shared_ptr<arrow::Schema> NestedPreparedSchema() {
              arrow::field("value",
                           arrow::struct_({arrow::field("name", arrow::utf8()),
                                           arrow::field("items", arrow::list(arrow::int32()))}))))});
-}
-
-std::shared_ptr<TableSchema> PkSchema(
-    const std::shared_ptr<arrow::DataType>& key_type = arrow::int64(),
-    const std::map<std::string, std::string>& options = {}) {
-    return TableSchema::Create(
-               /*schema_id=*/0,
-               arrow::schema({arrow::field("id", key_type), arrow::field("value", arrow::utf8())}),
-               /*partition_keys=*/{}, /*primary_keys=*/{"id"}, options)
-        .value();
 }
 
 std::unique_ptr<RecordBatch> MakeBatch(const std::string& json) {
@@ -142,52 +134,50 @@ Result<std::string> ReadJson(const std::vector<std::unique_ptr<BatchReader>>& re
     return result->ToString();
 }
 
-TEST(PrimaryKeyRealtimeStoreOptionsTest, TestSupportedOptions) {
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
-    ASSERT_OK(PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema()));
-}
-
-TEST(PrimaryKeyRealtimeStoreOptionsTest, TestUnsupportedOptions) {
-    const std::string sequence_group =
-        std::string(Options::FIELDS_PREFIX) + ".value." + Options::SEQUENCE_GROUP;
-    const std::vector<std::map<std::string, std::string>> unsupported_options = {
-        {{Options::BUCKET, "0"}},
-        {{Options::BUCKET, "1"}, {Options::MERGE_ENGINE, "partial-update"}},
-        {{Options::BUCKET, "1"}, {Options::DATA_EVOLUTION_ENABLED, "true"}},
-        {{Options::BUCKET, "1"}, {sequence_group, "seq"}},
-        {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
-        {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
-        {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
-        {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
-    };
-    for (const std::map<std::string, std::string>& option_map : unsupported_options) {
-        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
-        ASSERT_NOK(PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema()));
+class TestingMemoryPool final : public MemoryPool {
+ public:
+    void* Malloc(uint64_t size, uint64_t alignment) override {
+        ++allocation_count;
+        if (reject_allocations) {
+            throw std::bad_alloc();
+        }
+        return delegate_->Malloc(size, alignment);
     }
-}
 
-TEST(PrimaryKeyRealtimeStoreOptionsTest, TestRejectsFloatingPrimaryKeys) {
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
-    ASSERT_NOK_WITH_MSG(
-        PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema(arrow::float32())),
-        "FLOAT or DOUBLE primary keys");
-    ASSERT_NOK_WITH_MSG(
-        PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema(arrow::float64())),
-        "FLOAT or DOUBLE primary keys");
-}
+    void* Realloc(void* pointer, size_t old_size, size_t new_size, uint64_t alignment) override {
+        ++allocation_count;
+        if (reject_allocations) {
+            throw std::bad_alloc();
+        }
+        return delegate_->Realloc(pointer, old_size, new_size, alignment);
+    }
 
-TEST(PrimaryKeyRealtimeStoreOptionsTest, TestRejectsEnabledGlobalIndex) {
-    const std::map<std::string, std::string> option_map = {{Options::BUCKET, "1"},
-                                                           {Options::PK_BTREE_INDEX_COLUMNS, "id"}};
-    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
-    ASSERT_NOK_WITH_MSG(
-        PrimaryKeyRealtimeStore::ValidateOptions(options, *PkSchema(arrow::int64(), option_map)),
-        "does not support global indexes");
-}
+    void Free(void* pointer, uint64_t size) override {
+        delegate_->Free(pointer, size);
+    }
+
+    void Free(void* pointer, uint64_t size, uint64_t alignment) override {
+        delegate_->Free(pointer, size, alignment);
+    }
+
+    uint64_t CurrentUsage() const override {
+        return delegate_->CurrentUsage();
+    }
+
+    uint64_t MaxMemoryUsage() const override {
+        return delegate_->MaxMemoryUsage();
+    }
+
+    bool reject_allocations = false;
+    int64_t allocation_count = 0;
+
+ private:
+    std::unique_ptr<MemoryPool> delegate_ = GetMemoryPool();
+};
 
 TEST(PrimaryKeyRealtimeStoreTest, TestWriteAndSealValidation) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(PreparedSchema()));
+                         PrimaryKeyRealtimeStore::Create(PreparedSchema(), GetDefaultPool()));
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
                          store->SealForCommit());
     ASSERT_FALSE(segment.has_value());
@@ -232,14 +222,15 @@ TEST(PrimaryKeyRealtimeStoreTest, TestBadTransportPrefix) {
     invalid_fields.push_back(std::move(wrong_offset_id));
 
     for (const arrow::FieldVector& fields : invalid_fields) {
-        ASSERT_NOK_WITH_MSG(PrimaryKeyRealtimeStore::Create(arrow::schema(fields)),
-                            "prepared schema field");
+        ASSERT_NOK_WITH_MSG(
+            PrimaryKeyRealtimeStore::Create(arrow::schema(fields), GetDefaultPool()),
+            "prepared schema field");
     }
 }
 
 TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderPerStoredBatch) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(PreparedSchema()));
+                         PrimaryKeyRealtimeStore::Create(PreparedSchema(), GetDefaultPool()));
     ASSERT_OK(store->Write(RealtimeWriteBatch{
         MakeBatch(R"([[1, 6, 1, 1, "before"], [0, 5, 0, 3, "three"]])"), OffsetRange(0, 2)}));
     ASSERT_OK(store->Write(
@@ -265,7 +256,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderPerStoredBatch) {
 TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderExportsZeroOffsets) {
     std::shared_ptr<arrow::Schema> schema = NestedPreparedSchema();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(schema));
+                         PrimaryKeyRealtimeStore::Create(schema, GetDefaultPool()));
     ASSERT_OK(store->Write(RealtimeWriteBatch{
         MakeBatch(schema, R"([[0, 1, 0, 1, ["one", [1, 2]]], [0, 2, 1, 2, ["two", [3, 4]]]])"),
         OffsetRange(0, 2)}));
@@ -286,7 +277,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCommitReaderExportsZeroOffsets) {
 
 TEST(PrimaryKeyRealtimeStoreTest, TestCloseUnreadBatchReaders) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(PreparedSchema()));
+                         PrimaryKeyRealtimeStore::Create(PreparedSchema(), GetDefaultPool()));
     ASSERT_OK(
         store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 10, 0, 1, "a"]])"), OffsetRange(0, 1)}));
     ASSERT_OK(
@@ -306,7 +297,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestCloseUnreadBatchReaders) {
 
 TEST(PrimaryKeyRealtimeStoreTest, TestReclaimKeepsReadView) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(PreparedSchema()));
+                         PrimaryKeyRealtimeStore::Create(PreparedSchema(), GetDefaultPool()));
     ASSERT_OK(
         store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 0, 4, 1, "one"]])"), OffsetRange(4, 5)}));
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
@@ -318,7 +309,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestReclaimKeepsReadView) {
 
 TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderPerStoredBatch) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(PreparedSchema()));
+                         PrimaryKeyRealtimeStore::Create(PreparedSchema(), GetDefaultPool()));
     ASSERT_OK(
         store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 1, 0, 2, "two"]])"), OffsetRange(0, 1)}));
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
@@ -342,7 +333,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderPerStoredBatch) {
 TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderProjectsTopLevelFieldsById) {
     const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(stored_schema));
+                         PrimaryKeyRealtimeStore::Create(stored_schema, GetDefaultPool()));
     ASSERT_OK(store->Write(RealtimeWriteBatch{
         MakeSlicedBatch(stored_schema,
                         R"([[0, 1, 0, 6, "six"], [0, 2, 1, 7, "seven"], [0, 3, 2, 8, "eight"]])", 1,
@@ -374,6 +365,34 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderProjectsTopLevelFieldsById) {
     ASSERT_TRUE(projected->field(4)->IsNull(0));
 }
 
+TEST(PrimaryKeyRealtimeStoreTest, TestQuerySchemaAlignmentUsesCallerPool) {
+    const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
+    std::shared_ptr<TestingMemoryPool> pool = std::make_shared<TestingMemoryPool>();
+    auto write_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*stored_schema, write_schema.get()).ok());
+    RealtimeStoreCreateRequest request{std::move(write_schema),
+                                       /*options=*/{}, pool, RealtimeStoreMode::PRIMARY_KEY};
+    ArrowRealtimeStoreFactory factory;
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeStore> store, factory.Create(std::move(request)));
+    ASSERT_OK(store->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[0, 1, 0, 7, "seven"]])"), OffsetRange(0, 1)}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
+
+    arrow::FieldVector requested_fields = stored_schema->fields();
+    requested_fields.push_back(FieldWithId("added", arrow::int32(), 2));
+    std::shared_ptr<arrow::Schema> requested_schema = arrow::schema(std::move(requested_fields));
+    auto c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*requested_schema, c_schema.get()).ok());
+    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
+                                 /*enable_predicate_pushdown=*/false};
+
+    const int64_t allocations_before_query = pool->allocation_count;
+    pool->reject_allocations = true;
+    ASSERT_NOK_WITH_MSG(store->CreateQueryReaders(view, /*offset_begin=*/0, context),
+                        "Out of memory");
+    ASSERT_GT(pool->allocation_count, allocations_before_query);
+}
+
 TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
     const std::shared_ptr<arrow::Field> stored_a = FieldWithId("a", arrow::int32(), 10);
     const std::shared_ptr<arrow::Field> stored_b = FieldWithId("b", arrow::int32(), 11);
@@ -389,7 +408,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
         FieldWithId("attrs", arrow::map(arrow::utf8(), arrow::struct_({stored_x, stored_y})), 2)};
     std::shared_ptr<arrow::Schema> stored_schema = arrow::schema(std::move(stored_fields));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(stored_schema));
+                         PrimaryKeyRealtimeStore::Create(stored_schema, GetDefaultPool()));
     ASSERT_OK(store->Write(RealtimeWriteBatch{
         MakeSlicedBatch(
             stored_schema,

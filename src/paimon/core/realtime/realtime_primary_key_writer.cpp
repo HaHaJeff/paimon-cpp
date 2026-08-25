@@ -19,12 +19,14 @@
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 
 #include <limits>
+#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "arrow/compute/api.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
@@ -52,20 +54,31 @@ struct PreparedArrayPrivateData {
 };
 
 void ReleasePreparedArray(ArrowArray* array) {
-    auto* data = static_cast<PreparedArrayPrivateData*>(array->private_data);
+    std::unique_ptr<PreparedArrayPrivateData> data(
+        static_cast<PreparedArrayPrivateData*>(array->private_data));
     array->release = data->release;
     array->private_data = data->private_data;
     array->release(array);
-    delete data;
 }
 
 Status RetainPreparedArrayPool(ArrowArray* array,
                                const std::shared_ptr<arrow::MemoryPool>& arrow_pool) {
-    if (!array || !array->release || !arrow_pool) {
+    if (!array || !array->release) {
         return Status::Invalid("cannot retain prepared batch memory pool");
     }
-    array->private_data =
-        new PreparedArrayPrivateData{array->release, array->private_data, arrow_pool};
+    if (!arrow_pool) {
+        ArrowArrayRelease(array);
+        return Status::Invalid("cannot retain prepared batch memory pool");
+    }
+    std::unique_ptr<PreparedArrayPrivateData> data;
+    try {
+        data = std::make_unique<PreparedArrayPrivateData>(
+            PreparedArrayPrivateData{array->release, array->private_data, arrow_pool});
+    } catch (const std::bad_alloc&) {
+        ArrowArrayRelease(array);
+        return Status::OutOfMemory("failed to retain prepared batch memory pool");
+    }
+    array->private_data = data.release();
     array->release = ReleasePreparedArray;
     return Status::OK();
 }

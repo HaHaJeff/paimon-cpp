@@ -28,66 +28,16 @@
 #include "arrow/c/bridge.h"
 #include "fmt/format.h"
 #include "paimon/common/metrics/metrics_impl.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
+#include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
-#include "paimon/core/core_options.h"
-#include "paimon/core/index/pk/primary_key_index_definitions.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
-#include "paimon/core/schema/table_schema.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"
+#include "paimon/memory/memory_pool.h"
 
 namespace paimon {
-
-Status PrimaryKeyRealtimeStore::ValidateOptions(const CoreOptions& options,
-                                                const TableSchema& schema) {
-    if (options.GetBucket() <= 0) {
-        return Status::NotImplemented("PK realtime v1 requires fixed buckets");
-    }
-    if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
-        return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
-    }
-    if (options.DataEvolutionEnabled()) {
-        return Status::NotImplemented("PK realtime v1 does not support data evolution");
-    }
-    if (!options.GetFieldsSequenceGroups().empty()) {
-        return Status::NotImplemented("PK realtime v1 does not support sequence groups");
-    }
-    if (options.IgnoreDelete() || options.PartialUpdateRemoveRecordOnDelete() ||
-        options.AggregationRemoveRecordOnDelete() ||
-        !options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
-        return Status::NotImplemented("PK realtime v1 requires default delete behavior");
-    }
-    if (!options.GetSequenceField().empty()) {
-        return Status::NotImplemented("PK realtime v1 does not support sequence.field");
-    }
-    if (!options.SequenceFieldSortOrderIsAscending()) {
-        return Status::NotImplemented(
-            "PK realtime v1 supports only ascending sequence.field.sort-order");
-    }
-    if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
-        options.GetChangelogProducer() != ChangelogProducer::NONE) {
-        return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> primary_key_fields,
-                           schema.TrimmedPrimaryKeyFields());
-    for (const DataField& field : primary_key_fields) {
-        if (field.Type()->id() == arrow::Type::FLOAT || field.Type()->id() == arrow::Type::DOUBLE) {
-            return Status::NotImplemented(
-                "PK realtime v1 does not support FLOAT or DOUBLE primary keys");
-        }
-    }
-    if (options.GlobalIndexEnabled()) {
-        PAIMON_ASSIGN_OR_RAISE(PrimaryKeyIndexDefinitions definitions,
-                               PrimaryKeyIndexDefinitions::Create(schema));
-        if (!definitions.Definitions().empty()) {
-            return Status::NotImplemented("PK realtime v1 does not support global indexes");
-        }
-    }
-    return Status::OK();
-}
 
 namespace {
 
@@ -283,8 +233,11 @@ class StoredBatchReader final : public BatchReader {
 
 class PrimaryKeyRealtimeStore::Impl {
  public:
-    explicit Impl(std::shared_ptr<arrow::Schema> prepared_schema)
-        : prepared_schema_(std::move(prepared_schema)) {}
+    Impl(std::shared_ptr<arrow::Schema> prepared_schema, std::shared_ptr<MemoryPool> memory_pool,
+         std::shared_ptr<arrow::MemoryPool> arrow_pool)
+        : prepared_schema_(std::move(prepared_schema)),
+          memory_pool_(std::move(memory_pool)),
+          arrow_pool_(std::move(arrow_pool)) {}
 
     Status Write(RealtimeWriteBatch&& write_batch) {
         if (!write_batch.batch || !write_batch.batch->GetData()) {
@@ -369,7 +322,7 @@ class PrimaryKeyRealtimeStore::Impl {
                 PAIMON_ASSIGN_OR_RAISE(
                     std::shared_ptr<arrow::Array> projected,
                     AlignArrayByPaimonIds(batch.data, arrow::struct_(read_schema->fields()),
-                                          arrow::default_memory_pool()));
+                                          arrow_pool_.get()));
                 StoredBatch query_batch{checked_pointer_cast<arrow::StructArray>(projected),
                                         batch.offset_range, /*memory_usage=*/0};
                 readers.push_back(std::make_unique<StoredBatchReader>(query_batch));
@@ -399,6 +352,8 @@ class PrimaryKeyRealtimeStore::Impl {
 
  private:
     std::shared_ptr<arrow::Schema> prepared_schema_;
+    std::shared_ptr<MemoryPool> memory_pool_;
+    std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     mutable std::mutex mutex_;
     std::vector<StoredBatch> building_;
     std::vector<std::shared_ptr<Segment>> sealed_;
@@ -410,10 +365,15 @@ PrimaryKeyRealtimeStore::PrimaryKeyRealtimeStore(std::unique_ptr<Impl>&& impl)
 PrimaryKeyRealtimeStore::~PrimaryKeyRealtimeStore() = default;
 
 Result<std::shared_ptr<PrimaryKeyRealtimeStore>> PrimaryKeyRealtimeStore::Create(
-    const std::shared_ptr<arrow::Schema>& prepared_schema) {
+    const std::shared_ptr<arrow::Schema>& prepared_schema,
+    const std::shared_ptr<MemoryPool>& memory_pool) {
     PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
-    return std::shared_ptr<PrimaryKeyRealtimeStore>(
-        new PrimaryKeyRealtimeStore(std::make_unique<Impl>(prepared_schema)));
+    if (!memory_pool) {
+        return Status::Invalid("PK real-time store memory pool is null");
+    }
+    std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(memory_pool);
+    return std::shared_ptr<PrimaryKeyRealtimeStore>(new PrimaryKeyRealtimeStore(
+        std::make_unique<Impl>(prepared_schema, memory_pool, std::move(arrow_pool))));
 }
 Status PrimaryKeyRealtimeStore::Write(RealtimeWriteBatch&& batch) {
     return impl_->Write(std::move(batch));

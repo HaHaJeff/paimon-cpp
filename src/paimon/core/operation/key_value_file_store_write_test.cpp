@@ -488,19 +488,17 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
     });
     std::unique_ptr<UniqueTestDirectory> dir = UniqueTestDirectory::Create();
     ASSERT_TRUE(dir);
-    CreateTable(dir->Str(), schema, options);
-
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
-    WriteContextBuilder builder(PathUtil::JoinPath(dir->Str(), "foo.db/bar"), "test");
-    builder.SetOptions(options).WithStreamingMode(true).WithRealtimeContext(realtime_context);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> write_context, builder.Finish());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         FileStoreWrite::Create(std::move(write_context)));
-
-    ASSERT_NOK_WITH_MSG(writer->Write(MakeBatch(schema, R"([[1, 10]])")),
-                        "PK real-time write schema contains reserved transport field");
-    ASSERT_OK(writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<Catalog> catalog, Catalog::Create(dir->Str(), options));
+    ASSERT_OK(catalog->CreateDatabase("foo", {}, /*ignore_if_exists=*/false));
+    ArrowSchema c_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &c_schema).ok());
+    Status create_status =
+        catalog->CreateTable(Identifier("foo", "bar"), &c_schema,
+                             /*partition_keys=*/{}, /*primary_keys=*/{"id"}, options,
+                             /*ignore_if_exists=*/false);
+    ArrowSchemaRelease(&c_schema);
+    ASSERT_NOK_WITH_MSG(create_status,
+                        "field name '_REALTIME_OFFSET' in schema cannot be special field");
 }
 
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimePool) {

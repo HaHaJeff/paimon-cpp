@@ -29,15 +29,14 @@ class Schema;
 
 namespace paimon {
 
-class CoreOptions;
-class TableSchema;
+class MemoryPool;
 
 /// Internal in-memory implementation of the default primary-key `RealtimeStore`.
 class PrimaryKeyRealtimeStore final : public RealtimeStore {
  public:
     static Result<std::shared_ptr<PrimaryKeyRealtimeStore>> Create(
-        const std::shared_ptr<arrow::Schema>& prepared_schema);
-    static Status ValidateOptions(const CoreOptions& options, const TableSchema& schema);
+        const std::shared_ptr<arrow::Schema>& prepared_schema,
+        const std::shared_ptr<MemoryPool>& memory_pool);
 
     ~PrimaryKeyRealtimeStore() override;
 
