@@ -98,6 +98,36 @@ class TrackingBatchReader : public BatchReader {
     int32_t* close_count_;
 };
 
+class MalformedBitmapBatchReader : public BatchReader {
+ public:
+    MalformedBitmapBatchReader(std::unique_ptr<BatchReader>&& delegate, int32_t row_id)
+        : delegate_(std::move(delegate)), row_id_(row_id) {}
+
+    Result<ReadBatch> NextBatch() override {
+        return delegate_->NextBatch();
+    }
+
+    Result<ReadBatchWithBitmap> NextBatchWithBitmap() override {
+        PAIMON_ASSIGN_OR_RAISE(ReadBatchWithBitmap batch, delegate_->NextBatchWithBitmap());
+        if (!IsEofBatch(batch)) {
+            batch.second.Add(row_id_);
+        }
+        return batch;
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return delegate_->GetReaderMetrics();
+    }
+
+    void Close() override {
+        delegate_->Close();
+    }
+
+ private:
+    std::unique_ptr<BatchReader> delegate_;
+    int32_t row_id_;
+};
+
 }  // namespace
 
 class MergedKeyValueRecordReaderTest : public testing::Test {
@@ -257,6 +287,28 @@ TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderRejectsReversedVisibleO
                                         value_schema, value_schema, pool_);
     ASSERT_TRUE(result.status().IsInvalid());
     ASSERT_NOK_WITH_MSG(result, "prepared visible offset range begin exceeds end");
+}
+
+TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderBitmapBounds) {
+    std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
+    std::shared_ptr<arrow::Schema> value_schema = arrow::schema({key});
+    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema({key});
+    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
+    std::shared_ptr<arrow::Array> prepared_array =
+        arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([[0, 10, 0, 1]])").ValueOrDie();
+    auto batch_reader = std::make_unique<MalformedBitmapBatchReader>(
+        std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, /*batch_size=*/1),
+        /*row_id=*/1);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<KeyValueRecordReader> reader,
+        AdaptPreparedBatchReaderForTest(std::move(batch_reader), prepared_schema, OffsetRange(0, 1),
+                                        value_schema, value_schema, pool_));
+    Result<std::vector<KeyValue>> result =
+        ReadResultCollector::CollectKeyValueResult<KeyValueRecordReader,
+                                                   KeyValueRecordReader::Iterator>(reader.get());
+    ASSERT_TRUE(result.status().IsInvalid());
+    ASSERT_NOK_WITH_MSG(result, "selected row id 1 is out of bounds for prepared batch length 1");
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderCommitSchema) {

@@ -321,7 +321,9 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
             }
             key_ctx_ = std::make_shared<ColumnarBatchContext>(key_fields, pool_);
             value_ctx_ = std::make_shared<ColumnarBatchContext>(value_fields, pool_);
-            if (!SelectRows(*offset_array, std::move(selection))) {
+            PAIMON_ASSIGN_OR_RAISE(bool has_selected_rows,
+                                   SelectRows(*offset_array, std::move(selection)));
+            if (!has_selected_rows) {
                 continue;
             }
             ArrowUtils::TraverseArray(data_batch);
@@ -362,7 +364,15 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         return Status::OK();
     }
 
-    bool SelectRows(const arrow::Int64Array& offsets, RoaringBitmap32&& selection) {
+    Result<bool> SelectRows(const arrow::Int64Array& offsets, RoaringBitmap32&& selection) {
+        for (auto iter = selection.Begin(); iter != selection.End(); ++iter) {
+            const int32_t row = *iter;
+            if (row < 0 || row >= offsets.length()) {
+                return Status::Invalid(
+                    fmt::format("selected row id {} is out of bounds for prepared batch length {}",
+                                row, offsets.length()));
+            }
+        }
         if (!visible_offsets_.has_value()) {
             selected_rows_.reserve(offsets.length());
             for (int64_t row = 0; row < offsets.length(); ++row) {
