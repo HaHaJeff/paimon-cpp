@@ -29,12 +29,14 @@
 #include "paimon/common/utils/fields_comparator.h"
 #include "paimon/common/utils/object_utils.h"
 #include "paimon/core/core_options.h"
+#include "paimon/core/index/pk/primary_key_index_definitions.h"
 #include "paimon/core/mergetree/compact/aggregate/aggregate_merge_function.h"
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/first_row_merge_function.h"
 #include "paimon/core/mergetree/compact/merge_function.h"
 #include "paimon/core/mergetree/compact/partial_update_merge_function.h"
 #include "paimon/core/options/merge_engine.h"
+#include "paimon/core/schema/table_schema.h"
 #include "paimon/status.h"
 
 namespace arrow {
@@ -94,6 +96,54 @@ Result<std::unique_ptr<FieldsComparator>> PrimaryKeyTableUtils::CreateSequenceFi
     }
     return FieldsComparator::Create(value_fields, sort_field_idxs,
                                     options.SequenceFieldSortOrderIsAscending());
+}
+
+Status PrimaryKeyTableUtils::ValidateRealtimeOptions(const CoreOptions& options,
+                                                     const TableSchema& schema) {
+    if (options.GetBucket() <= 0) {
+        return Status::NotImplemented("PK realtime v1 requires fixed buckets");
+    }
+    if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
+        return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
+    }
+    if (options.DataEvolutionEnabled()) {
+        return Status::NotImplemented("PK realtime v1 does not support data evolution");
+    }
+    if (!options.GetFieldsSequenceGroups().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support sequence groups");
+    }
+    if (options.IgnoreDelete() || options.PartialUpdateRemoveRecordOnDelete() ||
+        options.AggregationRemoveRecordOnDelete() ||
+        !options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
+        return Status::NotImplemented("PK realtime v1 requires default delete behavior");
+    }
+    if (!options.GetSequenceField().empty()) {
+        return Status::NotImplemented("PK realtime v1 does not support sequence.field");
+    }
+    if (!options.SequenceFieldSortOrderIsAscending()) {
+        return Status::NotImplemented(
+            "PK realtime v1 supports only ascending sequence.field.sort-order");
+    }
+    if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
+        options.GetChangelogProducer() != ChangelogProducer::NONE) {
+        return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
+    }
+    PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> primary_key_fields,
+                           schema.TrimmedPrimaryKeyFields());
+    for (const DataField& field : primary_key_fields) {
+        if (field.Type()->id() == arrow::Type::FLOAT || field.Type()->id() == arrow::Type::DOUBLE) {
+            return Status::NotImplemented(
+                "PK realtime v1 does not support FLOAT or DOUBLE primary keys");
+        }
+    }
+    if (options.GlobalIndexEnabled()) {
+        PAIMON_ASSIGN_OR_RAISE(PrimaryKeyIndexDefinitions definitions,
+                               PrimaryKeyIndexDefinitions::Create(schema));
+        if (!definitions.Definitions().empty()) {
+            return Status::NotImplemented("PK realtime v1 does not support global indexes");
+        }
+    }
+    return Status::OK();
 }
 
 }  // namespace paimon

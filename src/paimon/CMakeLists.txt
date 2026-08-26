@@ -383,7 +383,6 @@ set(PAIMON_CORE_SRCS
     core/realtime/arrow_array_pool_holder.cpp
     core/realtime/arrow_realtime_store.cpp
     core/realtime/arrow_realtime_store_factory.cpp
-    core/realtime/framework/primary_key_realtime_validator.cpp
     core/realtime/prepared_key_value_reader.cpp
     core/realtime/primary_key_realtime_store.cpp
     core/realtime/realtime_append_only_writer.cpp
@@ -792,7 +791,6 @@ if(PAIMON_BUILD_TESTS)
                     core/manifest/index_manifest_file_handler_test.cpp
                     core/memory/writer_memory_manager_test.cpp
                     core/realtime/arrow_realtime_store_test.cpp
-                    core/realtime/framework/primary_key_realtime_validator_test.cpp
                     core/realtime/primary_key_realtime_store_test.cpp
                     core/realtime/realtime_context_test.cpp
                     core/realtime/realtime_reader_test.cpp

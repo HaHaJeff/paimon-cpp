@@ -1882,45 +1882,6 @@ TEST_F(RealtimeWriteInteTest, TestPkNestedProjectionAcrossDiskAndMemory) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(RealtimeWriteInteTest, TestPkMemoryReadAfterSchemaEvolution) {
-    CreatePkTable();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         MakeBatch({Row{1, "old", "p0"}}, /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(batch)));
-
-    std::shared_ptr<arrow::Field> renamed_payload = arrow::field("renamed_payload", arrow::utf8());
-    std::shared_ptr<arrow::Field> added = arrow::field("added", arrow::int32());
-    ASSERT_OK(TestHelper::WriteNextSchema(dir_->GetFileSystem(), table_path_,
-                                          {DataField(0, fields_[0]), DataField(1, renamed_payload),
-                                           DataField(2, fields_[2]), DataField(3, added)},
-                                          /*highest_field_id=*/3, options_));
-    fields_[1] = renamed_payload;
-    fields_.push_back(added);
-    schema_ = arrow::schema(fields_);
-
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan,
-                         CreatePlan(realtime_context, /*predicate=*/nullptr));
-    ASSERT_OK_AND_ASSIGN(CollectedReadResult result,
-                         ReadPlan(plan, realtime_context, {"id", "renamed_payload", "pt", "added"},
-                                  /*predicate=*/nullptr, /*enable_predicate_filter=*/false));
-    ASSERT_EQ(1, result.data->num_chunks());
-    std::shared_ptr<arrow::StructArray> row =
-        std::dynamic_pointer_cast<arrow::StructArray>(result.data->chunk(0));
-    ASSERT_NE(nullptr, row);
-    ASSERT_EQ(1, row->length());
-    std::shared_ptr<arrow::StringArray> renamed_values =
-        std::dynamic_pointer_cast<arrow::StringArray>(row->field(2));
-    ASSERT_NE(nullptr, renamed_values);
-    ASSERT_EQ("old", renamed_values->GetString(0));
-    ASSERT_TRUE(row->field(4)->IsNull(0));
-    result.reader->Close();
-    ASSERT_OK(writer->Close());
-}
-
 TEST_F(RealtimeWriteInteTest, TestPkCompositeMerge) {
     CreatePkTable(/*partition_keys=*/{}, /*primary_keys=*/{"id", "payload"});
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,

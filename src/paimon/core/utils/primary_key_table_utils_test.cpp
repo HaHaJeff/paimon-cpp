@@ -19,6 +19,7 @@
 #include "paimon/core/utils/primary_key_table_utils.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +34,7 @@
 #include "paimon/core/core_options.h"
 #include "paimon/core/key_value.h"
 #include "paimon/core/mergetree/compact/merge_function.h"
+#include "paimon/core/schema/table_schema.h"
 #include "paimon/defs.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/status.h"
@@ -41,6 +43,62 @@
 #include "paimon/testing/utils/testharness.h"
 
 namespace paimon::test {
+namespace {
+
+std::shared_ptr<TableSchema> PkSchema(
+    const std::shared_ptr<arrow::DataType>& key_type = arrow::int64(),
+    const std::map<std::string, std::string>& options = {}) {
+    return TableSchema::Create(
+               /*schema_id=*/0,
+               arrow::schema({arrow::field("id", key_type), arrow::field("value", arrow::utf8())}),
+               /*partition_keys=*/{}, /*primary_keys=*/{"id"}, options)
+        .value();
+}
+
+}  // namespace
+
+TEST(PrimaryKeyTableUtilsTest, TestSupportedRealtimeOptions) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
+    ASSERT_OK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *PkSchema()));
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestUnsupportedRealtimeOptions) {
+    const std::string sequence_group =
+        std::string(Options::FIELDS_PREFIX) + ".value." + Options::SEQUENCE_GROUP;
+    const std::vector<std::map<std::string, std::string>> unsupported_options = {
+        {{Options::BUCKET, "0"}},
+        {{Options::BUCKET, "1"}, {Options::MERGE_ENGINE, "partial-update"}},
+        {{Options::BUCKET, "1"}, {Options::DATA_EVOLUTION_ENABLED, "true"}},
+        {{Options::BUCKET, "1"}, {sequence_group, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
+        {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
+        {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
+        {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
+    };
+    for (const std::map<std::string, std::string>& option_map : unsupported_options) {
+        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+        ASSERT_NOK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *PkSchema()));
+    }
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestRealtimeRejectsFloatingPrimaryKeys) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({{Options::BUCKET, "1"}}));
+    ASSERT_NOK_WITH_MSG(
+        PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *PkSchema(arrow::float32())),
+        "FLOAT or DOUBLE primary keys");
+    ASSERT_NOK_WITH_MSG(
+        PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *PkSchema(arrow::float64())),
+        "FLOAT or DOUBLE primary keys");
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestRealtimeRejectsEnabledGlobalIndex) {
+    const std::map<std::string, std::string> option_map = {{Options::BUCKET, "1"},
+                                                           {Options::PK_BTREE_INDEX_COLUMNS, "id"}};
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+    ASSERT_NOK_WITH_MSG(PrimaryKeyTableUtils::ValidateRealtimeOptions(
+                            options, *PkSchema(arrow::int64(), option_map)),
+                        "does not support global indexes");
+}
 
 TEST(PrimaryKeyTableUtilsTest, TestCreateSequenceFieldsComparator) {
     {

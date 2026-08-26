@@ -20,14 +20,12 @@
 
 #include <mutex>
 #include <optional>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
-#include "fmt/format.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
@@ -43,139 +41,6 @@
 namespace paimon {
 
 namespace {
-
-struct AlignedArray {
-    std::shared_ptr<arrow::Array> array;
-    bool uses_arrow_pool;
-};
-
-Result<AlignedArray> AlignArrayByPaimonIds(const std::shared_ptr<arrow::Array>& array,
-                                           const std::shared_ptr<arrow::DataType>& read_type,
-                                           arrow::MemoryPool* pool);
-
-bool TypesExactlyEqual(const std::shared_ptr<arrow::DataType>& data_type,
-                       const std::shared_ptr<arrow::DataType>& read_type) {
-    if (!data_type->Equals(read_type) || data_type->num_fields() != read_type->num_fields()) {
-        return false;
-    }
-    for (int32_t i = 0; i < data_type->num_fields(); ++i) {
-        if (!data_type->field(i)->Equals(read_type->field(i), /*check_metadata=*/true) ||
-            !TypesExactlyEqual(data_type->field(i)->type(), read_type->field(i)->type())) {
-            return false;
-        }
-    }
-    return true;
-}
-
-Result<AlignedArray> AlignStructArrayByPaimonIds(
-    const std::shared_ptr<arrow::StructArray>& array,
-    const std::shared_ptr<arrow::StructType>& read_type, arrow::MemoryPool* pool) {
-    const std::shared_ptr<arrow::StructType> data_type =
-        checked_pointer_cast<arrow::StructType>(array->type());
-    std::unordered_map<int32_t, int32_t> data_field_indexes;
-    data_field_indexes.reserve(data_type->num_fields());
-    for (int32_t i = 0; i < data_type->num_fields(); ++i) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
-                               NestedProjectionUtils::GetPaimonFieldId(data_type->field(i)));
-        if (!data_field_indexes.emplace(field_id, i).second) {
-            return Status::Invalid(fmt::format("duplicate field id {} in stored schema", field_id));
-        }
-    }
-
-    std::unordered_map<int32_t, bool> requested_field_ids;
-    requested_field_ids.reserve(read_type->num_fields());
-    std::vector<std::shared_ptr<arrow::ArrayData>> children;
-    children.reserve(read_type->num_fields());
-    bool uses_arrow_pool = false;
-    for (const std::shared_ptr<arrow::Field>& read_field : read_type->fields()) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t field_id,
-                               NestedProjectionUtils::GetPaimonFieldId(read_field));
-        if (!requested_field_ids.emplace(field_id, true).second) {
-            return Status::Invalid(
-                fmt::format("duplicate field id {} in requested schema", field_id));
-        }
-        const auto data_iter = data_field_indexes.find(field_id);
-        if (data_iter == data_field_indexes.end()) {
-            if (!read_field->nullable()) {
-                return Status::Invalid(fmt::format(
-                    "requested non-nullable field '{}' with id {} is absent from stored schema",
-                    read_field->name(), field_id));
-            }
-            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-                std::shared_ptr<arrow::Array> null_child,
-                arrow::MakeArrayOfNull(read_field->type(), array->offset() + array->length(),
-                                       pool));
-            children.push_back(null_child->data());
-            uses_arrow_pool = true;
-            continue;
-        }
-        std::shared_ptr<arrow::Array> child =
-            arrow::MakeArray(array->data()->child_data[data_iter->second]);
-        PAIMON_ASSIGN_OR_RAISE(AlignedArray aligned_child,
-                               AlignArrayByPaimonIds(child, read_field->type(), pool));
-        children.push_back(aligned_child.array->data());
-        uses_arrow_pool = uses_arrow_pool || aligned_child.uses_arrow_pool;
-    }
-
-    std::shared_ptr<arrow::ArrayData> aligned = array->data()->Copy();
-    aligned->type = read_type;
-    aligned->child_data = std::move(children);
-    return AlignedArray{arrow::MakeArray(std::move(aligned)), uses_arrow_pool};
-}
-
-Result<AlignedArray> AlignArrayByPaimonIds(const std::shared_ptr<arrow::Array>& array,
-                                           const std::shared_ptr<arrow::DataType>& read_type,
-                                           arrow::MemoryPool* pool) {
-    if (TypesExactlyEqual(array->type(), read_type)) {
-        return AlignedArray{array, false};
-    }
-    if (array->type_id() != read_type->id()) {
-        return Status::Invalid(fmt::format("stored value type {} does not match requested type {}",
-                                           array->type()->ToString(), read_type->ToString()));
-    }
-    switch (read_type->id()) {
-        case arrow::Type::STRUCT:
-            return AlignStructArrayByPaimonIds(checked_pointer_cast<arrow::StructArray>(array),
-                                               checked_pointer_cast<arrow::StructType>(read_type),
-                                               pool);
-        case arrow::Type::LIST: {
-            std::shared_ptr<arrow::Array> values =
-                checked_pointer_cast<arrow::ListArray>(array)->values();
-            PAIMON_ASSIGN_OR_RAISE(
-                AlignedArray aligned_values,
-                AlignArrayByPaimonIds(values, read_type->field(0)->type(), pool));
-            std::shared_ptr<arrow::ArrayData> aligned = array->data()->Copy();
-            aligned->type = read_type;
-            aligned->child_data = {aligned_values.array->data()};
-            return AlignedArray{arrow::MakeArray(std::move(aligned)),
-                                aligned_values.uses_arrow_pool};
-        }
-        case arrow::Type::MAP: {
-            const std::shared_ptr<arrow::MapArray> map =
-                checked_pointer_cast<arrow::MapArray>(array);
-            const std::shared_ptr<arrow::MapType> map_type =
-                checked_pointer_cast<arrow::MapType>(read_type);
-            std::shared_ptr<arrow::Array> keys = map->keys();
-            PAIMON_ASSIGN_OR_RAISE(AlignedArray aligned_keys,
-                                   AlignArrayByPaimonIds(keys, map_type->key_type(), pool));
-            std::shared_ptr<arrow::Array> items = map->items();
-            PAIMON_ASSIGN_OR_RAISE(AlignedArray aligned_items,
-                                   AlignArrayByPaimonIds(items, map_type->item_type(), pool));
-            std::shared_ptr<arrow::ArrayData> entries = array->data()->child_data[0]->Copy();
-            entries->type = arrow::struct_({map_type->key_field(), map_type->item_field()});
-            entries->child_data = {aligned_keys.array->data(), aligned_items.array->data()};
-            std::shared_ptr<arrow::ArrayData> aligned = array->data()->Copy();
-            aligned->type = read_type;
-            aligned->child_data = {std::move(entries)};
-            return AlignedArray{arrow::MakeArray(std::move(aligned)),
-                                aligned_keys.uses_arrow_pool || aligned_items.uses_arrow_pool};
-        }
-        default:
-            return Status::Invalid(
-                fmt::format("stored leaf type {} does not match requested type {}",
-                            array->type()->ToString(), read_type->ToString()));
-    }
-}
 
 struct StoredBatch {
     std::shared_ptr<arrow::StructArray> data;
@@ -360,10 +225,14 @@ class PrimaryKeyRealtimeStore::Impl {
         for (const std::shared_ptr<Segment>& segment : typed->Segments()) {
             for (const StoredBatch& batch : segment->Batches()) {
                 PAIMON_ASSIGN_OR_RAISE(
-                    AlignedArray projected,
-                    AlignArrayByPaimonIds(batch.data, arrow::struct_(read_schema->fields()),
-                                          arrow_pool_.get()));
-                StoredBatch query_batch{checked_pointer_cast<arrow::StructArray>(projected.array),
+                    std::shared_ptr<arrow::Array> projected,
+                    NestedProjectionUtils::AlignArrayToReadType(
+                        batch.data, arrow::struct_(read_schema->fields()), arrow_pool_.get()));
+                if (!projected || projected->type_id() != arrow::Type::STRUCT) {
+                    return Status::Invalid(
+                        "PK memory query projection did not produce a StructArray");
+                }
+                StoredBatch query_batch{checked_pointer_cast<arrow::StructArray>(projected),
                                         batch.offset_range, /*memory_usage=*/0};
                 readers.push_back(std::make_unique<StoredBatchReader>(query_batch, arrow_pool_));
             }

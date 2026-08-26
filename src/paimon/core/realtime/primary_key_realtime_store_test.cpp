@@ -21,7 +21,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -84,16 +83,6 @@ std::unique_ptr<RecordBatch> MakeBatch(const std::string& json) {
     return RecordBatchBuilder(c_array.get()).Finish().value();
 }
 
-std::unique_ptr<RecordBatch> MakeBatch(const std::shared_ptr<arrow::Schema>& schema,
-                                       const std::string& json) {
-    std::shared_ptr<arrow::Array> array =
-        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema->fields()), json)
-            .ValueOrDie();
-    auto c_array = std::make_unique<ArrowArray>();
-    EXPECT_TRUE(arrow::ExportArray(*array, c_array.get()).ok());
-    return RecordBatchBuilder(c_array.get()).Finish().value();
-}
-
 std::unique_ptr<RecordBatch> MakeSlicedBatch(const std::shared_ptr<arrow::Schema>& schema,
                                              const std::string& json, int64_t offset,
                                              int64_t length) {
@@ -139,18 +128,10 @@ Result<std::string> ReadJson(const std::vector<std::unique_ptr<BatchReader>>& re
 class TestingMemoryPool final : public MemoryPool {
  public:
     void* Malloc(uint64_t size, uint64_t alignment) override {
-        ++allocation_count;
-        if (reject_allocations) {
-            throw std::bad_alloc();
-        }
         return delegate_->Malloc(size, alignment);
     }
 
     void* Realloc(void* pointer, size_t old_size, size_t new_size, uint64_t alignment) override {
-        ++allocation_count;
-        if (reject_allocations) {
-            throw std::bad_alloc();
-        }
         return delegate_->Realloc(pointer, old_size, new_size, alignment);
     }
 
@@ -169,9 +150,6 @@ class TestingMemoryPool final : public MemoryPool {
     uint64_t MaxMemoryUsage() const override {
         return delegate_->MaxMemoryUsage();
     }
-
-    bool reject_allocations = false;
-    int64_t allocation_count = 0;
 
  private:
     std::unique_ptr<MemoryPool> delegate_ = GetMemoryPool();
@@ -368,111 +346,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderPerStoredBatch) {
     ASSERT_NE(std::string::npos, actual.find("\"two\""));
 }
 
-TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderProjectsTopLevelFieldsById) {
-    const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(stored_schema, GetDefaultPool()));
-    ASSERT_OK(store->Write(RealtimeWriteBatch{
-        MakeSlicedBatch(stored_schema,
-                        R"([[0, 1, 0, 6, "six"], [0, 2, 1, 7, "seven"], [0, 3, 2, 8, "eight"]])", 1,
-                        1),
-        OffsetRange(0, 1)}));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-
-    arrow::FieldVector requested_fields(stored_schema->fields().begin(),
-                                        stored_schema->fields().begin() + 3);
-    requested_fields.push_back(FieldWithId("renamed_value", arrow::utf8(), 1));
-    requested_fields.push_back(FieldWithId("added", arrow::int32(), 2));
-    std::shared_ptr<arrow::Schema> requested_schema = arrow::schema(std::move(requested_fields));
-    auto c_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(arrow::ExportSchema(*requested_schema, c_schema.get()).ok());
-    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
-                                 /*enable_predicate_pushdown=*/false};
-    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
-                         store->CreateQueryReaders(view, /*offset_begin=*/0, context));
-    ASSERT_EQ(1, readers.size());
-    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
-    arrow::Result<std::shared_ptr<arrow::Array>> import_result =
-        arrow::ImportArray(batch.first.get(), batch.second.get());
-    ASSERT_TRUE(import_result.ok()) << import_result.status().ToString();
-    std::shared_ptr<arrow::Array> array = std::move(import_result).ValueOrDie();
-    ASSERT_TRUE(array->type()->Equals(arrow::struct_(requested_schema->fields())));
-    std::shared_ptr<arrow::StructArray> projected = checked_pointer_cast<arrow::StructArray>(array);
-    ASSERT_EQ(5, projected->num_fields());
-    ASSERT_EQ("seven", checked_pointer_cast<arrow::StringArray>(projected->field(3))->GetString(0));
-    ASSERT_TRUE(projected->field(4)->IsNull(0));
-}
-
-TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderRejectsMissingNonNullableTopLevelField) {
-    const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(stored_schema, GetDefaultPool()));
-    ASSERT_OK(store->Write(
-        RealtimeWriteBatch{MakeBatch(R"([[0, 1, 0, 7, "seven"]])"), OffsetRange(0, 1)}));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-
-    arrow::FieldVector requested_fields = stored_schema->fields();
-    requested_fields.push_back(
-        FieldWithId("required_added", arrow::int32(), 2, /*nullable=*/false));
-    auto c_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(
-        arrow::ExportSchema(*arrow::schema(std::move(requested_fields)), c_schema.get()).ok());
-    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
-                                 /*enable_predicate_pushdown=*/false};
-    ASSERT_NOK_WITH_MSG(store->CreateQueryReaders(view, /*offset_begin=*/0, context),
-                        "requested non-nullable field 'required_added' with id 2 is absent");
-}
-
-TEST(PrimaryKeyRealtimeStoreTest, TestQuerySchemaAlignmentUsesCallerPool) {
-    const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
-    std::shared_ptr<TestingMemoryPool> pool = std::make_shared<TestingMemoryPool>();
-    auto write_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(arrow::ExportSchema(*stored_schema, write_schema.get()).ok());
-    RealtimeStoreCreateRequest request{std::move(write_schema),
-                                       /*options=*/{}, pool, RealtimeStoreMode::PRIMARY_KEY};
-    ArrowRealtimeStoreFactory factory;
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeStore> store, factory.Create(std::move(request)));
-    ASSERT_OK(store->Write(
-        RealtimeWriteBatch{MakeBatch(R"([[0, 1, 0, 7, "seven"]])"), OffsetRange(0, 1)}));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-
-    arrow::FieldVector requested_fields = stored_schema->fields();
-    requested_fields.push_back(FieldWithId("added", arrow::int32(), 2));
-    std::shared_ptr<arrow::Schema> requested_schema = arrow::schema(std::move(requested_fields));
-    auto c_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(arrow::ExportSchema(*requested_schema, c_schema.get()).ok());
-    RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
-                                 /*enable_predicate_pushdown=*/false};
-
-    std::vector<arrow::FieldVector> zero_copy_schemas;
-    zero_copy_schemas.push_back(stored_schema->fields());
-    arrow::FieldVector reordered_fields(stored_schema->fields().begin(),
-                                        stored_schema->fields().begin() + 3);
-    reordered_fields.push_back(FieldWithId("renamed_value", arrow::utf8(), 1));
-    reordered_fields.push_back(FieldWithId("renamed_id", arrow::int64(), 0));
-    zero_copy_schemas.push_back(std::move(reordered_fields));
-    pool->reject_allocations = true;
-    for (const arrow::FieldVector& fields : zero_copy_schemas) {
-        auto zero_copy_schema = std::make_unique<ArrowSchema>();
-        ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(fields), zero_copy_schema.get()).ok());
-        RealtimeQueryContext zero_copy_context{zero_copy_schema.get(), /*predicate=*/nullptr,
-                                               /*enable_predicate_pushdown=*/false};
-        const int64_t allocations_before_query = pool->allocation_count;
-        ASSERT_OK_AND_ASSIGN(
-            std::vector<std::unique_ptr<BatchReader>> readers,
-            store->CreateQueryReaders(view, /*offset_begin=*/0, zero_copy_context));
-        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, readers[0]->NextBatch());
-        ASSERT_TRUE(arrow::ImportArray(batch.first.get(), batch.second.get()).ok());
-        ASSERT_EQ(allocations_before_query, pool->allocation_count);
-    }
-
-    const int64_t allocations_before_query = pool->allocation_count;
-    ASSERT_NOK_WITH_MSG(store->CreateQueryReaders(view, /*offset_begin=*/0, context),
-                        "Out of memory");
-    ASSERT_GT(pool->allocation_count, allocations_before_query);
-}
-
-TEST(PrimaryKeyRealtimeStoreTest, TestQueryAlignmentPoolOutlivesStoreReaderAndExport) {
+TEST(PrimaryKeyRealtimeStoreTest, TestQueryPoolOutlivesStoreReaderAndExport) {
     const std::shared_ptr<arrow::Schema> stored_schema = PreparedSchema();
     std::shared_ptr<TestingMemoryPool> pool = std::make_shared<TestingMemoryPool>();
     std::weak_ptr<TestingMemoryPool> pool_lifetime = pool;
@@ -487,18 +361,13 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryAlignmentPoolOutlivesStoreReaderAndEx
         RealtimeWriteBatch{MakeBatch(R"([[0, 1, 0, 7, "seven"]])"), OffsetRange(0, 1)}));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
 
-    arrow::FieldVector requested_fields = stored_schema->fields();
-    requested_fields.push_back(FieldWithId("added", arrow::int32(), 2));
     auto c_schema = std::make_unique<ArrowSchema>();
-    ASSERT_TRUE(
-        arrow::ExportSchema(*arrow::schema(std::move(requested_fields)), c_schema.get()).ok());
+    ASSERT_TRUE(arrow::ExportSchema(*stored_schema, c_schema.get()).ok());
     RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
                                  /*enable_predicate_pushdown=*/false};
     ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
                          store->CreateQueryReaders(view, /*offset_begin=*/0, context));
     ASSERT_EQ(1, readers.size());
-    ASSERT_GT(pool->allocation_count, 0);
-
     view.reset();
     store.reset();
     pool.reset();
@@ -516,7 +385,7 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryAlignmentPoolOutlivesStoreReaderAndEx
     ASSERT_TRUE(pool_lifetime.expired());
 }
 
-TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
+TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderProjectsNestedFields) {
     const std::shared_ptr<arrow::Field> stored_profile_a =
         FieldWithId("profile_a", arrow::int32(), 30);
     const std::shared_ptr<arrow::Field> stored_a = FieldWithId("a", arrow::int32(), 10);
@@ -543,30 +412,13 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
         OffsetRange(0, 1)}));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
 
-    const std::shared_ptr<arrow::Field> requested_profile_missing =
-        FieldWithId("added_profile", arrow::int32(), 31);
-    const std::shared_ptr<arrow::Field> requested_profile_a =
-        FieldWithId("renamed_profile_a", arrow::int32(), 30);
-    const std::shared_ptr<arrow::Field> requested_b = FieldWithId("renamed_b", arrow::int32(), 11);
-    const std::shared_ptr<arrow::Field> requested_a = FieldWithId("renamed_a", arrow::int32(), 10);
-    const std::shared_ptr<arrow::Field> requested_item_missing =
-        FieldWithId("added_item", arrow::int32(), 12);
-    const std::shared_ptr<arrow::Field> requested_y = FieldWithId("renamed_y", arrow::int32(), 21);
-    const std::shared_ptr<arrow::Field> requested_x = FieldWithId("renamed_x", arrow::int32(), 20);
-    const std::shared_ptr<arrow::Field> requested_attr_missing =
-        FieldWithId("added_attr", arrow::int32(), 22);
     arrow::FieldVector requested_fields(stored_schema->fields().begin(),
                                         stored_schema->fields().begin() + 3);
-    requested_fields.push_back(FieldWithId(
-        "renamed_profile", arrow::struct_({requested_profile_missing, requested_profile_a}), 1));
-    requested_fields.push_back(FieldWithId(
-        "renamed_items",
-        arrow::list(arrow::struct_({requested_b, requested_item_missing, requested_a})), 2));
+    requested_fields.push_back(FieldWithId("profile", arrow::struct_({stored_profile_a}), 1));
     requested_fields.push_back(
-        FieldWithId("renamed_attrs",
-                    arrow::map(arrow::utf8(),
-                               arrow::struct_({requested_y, requested_attr_missing, requested_x})),
-                    3));
+        FieldWithId("items", arrow::list(arrow::struct_({stored_b, stored_a})), 2));
+    requested_fields.push_back(
+        FieldWithId("attrs", arrow::map(arrow::utf8(), arrow::struct_({stored_y, stored_x})), 3));
     std::shared_ptr<arrow::Schema> requested_schema = arrow::schema(std::move(requested_fields));
     auto c_schema = std::make_unique<ArrowSchema>();
     ASSERT_TRUE(arrow::ExportSchema(*requested_schema, c_schema.get()).ok());
@@ -583,15 +435,13 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
     std::shared_ptr<arrow::StructArray> projected = checked_pointer_cast<arrow::StructArray>(array);
     const std::shared_ptr<arrow::StructArray> profile =
         checked_pointer_cast<arrow::StructArray>(projected->field(3));
-    ASSERT_TRUE(profile->field(0)->IsNull(0));
-    ASSERT_EQ(50, checked_pointer_cast<arrow::Int32Array>(profile->field(1))->Value(0));
+    ASSERT_EQ(50, checked_pointer_cast<arrow::Int32Array>(profile->field(0))->Value(0));
     const std::shared_ptr<arrow::ListArray> items =
         checked_pointer_cast<arrow::ListArray>(projected->field(4));
     const std::shared_ptr<arrow::StructArray> item_values =
         checked_pointer_cast<arrow::StructArray>(items->value_slice(0));
     ASSERT_EQ(200, checked_pointer_cast<arrow::Int32Array>(item_values->field(0))->Value(0));
-    ASSERT_TRUE(item_values->field(1)->IsNull(0));
-    ASSERT_EQ(100, checked_pointer_cast<arrow::Int32Array>(item_values->field(2))->Value(0));
+    ASSERT_EQ(100, checked_pointer_cast<arrow::Int32Array>(item_values->field(1))->Value(0));
     ASSERT_TRUE(item_values->IsNull(1));
 
     const std::shared_ptr<arrow::MapArray> attrs =
@@ -604,55 +454,8 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderAlignsNestedFieldsById) {
     const std::shared_ptr<arrow::StructArray> attr_values =
         checked_pointer_cast<arrow::StructArray>(attrs->items()->Slice(attr_offset, attr_length));
     ASSERT_EQ(8, checked_pointer_cast<arrow::Int32Array>(attr_values->field(0))->Value(0));
-    ASSERT_TRUE(attr_values->field(1)->IsNull(0));
-    ASSERT_EQ(7, checked_pointer_cast<arrow::Int32Array>(attr_values->field(2))->Value(0));
+    ASSERT_EQ(7, checked_pointer_cast<arrow::Int32Array>(attr_values->field(1))->Value(0));
     ASSERT_TRUE(attr_values->IsNull(1));
-}
-
-TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderRejectsMissingNonNullableNestedFields) {
-    const std::shared_ptr<arrow::Field> stored_profile_a =
-        FieldWithId("profile_a", arrow::int32(), 30);
-    const std::shared_ptr<arrow::Field> stored_item_a = FieldWithId("item_a", arrow::int32(), 10);
-    const std::shared_ptr<arrow::Field> stored_attr_a = FieldWithId("attr_a", arrow::int32(), 20);
-    arrow::FieldVector stored_fields = {
-        DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
-            ->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset()),
-        FieldWithId("profile", arrow::struct_({stored_profile_a}), 1),
-        FieldWithId("items", arrow::list(arrow::struct_({stored_item_a})), 2),
-        FieldWithId("attrs", arrow::map(arrow::utf8(), arrow::struct_({stored_attr_a})), 3)};
-    const std::shared_ptr<arrow::Schema> stored_schema = arrow::schema(std::move(stored_fields));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(stored_schema, GetDefaultPool()));
-    ASSERT_OK(store->Write(
-        RealtimeWriteBatch{MakeBatch(stored_schema, R"([[0, 1, 0, [5], [[10]], [["key", [20]]]]])"),
-                           OffsetRange(0, 1)}));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-
-    const std::shared_ptr<arrow::Field> required =
-        FieldWithId("required_nested", arrow::int32(), 99, /*nullable=*/false);
-    std::vector<arrow::FieldVector> requested_schemas;
-    arrow::FieldVector struct_fields = stored_schema->fields();
-    struct_fields[3] = FieldWithId("profile", arrow::struct_({stored_profile_a, required}), 1);
-    requested_schemas.push_back(std::move(struct_fields));
-    arrow::FieldVector list_fields = stored_schema->fields();
-    list_fields[4] =
-        FieldWithId("items", arrow::list(arrow::struct_({stored_item_a, required})), 2);
-    requested_schemas.push_back(std::move(list_fields));
-    arrow::FieldVector map_fields = stored_schema->fields();
-    map_fields[5] = FieldWithId(
-        "attrs", arrow::map(arrow::utf8(), arrow::struct_({stored_attr_a, required})), 3);
-    requested_schemas.push_back(std::move(map_fields));
-
-    for (const arrow::FieldVector& fields : requested_schemas) {
-        auto c_schema = std::make_unique<ArrowSchema>();
-        ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(fields), c_schema.get()).ok());
-        RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
-                                     /*enable_predicate_pushdown=*/false};
-        ASSERT_NOK_WITH_MSG(store->CreateQueryReaders(view, /*offset_begin=*/0, context),
-                            "requested non-nullable field 'required_nested' with id 99 is absent");
-    }
 }
 
 }  // namespace
