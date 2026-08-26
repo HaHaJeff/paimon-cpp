@@ -138,11 +138,9 @@ class StoredBatchReader final : public BatchReader {
 
 class PrimaryKeyRealtimeStore::Impl {
  public:
-    Impl(std::shared_ptr<arrow::Schema> prepared_schema, std::shared_ptr<MemoryPool> memory_pool,
+    Impl(std::shared_ptr<arrow::Schema> prepared_schema,
          std::shared_ptr<arrow::MemoryPool> arrow_pool)
-        : prepared_schema_(std::move(prepared_schema)),
-          memory_pool_(std::move(memory_pool)),
-          arrow_pool_(std::move(arrow_pool)) {}
+        : prepared_schema_(std::move(prepared_schema)), arrow_pool_(std::move(arrow_pool)) {}
 
     Status Write(RealtimeWriteBatch&& write_batch) {
         if (!write_batch.batch || !write_batch.batch->GetData()) {
@@ -263,7 +261,6 @@ class PrimaryKeyRealtimeStore::Impl {
 
  private:
     std::shared_ptr<arrow::Schema> prepared_schema_;
-    std::shared_ptr<MemoryPool> memory_pool_;
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     mutable std::mutex mutex_;
     std::vector<StoredBatch> building_;
@@ -284,7 +281,7 @@ Result<std::shared_ptr<PrimaryKeyRealtimeStore>> PrimaryKeyRealtimeStore::Create
     }
     std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(memory_pool);
     return std::shared_ptr<PrimaryKeyRealtimeStore>(new PrimaryKeyRealtimeStore(
-        std::make_unique<Impl>(prepared_schema, memory_pool, std::move(arrow_pool))));
+        std::make_unique<Impl>(prepared_schema, std::move(arrow_pool))));
 }
 Status PrimaryKeyRealtimeStore::Write(RealtimeWriteBatch&& batch) {
     return impl_->Write(std::move(batch));

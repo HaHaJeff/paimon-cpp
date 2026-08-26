@@ -100,11 +100,7 @@ Result<std::shared_ptr<arrow::StructArray>> PrepareBatch(
         arrow::Datum sorted,
         arrow::compute::Take(arrow::Datum(prepared), indices,
                              arrow::compute::TakeOptions::NoBoundsCheck(), &context));
-    std::shared_ptr<arrow::Array> sorted_array = sorted.make_array();
-    if (!sorted_array || sorted_array->type_id() != arrow::Type::STRUCT) {
-        return Status::Invalid("PK real-time sorted batch is not a StructArray");
-    }
-    return checked_pointer_cast<arrow::StructArray>(std::move(sorted_array));
+    return checked_pointer_cast<arrow::StructArray>(sorted.make_array());
 }
 
 }  // namespace
@@ -112,19 +108,13 @@ Result<std::shared_ptr<arrow::StructArray>> PrepareBatch(
 Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Create(
     const std::map<std::string, std::string>& partition, int32_t bucket,
     const std::shared_ptr<arrow::Schema>& write_schema,
+    const std::shared_ptr<arrow::Schema>& prepared_schema,
     const std::vector<std::string>& trimmed_primary_keys,
     const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<RealtimeContextImpl>& realtime_context,
     const RealtimeStoreState& store_state, int64_t restored_max_sequence_number,
     const std::shared_ptr<MergeTreeWriter>& merge_tree_writer,
     const std::shared_ptr<MemoryPool>& memory_pool) {
-    if (!store_state.store || !merge_tree_writer || !write_schema || !key_comparator ||
-        !realtime_context || !memory_pool) {
-        return Status::Invalid("PK real-time writer received a null dependency");
-    }
-    if (trimmed_primary_keys.empty()) {
-        return Status::Invalid("PK real-time writer requires at least one primary key");
-    }
     if (restored_max_sequence_number < -1 ||
         restored_max_sequence_number == std::numeric_limits<int64_t>::max()) {
         return Status::Invalid("PK restored sequence number is invalid");
@@ -138,8 +128,6 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
         }
         key_fields.push_back(std::move(field));
     }
-    std::shared_ptr<arrow::Schema> prepared_schema =
-        SpecialFields::PreparedKeyValueSchema(write_schema->fields());
     const RealtimePartitionBucket partition_bucket(partition, bucket);
     PAIMON_ASSIGN_OR_RAISE(int64_t initial_max_sequence_number,
                            realtime_context->AdvanceMaterializedMaxSequenceNumber(

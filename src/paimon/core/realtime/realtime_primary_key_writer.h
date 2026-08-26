@@ -48,6 +48,7 @@ class RealtimePrimaryKeyWriter final : public BatchWriter {
     static Result<std::shared_ptr<RealtimePrimaryKeyWriter>> Create(
         const std::map<std::string, std::string>& partition, int32_t bucket,
         const std::shared_ptr<arrow::Schema>& write_schema,
+        const std::shared_ptr<arrow::Schema>& prepared_schema,
         const std::vector<std::string>& trimmed_primary_keys,
         const std::shared_ptr<FieldsComparator>& key_comparator,
         const std::shared_ptr<RealtimeContextImpl>& realtime_context,

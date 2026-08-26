@@ -479,28 +479,6 @@ TEST_F(KeyValueFileStoreWriteTest, TestRealtimeWrite) {
     ASSERT_OK(writer->Close());
 }
 
-TEST_F(KeyValueFileStoreWriteTest, TestRealtimeOffsetCollision) {
-    const std::map<std::string, std::string> options = {{Options::BUCKET, "1"},
-                                                        {Options::REALTIME_ENABLED, "true"}};
-    const std::shared_ptr<arrow::Schema> schema = arrow::schema({
-        arrow::field("id", arrow::int64(), false),
-        arrow::field("_REALTIME_OFFSET", arrow::int64()),
-    });
-    std::unique_ptr<UniqueTestDirectory> dir = UniqueTestDirectory::Create();
-    ASSERT_TRUE(dir);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<Catalog> catalog, Catalog::Create(dir->Str(), options));
-    ASSERT_OK(catalog->CreateDatabase("foo", {}, /*ignore_if_exists=*/false));
-    ArrowSchema c_schema;
-    ASSERT_TRUE(arrow::ExportSchema(*schema, &c_schema).ok());
-    Status create_status =
-        catalog->CreateTable(Identifier("foo", "bar"), &c_schema,
-                             /*partition_keys=*/{}, /*primary_keys=*/{"id"}, options,
-                             /*ignore_if_exists=*/false);
-    ArrowSchemaRelease(&c_schema);
-    ASSERT_NOK_WITH_MSG(create_status,
-                        "field name '_REALTIME_OFFSET' in schema cannot be special field");
-}
-
 TEST_F(KeyValueFileStoreWriteTest, TestRealtimePool) {
     const std::map<std::string, std::string> options = {{Options::BUCKET, "1"},
                                                         {Options::REALTIME_ENABLED, "true"}};

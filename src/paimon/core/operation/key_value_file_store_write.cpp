@@ -124,6 +124,7 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     std::shared_ptr<CompactManager> compact_manager;
     std::shared_ptr<RealtimeContextImpl> realtime_context_impl;
     std::optional<RealtimeStoreState> realtime_store_state;
+    std::shared_ptr<arrow::Schema> prepared_schema;
     if (realtime_context_) {
         std::vector<std::pair<std::string, std::string>> partition_values;
         PAIMON_ASSIGN_OR_RAISE(partition_values,
@@ -131,12 +132,7 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         partition_map =
             std::map<std::string, std::string>(partition_values.begin(), partition_values.end());
         PAIMON_ASSIGN_OR_RAISE(realtime_context_impl, RealtimeContextImpl::Cast(realtime_context_));
-        if (schema_->GetFieldByName(SpecialFields::RealtimeOffset().Name())) {
-            return Status::Invalid("PK real-time write schema contains reserved transport field " +
-                                   SpecialFields::RealtimeOffset().Name());
-        }
-        std::shared_ptr<arrow::Schema> prepared_schema =
-            SpecialFields::PreparedKeyValueSchema(schema_->fields());
+        prepared_schema = SpecialFields::PreparedKeyValueSchema(schema_->fields());
         auto c_write_schema = std::make_unique<ArrowSchema>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(
             arrow::ExportSchema(*prepared_schema, c_write_schema.get()));
@@ -169,7 +165,7 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         return std::shared_ptr<BatchWriter>(std::move(writer));
     }
     return RealtimePrimaryKeyWriter::Create(
-        partition_map, bucket, schema_, trimmed_primary_keys, key_comparator_,
+        partition_map, bucket, schema_, prepared_schema, trimmed_primary_keys, key_comparator_,
         realtime_context_impl, realtime_store_state.value(), restore_max_seq_number, writer, pool_);
 }
 

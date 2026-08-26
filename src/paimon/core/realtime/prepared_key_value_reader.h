@@ -47,6 +47,13 @@ class PreparedKeyValueReaderFactory {
         const std::shared_ptr<arrow::Schema>& value_schema,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
+    static Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateForQuery(
+        std::vector<std::unique_ptr<BatchReader>>&& readers,
+        const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& visible_offsets,
+        const std::shared_ptr<arrow::Schema>& key_schema,
+        const std::shared_ptr<arrow::Schema>& value_schema,
+        const std::shared_ptr<MemoryPool>& memory_pool);
+
     static Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateForCommit(
         std::vector<std::unique_ptr<BatchReader>>&& readers,
         const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,

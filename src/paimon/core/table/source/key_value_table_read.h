@@ -22,6 +22,7 @@
 #include <memory>
 #include <vector>
 
+#include "arrow/type_fwd.h"
 #include "paimon/core/operation/internal_read_context.h"
 #include "paimon/core/operation/split_read.h"
 #include "paimon/core/utils/file_store_path_factory.h"
@@ -58,6 +59,7 @@ class KeyValueTableRead : public TableRead {
     KeyValueTableRead(std::vector<std::unique_ptr<SplitRead>>&& split_reads,
                       const std::shared_ptr<FileStorePathFactory>& path_factory,
                       const std::shared_ptr<InternalReadContext>& context,
+                      const std::shared_ptr<arrow::Schema>& prepared_query_schema,
                       const std::shared_ptr<MemoryPool>& memory_pool,
                       const std::shared_ptr<Executor>& executor);
 
@@ -67,6 +69,7 @@ class KeyValueTableRead : public TableRead {
     std::vector<std::unique_ptr<SplitRead>> split_reads_;
     std::shared_ptr<FileStorePathFactory> path_factory_;
     std::shared_ptr<InternalReadContext> context_;
+    std::shared_ptr<arrow::Schema> prepared_query_schema_;
     std::shared_ptr<Executor> executor_;
     bool force_keep_delete_ = false;
 };
