@@ -477,9 +477,6 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
         return Status::Invalid("prepared batch reader cannot be null");
     }
     ScopeGuard close_guard([&owned_reader]() -> void { owned_reader->Close(); });
-    if (visible_offsets.has_value() && visible_offsets->begin > visible_offsets->end) {
-        return Status::Invalid("prepared visible offset range begin exceeds end");
-    }
     std::unique_ptr<KeyValueRecordReader> result = std::make_unique<PreparedKeyValueReader>(
         std::move(owned_reader), plan, visible_offsets, memory_pool, offset_coverage);
     close_guard.Release();
