@@ -212,11 +212,10 @@ Result<std::unique_ptr<FileStoreWrite>> FileStoreWrite::Create(std::unique_ptr<W
             PAIMON_RETURN_NOT_OK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *schema));
             if (ignore_previous_files) {
                 return Status::NotImplemented(
-                    "PK realtime v1 requires restore from the latest snapshot");
+                    "PK realtime requires restore from the latest snapshot");
             }
             if (!ctx->GetWriteSchema().empty()) {
-                return Status::NotImplemented(
-                    "PK realtime v1 does not support a custom write schema");
+                return Status::NotImplemented("PK realtime does not support a custom write schema");
             }
             PAIMON_RETURN_NOT_OK(RestoreRealtimeCommittedProgress(ctx->GetRealtimeContext(),
                                                                   snapshot_manager, options));

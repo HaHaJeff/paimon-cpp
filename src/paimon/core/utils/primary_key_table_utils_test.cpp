@@ -113,13 +113,13 @@ TEST(PrimaryKeyTableUtilsTest, TestRealtimeRejectsDeleteAndSequenceOrderingOptio
 TEST(PrimaryKeyTableUtilsTest, TestRealtimeReportsSpecificLookupErrors) {
     const std::vector<std::pair<std::map<std::string, std::string>, std::string>> cases = {
         {{{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
-         "PK realtime v1 does not support lookup"},
+         "PK realtime does not support lookup"},
         {{{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
-         "PK realtime v1 does not support deletion vectors"},
+         "PK realtime does not support deletion vectors"},
         {{{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
-         "PK realtime v1 supports only the NONE changelog producer"},
+         "PK realtime supports only the NONE changelog producer"},
         {{{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "lookup"}},
-         "PK realtime v1 supports only the NONE changelog producer"},
+         "PK realtime supports only the NONE changelog producer"},
     };
     for (const auto& [option_map, expected_message] : cases) {
         ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));

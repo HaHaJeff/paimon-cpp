@@ -24,7 +24,6 @@
 #include "arrow/c/bridge.h"
 #include "paimon/common/data/binary_row.h"
 #include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/core/compact/noop_compact_manager.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/io/data_file_meta.h"
@@ -121,9 +120,6 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
                            file_store_path_factory_->CreateDataFilePathFactory(partition, bucket));
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::string> trimmed_primary_keys,
                            table_schema_->TrimmedPrimaryKeys());
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<Levels> levels,
-        Levels::Create(key_comparator_, restore_data_files, options_.GetNumLevels()));
     std::map<std::string, std::string> partition_map;
     std::shared_ptr<CompactManager> compact_manager;
     std::shared_ptr<RealtimeContextImpl> realtime_context_impl;
@@ -139,17 +135,11 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
             return Status::Invalid("PK real-time write schema contains reserved transport field " +
                                    SpecialFields::RealtimeOffset().Name());
         }
-        arrow::FieldVector prepared_fields = {
-            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
-                ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
-                ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
-        prepared_fields.insert(prepared_fields.end(), schema_->fields().begin(),
-                               schema_->fields().end());
+        std::shared_ptr<arrow::Schema> prepared_schema =
+            SpecialFields::PreparedKeyValueSchema(schema_->fields());
         auto c_write_schema = std::make_unique<ArrowSchema>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(
-            arrow::ExportSchema(*arrow::schema(std::move(prepared_fields)), c_write_schema.get()));
+            arrow::ExportSchema(*prepared_schema, c_write_schema.get()));
         PAIMON_ASSIGN_OR_RAISE(
             RealtimeStoreState store_state,
             realtime_context_impl->GetOrCreateRealtimeStore(
@@ -159,6 +149,9 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         realtime_store_state = std::move(store_state);
         compact_manager = std::make_shared<NoopCompactManager>();
     } else {
+        PAIMON_ASSIGN_OR_RAISE(
+            std::shared_ptr<Levels> levels,
+            Levels::Create(key_comparator_, restore_data_files, options_.GetNumLevels()));
         auto compact_strategy = compact_manager_factory_->CreateCompactStrategy();
         PAIMON_ASSIGN_OR_RAISE(compact_manager, compact_manager_factory_->CreateCompactManager(
                                                     partition, bucket, compact_strategy,

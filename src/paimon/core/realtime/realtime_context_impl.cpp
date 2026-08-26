@@ -37,6 +37,7 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
+#include "fmt/format.h"
 #include "paimon/arrow/abi.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/scope_guard.h"
@@ -119,10 +120,10 @@ Result<RealtimeStoreState> RealtimeContextImpl::GetOrCreateRealtimeStore(
     if (iter != stores_.end()) {
         if (iter->second.mode != request.mode ||
             !iter->second.write_schema->Equals(*requested_schema, /*check_metadata=*/true)) {
-            return Status::Invalid("real-time store schema or mode mismatch for partition " +
-                                   PartitionToString(partition_bucket.partition) + ", bucket " +
-                                   std::to_string(partition_bucket.bucket) +
-                                   "; recreate the RealtimeContext");
+            return Status::Invalid(fmt::format(
+                "real-time store schema or mode mismatch for partition {}, bucket {}; recreate "
+                "the RealtimeContext",
+                PartitionToString(partition_bucket.partition), partition_bucket.bucket));
         }
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeReadView> read_view,
                                iter->second.store->AcquireReadView());
@@ -165,9 +166,9 @@ Result<int64_t> RealtimeContextImpl::AdvanceMaterializedMaxSequenceNumber(
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = stores_.find(partition_bucket);
     if (iter == stores_.end()) {
-        return Status::KeyError("real-time store not found for partition " +
-                                PartitionToString(partition_bucket.partition) + ", bucket " +
-                                std::to_string(partition_bucket.bucket));
+        return Status::KeyError(fmt::format("real-time store not found for partition {}, bucket {}",
+                                            PartitionToString(partition_bucket.partition),
+                                            partition_bucket.bucket));
     }
     StoreEntry& entry = iter->second;
     if (max_sequence_number > entry.materialized_max_sequence_number) {

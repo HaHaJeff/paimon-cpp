@@ -101,46 +101,46 @@ Result<std::unique_ptr<FieldsComparator>> PrimaryKeyTableUtils::CreateSequenceFi
 Status PrimaryKeyTableUtils::ValidateRealtimeOptions(const CoreOptions& options,
                                                      const TableSchema& schema) {
     if (options.GetBucket() <= 0) {
-        return Status::NotImplemented("PK realtime v1 requires fixed buckets");
+        return Status::NotImplemented("PK realtime requires fixed buckets");
     }
     if (options.GetMergeEngine() != MergeEngine::DEDUPLICATE) {
-        return Status::NotImplemented("PK realtime v1 supports only the DEDUPLICATE merge engine");
+        return Status::NotImplemented("PK realtime supports only the DEDUPLICATE merge engine");
     }
     if (options.DataEvolutionEnabled()) {
-        return Status::NotImplemented("PK realtime v1 does not support data evolution");
+        return Status::NotImplemented("PK realtime does not support data evolution");
     }
     if (options.IgnoreDelete()) {
-        return Status::NotImplemented("PK realtime v1 requires default delete behavior");
+        return Status::NotImplemented("PK realtime requires default delete behavior");
     }
     if (!options.GetSequenceField().empty()) {
-        return Status::NotImplemented("PK realtime v1 does not support sequence.field");
+        return Status::NotImplemented("PK realtime does not support sequence.field");
     }
     if (!options.SequenceFieldSortOrderIsAscending()) {
         return Status::NotImplemented(
-            "PK realtime v1 supports only ascending sequence.field.sort-order");
+            "PK realtime supports only ascending sequence.field.sort-order");
     }
     if (options.GetChangelogProducer() != ChangelogProducer::NONE) {
-        return Status::NotImplemented("PK realtime v1 supports only the NONE changelog producer");
+        return Status::NotImplemented("PK realtime supports only the NONE changelog producer");
     }
     if (options.DeletionVectorsEnabled()) {
-        return Status::NotImplemented("PK realtime v1 does not support deletion vectors");
+        return Status::NotImplemented("PK realtime does not support deletion vectors");
     }
     if (options.NeedLookup()) {
-        return Status::NotImplemented("PK realtime v1 does not support lookup");
+        return Status::NotImplemented("PK realtime does not support lookup");
     }
     PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> primary_key_fields,
                            schema.TrimmedPrimaryKeyFields());
     for (const DataField& field : primary_key_fields) {
         if (field.Type()->id() == arrow::Type::FLOAT || field.Type()->id() == arrow::Type::DOUBLE) {
             return Status::NotImplemented(
-                "PK realtime v1 does not support FLOAT or DOUBLE primary keys");
+                "PK realtime does not support FLOAT or DOUBLE primary keys");
         }
     }
     if (options.GlobalIndexEnabled()) {
         PAIMON_ASSIGN_OR_RAISE(PrimaryKeyIndexDefinitions definitions,
                                PrimaryKeyIndexDefinitions::Create(schema));
         if (!definitions.Definitions().empty()) {
-            return Status::NotImplemented("PK realtime v1 does not support global indexes");
+            return Status::NotImplemented("PK realtime does not support global indexes");
         }
     }
     return Status::OK();

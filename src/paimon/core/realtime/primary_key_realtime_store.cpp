@@ -18,6 +18,7 @@
 
 #include "paimon/core/realtime/primary_key_realtime_store.h"
 
+#include <algorithm>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -204,7 +205,7 @@ class PrimaryKeyRealtimeStore::Impl {
             segments.push_back(
                 std::make_shared<Segment>(range, std::vector<StoredBatch>(building_)));
         }
-        return std::shared_ptr<RealtimeReadView>(new ReadView(std::move(segments)));
+        return std::make_shared<ReadView>(std::move(segments));
     }
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
@@ -241,9 +242,11 @@ class PrimaryKeyRealtimeStore::Impl {
 
     Status AdvanceCommittedOffset(int64_t committed_end_offset) {
         std::lock_guard<std::mutex> lock(mutex_);
-        while (!sealed_.empty() && sealed_.front()->GetOffsetRange().end <= committed_end_offset) {
-            sealed_.erase(sealed_.begin());
-        }
+        auto first_retained = std::find_if(
+            sealed_.begin(), sealed_.end(), [committed_end_offset](const auto& segment) {
+                return segment->GetOffsetRange().end > committed_end_offset;
+            });
+        sealed_.erase(sealed_.begin(), first_retained);
         return Status::OK();
     }
 

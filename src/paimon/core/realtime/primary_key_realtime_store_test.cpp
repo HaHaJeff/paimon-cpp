@@ -319,19 +319,45 @@ TEST(PrimaryKeyRealtimeStoreTest, TestReclaimKeepsReadView) {
     ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
                          store->SealForCommit());
     ASSERT_TRUE(segment.has_value());
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());
-    ASSERT_GT(store->GetMemoryUsage(), 0);
+    ASSERT_OK(
+        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 1, 5, 2, "two"]])"), OffsetRange(5, 6)}));
+    ASSERT_OK_AND_ASSIGN(segment, store->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK(store->Write(
+        RealtimeWriteBatch{MakeBatch(R"([[0, 2, 6, 3, "three"]])"), OffsetRange(6, 7)}));
+    ASSERT_OK_AND_ASSIGN(segment, store->SealForCommit());
+    ASSERT_TRUE(segment.has_value());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> retained_view, store->AcquireReadView());
+    ASSERT_EQ(OffsetRange(4, 7), retained_view->GetOffsetRange());
+
+    const uint64_t initial_memory_usage = store->GetMemoryUsage();
+    ASSERT_GT(initial_memory_usage, 0);
+    ASSERT_OK(store->AdvanceCommittedOffset(4));
+    ASSERT_EQ(initial_memory_usage, store->GetMemoryUsage());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> current_view, store->AcquireReadView());
+    ASSERT_EQ(OffsetRange(4, 7), current_view->GetOffsetRange());
     ASSERT_OK(store->AdvanceCommittedOffset(5));
+    ASSERT_LT(store->GetMemoryUsage(), initial_memory_usage);
+    ASSERT_OK_AND_ASSIGN(current_view, store->AcquireReadView());
+    ASSERT_EQ(OffsetRange(5, 7), current_view->GetOffsetRange());
+    ASSERT_OK(store->AdvanceCommittedOffset(6));
+    ASSERT_OK_AND_ASSIGN(current_view, store->AcquireReadView());
+    ASSERT_EQ(OffsetRange(6, 7), current_view->GetOffsetRange());
+    ASSERT_OK(store->AdvanceCommittedOffset(7));
     ASSERT_EQ(0, store->GetMemoryUsage());
+    ASSERT_OK_AND_ASSIGN(current_view, store->AcquireReadView());
+    ASSERT_FALSE(current_view->GetOffsetRange().has_value());
 
     auto c_schema = std::make_unique<ArrowSchema>();
     ASSERT_TRUE(arrow::ExportSchema(*PreparedSchema(), c_schema.get()).ok());
     RealtimeQueryContext context{c_schema.get(), /*predicate=*/nullptr,
                                  /*enable_predicate_pushdown=*/false};
     ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
-                         store->CreateQueryReaders(view, /*offset_begin=*/0, context));
+                         store->CreateQueryReaders(retained_view, /*offset_begin=*/0, context));
     ASSERT_OK_AND_ASSIGN(std::string actual, ReadJson(readers));
     ASSERT_NE(std::string::npos, actual.find("\"one\""));
+    ASSERT_NE(std::string::npos, actual.find("\"two\""));
+    ASSERT_NE(std::string::npos, actual.find("\"three\""));
 }
 
 TEST(PrimaryKeyRealtimeStoreTest, TestQueryReaderPerStoredBatch) {
