@@ -36,7 +36,6 @@
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
 #include "paimon/core/mergetree/merge_tree_writer.h"
-#include "paimon/core/realtime/arrow_array_pool_holder.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
 #include "paimon/core/utils/commit_increment.h"

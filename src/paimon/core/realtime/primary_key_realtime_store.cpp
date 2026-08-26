@@ -32,7 +32,6 @@
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/scope_guard.h"
-#include "paimon/core/realtime/arrow_array_pool_holder.h"
 #include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"

@@ -380,7 +380,6 @@ set(PAIMON_CORE_SRCS
     core/manifest/snapshot_live_manifest_entries.cpp
     core/operation/write_context.cpp
     core/operation/write_restore.cpp
-    core/realtime/arrow_array_pool_holder.cpp
     core/realtime/arrow_realtime_store.cpp
     core/realtime/arrow_realtime_store_factory.cpp
     core/realtime/prepared_key_value_reader.cpp
