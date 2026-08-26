@@ -48,11 +48,6 @@ namespace paimon {
 
 namespace {
 
-constexpr int32_t kValueKindIndex = 0;
-constexpr int32_t kSequenceNumberIndex = 1;
-constexpr int32_t kRealtimeOffsetIndex = 2;
-constexpr int32_t kPreparedValueStartIndex = 3;
-
 template <typename Reader>
 void CloseReaders(const std::vector<std::unique_ptr<Reader>>& readers) {
     for (const std::unique_ptr<Reader>& reader : readers) {
@@ -151,7 +146,7 @@ Result<std::vector<int32_t>> ResolveFieldIndexes(
     const std::shared_ptr<arrow::Schema>& prepared_schema,
     const std::shared_ptr<arrow::Schema>& row_schema) {
     arrow::FieldVector prepared_value_fields(
-        prepared_schema->fields().begin() + kPreparedValueStartIndex,
+        prepared_schema->fields().begin() + SpecialFields::kPreparedKeyValueValueStartIndex,
         prepared_schema->fields().end());
     std::vector<int32_t> result;
     result.reserve(row_schema->num_fields());
@@ -167,18 +162,19 @@ Result<std::vector<int32_t>> ResolveFieldIndexes(
                 "type {}",
                 field_id, prepared_field->type()->ToString(), row_field->type()->ToString()));
         }
-        result.push_back(value_index + kPreparedValueStartIndex);
+        result.push_back(value_index + SpecialFields::kPreparedKeyValueValueStartIndex);
     }
     return result;
 }
 
 Status ValidateExactCommitSchema(const std::shared_ptr<arrow::Schema>& prepared_schema,
                                  const std::shared_ptr<arrow::Schema>& value_schema) {
-    if (prepared_schema->num_fields() != value_schema->num_fields() + kPreparedValueStartIndex) {
+    if (prepared_schema->num_fields() !=
+        value_schema->num_fields() + SpecialFields::kPreparedKeyValueValueStartIndex) {
         return Status::Invalid("commit requires the exact prepared writer schema");
     }
     for (int32_t i = 0; i < value_schema->num_fields(); ++i) {
-        if (!prepared_schema->field(i + kPreparedValueStartIndex)
+        if (!prepared_schema->field(i + SpecialFields::kPreparedKeyValueValueStartIndex)
                  ->Equals(value_schema->field(i), true)) {
             return Status::Invalid("commit requires the exact prepared writer schema");
         }
@@ -300,15 +296,15 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
             std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> offset_array =
                 checked_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
-                    data_batch->field(kRealtimeOffsetIndex));
+                    data_batch->field(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex));
             if (offset_coverage_) {
                 PAIMON_RETURN_NOT_OK(offset_coverage_->Add(*offset_array));
             }
 
             row_kind_array_ = checked_pointer_cast<arrow::NumericArray<arrow::Int8Type>>(
-                data_batch->field(kValueKindIndex));
+                data_batch->field(SpecialFields::kPreparedKeyValueValueKindIndex));
             sequence_number_array_ = checked_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
-                data_batch->field(kSequenceNumberIndex));
+                data_batch->field(SpecialFields::kPreparedKeyValueSequenceNumberIndex));
             arrow::ArrayVector key_fields;
             key_fields.reserve(key_field_indexes_.size());
             for (int32_t index : key_field_indexes_) {
@@ -344,21 +340,26 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                     "prepared batch field {} does not match declared prepared schema", i));
             }
         }
-        if (!data_batch->field(kValueKindIndex) ||
-            data_batch->field(kValueKindIndex)->type_id() != arrow::Type::INT8) {
+        if (!data_batch->field(SpecialFields::kPreparedKeyValueValueKindIndex) ||
+            data_batch->field(SpecialFields::kPreparedKeyValueValueKindIndex)->type_id() !=
+                arrow::Type::INT8) {
             return Status::Invalid("cannot cast VALUE_KIND column to int8 arrow array");
         }
-        if (!data_batch->field(kSequenceNumberIndex) ||
-            data_batch->field(kSequenceNumberIndex)->type_id() != arrow::Type::INT64) {
+        if (!data_batch->field(SpecialFields::kPreparedKeyValueSequenceNumberIndex) ||
+            data_batch->field(SpecialFields::kPreparedKeyValueSequenceNumberIndex)->type_id() !=
+                arrow::Type::INT64) {
             return Status::Invalid("cannot cast SEQUENCE_NUMBER column to int64 arrow array");
         }
-        if (!data_batch->field(kRealtimeOffsetIndex) ||
-            data_batch->field(kRealtimeOffsetIndex)->type_id() != arrow::Type::INT64) {
+        if (!data_batch->field(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex) ||
+            data_batch->field(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex)->type_id() !=
+                arrow::Type::INT64) {
             return Status::Invalid("cannot cast REALTIME_OFFSET column to int64 arrow array");
         }
-        if (data_batch->field(kValueKindIndex)->null_count() != 0 ||
-            data_batch->field(kSequenceNumberIndex)->null_count() != 0 ||
-            data_batch->field(kRealtimeOffsetIndex)->null_count() != 0) {
+        if (data_batch->field(SpecialFields::kPreparedKeyValueValueKindIndex)->null_count() != 0 ||
+            data_batch->field(SpecialFields::kPreparedKeyValueSequenceNumberIndex)->null_count() !=
+                0 ||
+            data_batch->field(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex)->null_count() !=
+                0) {
             return Status::Invalid("prepared transport columns must not contain nulls");
         }
         return Status::OK();
@@ -428,15 +429,19 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
 Status PreparedKeyValueReaderFactory::ValidateTransportSchema(
     const std::shared_ptr<arrow::Schema>& prepared_schema) {
-    if (!prepared_schema || prepared_schema->num_fields() < kPreparedValueStartIndex) {
+    if (!prepared_schema ||
+        prepared_schema->num_fields() < SpecialFields::kPreparedKeyValueValueStartIndex) {
         return Status::Invalid("prepared schema must contain realtime transport fields");
     }
-    PAIMON_RETURN_NOT_OK(
-        CheckPreparedField(prepared_schema, kValueKindIndex, SpecialFields::ValueKind()));
-    PAIMON_RETURN_NOT_OK(
-        CheckPreparedField(prepared_schema, kSequenceNumberIndex, SpecialFields::SequenceNumber()));
-    PAIMON_RETURN_NOT_OK(
-        CheckPreparedField(prepared_schema, kRealtimeOffsetIndex, SpecialFields::RealtimeOffset()));
+    PAIMON_RETURN_NOT_OK(CheckPreparedField(prepared_schema,
+                                            SpecialFields::kPreparedKeyValueValueKindIndex,
+                                            SpecialFields::ValueKind()));
+    PAIMON_RETURN_NOT_OK(CheckPreparedField(prepared_schema,
+                                            SpecialFields::kPreparedKeyValueSequenceNumberIndex,
+                                            SpecialFields::SequenceNumber()));
+    PAIMON_RETURN_NOT_OK(CheckPreparedField(prepared_schema,
+                                            SpecialFields::kPreparedKeyValueRealtimeOffsetIndex,
+                                            SpecialFields::RealtimeOffset()));
     return Status::OK();
 }
 
@@ -474,9 +479,9 @@ Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
                            ResolveFieldIndexes(prepared_schema, key_schema));
     PAIMON_ASSIGN_OR_RAISE(std::vector<int32_t> value_field_indexes,
                            ResolveFieldIndexes(prepared_schema, value_schema));
-    std::unique_ptr<KeyValueRecordReader> result(new PreparedKeyValueReader(
+    std::unique_ptr<KeyValueRecordReader> result = std::make_unique<PreparedKeyValueReader>(
         std::move(owned_reader), prepared_schema, visible_offsets, std::move(key_field_indexes),
-        std::move(value_field_indexes), memory_pool, offset_coverage));
+        std::move(value_field_indexes), memory_pool, offset_coverage);
     close_guard.Release();
     return result;
 }

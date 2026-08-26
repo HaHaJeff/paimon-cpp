@@ -27,7 +27,6 @@
 #include "arrow/c/bridge.h"
 #include "arrow/compute/api.h"
 #include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/common/types/row_kind.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
@@ -139,22 +138,16 @@ Result<std::shared_ptr<RealtimePrimaryKeyWriter>> RealtimePrimaryKeyWriter::Crea
         }
         key_fields.push_back(std::move(field));
     }
-    arrow::FieldVector prepared_fields = {
-        DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
-            ->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
-    prepared_fields.insert(prepared_fields.end(), write_schema->fields().begin(),
-                           write_schema->fields().end());
+    std::shared_ptr<arrow::Schema> prepared_schema =
+        SpecialFields::PreparedKeyValueSchema(write_schema->fields());
     const RealtimePartitionBucket partition_bucket(partition, bucket);
     PAIMON_ASSIGN_OR_RAISE(int64_t initial_max_sequence_number,
                            realtime_context->AdvanceMaterializedMaxSequenceNumber(
                                partition_bucket, restored_max_sequence_number));
     return std::shared_ptr<RealtimePrimaryKeyWriter>(new RealtimePrimaryKeyWriter(
         store_state.store, merge_tree_writer, realtime_context, partition_bucket, write_schema,
-        arrow::schema(std::move(prepared_fields)), arrow::schema(std::move(key_fields)),
-        trimmed_primary_keys, key_comparator, store_state.initial_offset,
-        initial_max_sequence_number, memory_pool));
+        prepared_schema, arrow::schema(std::move(key_fields)), trimmed_primary_keys, key_comparator,
+        store_state.initial_offset, initial_max_sequence_number, memory_pool));
 }
 
 RealtimePrimaryKeyWriter::RealtimePrimaryKeyWriter(

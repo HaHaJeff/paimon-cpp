@@ -19,6 +19,7 @@
 
 #include "paimon/core/table/source/key_value_table_read.h"
 
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,7 +27,6 @@
 #include "arrow/c/bridge.h"
 #include "paimon/common/reader/concat_batch_reader.h"
 #include "paimon/common/table/special_fields.h"
-#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/global_index/indexed_split_impl.h"
@@ -42,6 +42,7 @@
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/pk_count_reader.h"
 #include "paimon/core/table/source/realtime_split.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/core/utils/primary_key_table_utils.h"
 #include "paimon/status.h"
 
@@ -62,14 +63,23 @@ Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateMemoryReaders(
     const std::shared_ptr<FieldsComparator>& key_comparator,
     const std::shared_ptr<InternalReadContext>& context,
     const std::shared_ptr<MemoryPool>& memory_pool) {
-    arrow::FieldVector prepared_fields = {
-        DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
-            ->WithNullable(false),
-        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
-    prepared_fields.insert(prepared_fields.end(), value_schema->fields().begin(),
-                           value_schema->fields().end());
-    std::shared_ptr<arrow::Schema> prepared_schema = arrow::schema(std::move(prepared_fields));
+    arrow::FieldVector prepared_value_fields;
+    prepared_value_fields.reserve(key_schema->num_fields() + value_schema->num_fields());
+    std::unordered_set<int32_t> field_ids;
+    for (const std::shared_ptr<arrow::Field>& field : key_schema->fields()) {
+        PAIMON_ASSIGN_OR_RAISE(int32_t field_id, NestedProjectionUtils::GetPaimonFieldId(field));
+        if (field_ids.insert(field_id).second) {
+            prepared_value_fields.push_back(field);
+        }
+    }
+    for (const std::shared_ptr<arrow::Field>& field : value_schema->fields()) {
+        PAIMON_ASSIGN_OR_RAISE(int32_t field_id, NestedProjectionUtils::GetPaimonFieldId(field));
+        if (field_ids.insert(field_id).second) {
+            prepared_value_fields.push_back(field);
+        }
+    }
+    std::shared_ptr<arrow::Schema> prepared_schema =
+        SpecialFields::PreparedKeyValueSchema(prepared_value_fields);
     auto c_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*prepared_schema, c_schema.get()));
     ScopeGuard schema_guard([schema = c_schema.get()]() { ArrowSchemaRelease(schema); });
