@@ -63,21 +63,69 @@ TEST(PrimaryKeyTableUtilsTest, TestSupportedRealtimeOptions) {
 }
 
 TEST(PrimaryKeyTableUtilsTest, TestUnsupportedRealtimeOptions) {
-    const std::string sequence_group =
-        std::string(Options::FIELDS_PREFIX) + ".value." + Options::SEQUENCE_GROUP;
     const std::vector<std::map<std::string, std::string>> unsupported_options = {
         {{Options::BUCKET, "0"}},
         {{Options::BUCKET, "1"}, {Options::MERGE_ENGINE, "partial-update"}},
         {{Options::BUCKET, "1"}, {Options::DATA_EVOLUTION_ENABLED, "true"}},
-        {{Options::BUCKET, "1"}, {sequence_group, "seq"}},
         {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD, "seq"}},
-        {{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
-        {{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
-        {{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
     };
     for (const std::map<std::string, std::string>& option_map : unsupported_options) {
         ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
         ASSERT_NOK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *PkSchema()));
+    }
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestRealtimeAcceptsInactiveMergeEngineOptions) {
+    const std::string sequence_group =
+        std::string(Options::FIELDS_PREFIX) + ".value." + Options::SEQUENCE_GROUP;
+    const std::map<std::string, std::string> option_map = {
+        {Options::BUCKET, "1"},
+        {sequence_group, "seq"},
+        {Options::PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE, "true"},
+        {Options::AGGREGATION_REMOVE_RECORD_ON_DELETE, "true"},
+        {Options::PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP, "seq"},
+    };
+    ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<TableSchema> schema,
+                         TableSchema::Create(0,
+                                             arrow::schema({arrow::field("id", arrow::int64()),
+                                                            arrow::field("value", arrow::utf8()),
+                                                            arrow::field("seq", arrow::int64())}),
+                                             {}, {"id"}, option_map));
+    ASSERT_OK(PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *schema));
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestRealtimeRejectsDeleteAndSequenceOrderingOptions) {
+    ASSERT_OK_AND_ASSIGN(
+        CoreOptions ignore_delete,
+        CoreOptions::FromMap({{Options::BUCKET, "1"}, {Options::IGNORE_DELETE, "true"}}));
+    ASSERT_NOK_WITH_MSG(PrimaryKeyTableUtils::ValidateRealtimeOptions(ignore_delete, *PkSchema()),
+                        "requires default delete behavior");
+
+    ASSERT_OK_AND_ASSIGN(
+        CoreOptions descending,
+        CoreOptions::FromMap(
+            {{Options::BUCKET, "1"}, {Options::SEQUENCE_FIELD_SORT_ORDER, "descending"}}));
+    ASSERT_NOK_WITH_MSG(PrimaryKeyTableUtils::ValidateRealtimeOptions(descending, *PkSchema()),
+                        "supports only ascending sequence.field.sort-order");
+}
+
+TEST(PrimaryKeyTableUtilsTest, TestRealtimeReportsSpecificLookupErrors) {
+    const std::vector<std::pair<std::map<std::string, std::string>, std::string>> cases = {
+        {{{Options::BUCKET, "1"}, {Options::FORCE_LOOKUP, "true"}},
+         "PK realtime v1 does not support lookup"},
+        {{{Options::BUCKET, "1"}, {Options::DELETION_VECTORS_ENABLED, "true"}},
+         "PK realtime v1 does not support deletion vectors"},
+        {{{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "input"}},
+         "PK realtime v1 supports only the NONE changelog producer"},
+        {{{Options::BUCKET, "1"}, {Options::CHANGELOG_PRODUCER, "lookup"}},
+         "PK realtime v1 supports only the NONE changelog producer"},
+    };
+    for (const auto& [option_map, expected_message] : cases) {
+        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap(option_map));
+        Status status = PrimaryKeyTableUtils::ValidateRealtimeOptions(options, *PkSchema());
+        ASSERT_TRUE(status.IsNotImplemented());
+        ASSERT_EQ(status.message(), expected_message);
     }
 }
 

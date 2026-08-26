@@ -109,12 +109,7 @@ Status PrimaryKeyTableUtils::ValidateRealtimeOptions(const CoreOptions& options,
     if (options.DataEvolutionEnabled()) {
         return Status::NotImplemented("PK realtime v1 does not support data evolution");
     }
-    if (!options.GetFieldsSequenceGroups().empty()) {
-        return Status::NotImplemented("PK realtime v1 does not support sequence groups");
-    }
-    if (options.IgnoreDelete() || options.PartialUpdateRemoveRecordOnDelete() ||
-        options.AggregationRemoveRecordOnDelete() ||
-        !options.GetPartialUpdateRemoveRecordOnSequenceGroup().empty()) {
+    if (options.IgnoreDelete()) {
         return Status::NotImplemented("PK realtime v1 requires default delete behavior");
     }
     if (!options.GetSequenceField().empty()) {
@@ -124,9 +119,14 @@ Status PrimaryKeyTableUtils::ValidateRealtimeOptions(const CoreOptions& options,
         return Status::NotImplemented(
             "PK realtime v1 supports only ascending sequence.field.sort-order");
     }
-    if (options.NeedLookup() || options.DeletionVectorsEnabled() ||
-        options.GetChangelogProducer() != ChangelogProducer::NONE) {
-        return Status::NotImplemented("PK realtime v1 does not support lookup or early MOR");
+    if (options.GetChangelogProducer() != ChangelogProducer::NONE) {
+        return Status::NotImplemented("PK realtime v1 supports only the NONE changelog producer");
+    }
+    if (options.DeletionVectorsEnabled()) {
+        return Status::NotImplemented("PK realtime v1 does not support deletion vectors");
+    }
+    if (options.NeedLookup()) {
+        return Status::NotImplemented("PK realtime v1 does not support lookup");
     }
     PAIMON_ASSIGN_OR_RAISE(std::vector<DataField> primary_key_fields,
                            schema.TrimmedPrimaryKeyFields());
