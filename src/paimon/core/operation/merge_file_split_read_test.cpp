@@ -40,6 +40,7 @@
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/io/data_file_meta.h"
+#include "paimon/core/io/key_value_in_memory_record_reader.h"
 #include "paimon/core/manifest/file_source.h"
 #include "paimon/core/operation/internal_read_context.h"
 #include "paimon/core/schema/schema_manager.h"
@@ -328,9 +329,8 @@ class MergeFileSplitReadTest : public ::testing::Test,
         return {data_split1};
     }
 
-    Result<std::unique_ptr<BatchReader>> CreateReader(
-        const std::shared_ptr<InternalReadContext>& internal_context,
-        const std::vector<std::shared_ptr<DataSplit>>& data_splits) {
+    Result<std::unique_ptr<MergeFileSplitRead>> CreateMergeFileSplitRead(
+        const std::shared_ptr<InternalReadContext>& internal_context) {
         const auto& core_options = internal_context->GetCoreOptions();
         const auto& table_schema = internal_context->GetTableSchema();
         auto arrow_schema = DataField::ConvertDataFieldsToArrowSchema(table_schema->Fields());
@@ -347,9 +347,14 @@ class MergeFileSplitReadTest : public ::testing::Test,
                 core_options.DataFilePrefix(), core_options.LegacyPartitionNameEnabled(),
                 external_paths, global_index_external_path, core_options.IndexFileInDataFileDir(),
                 pool_));
-        PAIMON_ASSIGN_OR_RAISE(auto split_read,
-                               MergeFileSplitRead::Create(path_factory, std::move(internal_context),
-                                                          pool_, executor_));
+        return MergeFileSplitRead::Create(path_factory, internal_context, pool_, executor_);
+    }
+
+    Result<std::unique_ptr<BatchReader>> CreateReader(
+        const std::shared_ptr<InternalReadContext>& internal_context,
+        const std::vector<std::shared_ptr<DataSplit>>& data_splits) {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<MergeFileSplitRead> split_read,
+                               CreateMergeFileSplitRead(internal_context));
         std::vector<std::unique_ptr<BatchReader>> batch_readers;
         batch_readers.reserve(data_splits.size());
         for (const auto& split : data_splits) {
@@ -664,6 +669,74 @@ TEST_P(MergeFileSplitReadTest, TestSimple) {
                                                          &expected_array);
     ASSERT_TRUE(array_status.ok());
     CheckResult(result_array, expected_array, read_schema);
+}
+
+TEST_P(MergeFileSplitReadTest, TestRealtimeReadConcatenatesOrderedDiskSections) {
+    std::string path =
+        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
+    ReadContextBuilder context_builder(path);
+    std::vector<DataField> raw_read_fields = {DataField(0, arrow::field("k0", arrow::int32())),
+                                              DataField(1, arrow::field("k1", arrow::int32())),
+                                              DataField(5, arrow::field("s1", arrow::utf8())),
+                                              DataField(6, arrow::field("v0", arrow::float64()))};
+    std::shared_ptr<arrow::Schema> read_schema =
+        DataField::ConvertDataFieldsToArrowSchema(raw_read_fields);
+    ASSERT_TRUE(read_schema);
+
+    context_builder.SetReadFieldNames({"k0", "k1", "s1", "v0"});
+    context_builder.SetOptions(
+        {{Options::SEQUENCE_FIELD, "s0,s1"}, {Options::MERGE_ENGINE, "deduplicate"}});
+    AddOptions(&context_builder);
+    context_builder.EnableMultiThreadRowToBatch(false);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
+    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
+                         CreateMergeFileSplitRead(internal_context));
+
+    std::shared_ptr<arrow::DataType> memory_type =
+        arrow::struct_(split_read->GetValueSchema()->fields());
+    std::shared_ptr<arrow::StructArray> memory_array =
+        std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(memory_type, R"([
+                [100, 200, "memory-late",   10000.0, "zzzz"],
+                [1,     1, "memory-delete",  1100.0, "zzzz"],
+                [0,     0, "memory-first",   1000.0, "zzzz"],
+                [50,    0, "memory-middle",  5000.0, "zzzz"]
+            ])")
+                .ValueOrDie());
+    std::vector<std::unique_ptr<KeyValueRecordReader>> memory_readers;
+    memory_readers.push_back(std::make_unique<KeyValueInMemoryRecordReader>(
+        /*last_sequence_num=*/9, memory_array,
+        std::vector<RecordBatch::RowKind>(
+            {RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::DELETE,
+             RecordBatch::RowKind::UPDATE_AFTER, RecordBatch::RowKind::INSERT}),
+        std::vector<std::string>({"k0", "k1"}), std::vector<std::string>({"s0", "s1"}),
+        /*sequence_fields_ascending=*/true, split_read->GetKeyComparator(), pool_));
+
+    std::vector<std::shared_ptr<Split>> disk_splits = {PrepareDataSplit().front()};
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
+                         split_read->CreateRealtimeReader(disk_splits, std::move(memory_readers)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result_array,
+                         ReadResultCollector::CollectResult(batch_reader.get()));
+
+    arrow::FieldVector fields_with_row_kind = read_schema->fields();
+    fields_with_row_kind.insert(fields_with_row_kind.begin(),
+                                arrow::field("_VALUE_KIND", arrow::int8()));
+    std::shared_ptr<arrow::ChunkedArray> expected_array;
+    auto expected_status =
+        arrow::ipc::internal::json::ChunkedArrayFromJSON(arrow::struct_(fields_with_row_kind), {R"([
+            [0,   0,   0, "memory-first",  1000.0],
+            [0,   0,   1, "you",             11.1],
+            [0,   1,   0, "later",           12.2],
+            [0,   1,   2, "!",               13.3],
+            [0,  50,   0, "memory-middle", 5000.0],
+            [0, 100, 200, "memory-late", 10000.0]
+        ])"},
+                                                         &expected_array);
+    ASSERT_TRUE(expected_status.ok());
+    CheckResult(result_array, expected_array, read_schema);
+    ASSERT_TRUE(batch_reader->GetReaderMetrics());
+    batch_reader->Close();
 }
 
 TEST_P(MergeFileSplitReadTest, TestLookUp) {

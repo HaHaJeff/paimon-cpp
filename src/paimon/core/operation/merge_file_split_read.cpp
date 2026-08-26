@@ -36,6 +36,7 @@
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/object_utils.h"
+#include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/deletionvectors/apply_deletion_vector_batch_reader.h"
 #include "paimon/core/deletionvectors/bitmap_deletion_vector.h"
@@ -77,6 +78,53 @@ class Executor;
 struct KeyValue;
 template <typename T>
 class MergeFunctionWrapper;
+
+namespace {
+
+class SortMergeKeyValueRecordReader : public KeyValueRecordReader {
+ public:
+    explicit SortMergeKeyValueRecordReader(std::unique_ptr<SortMergeReader>&& reader)
+        : reader_(std::move(reader)) {}
+
+    class Iterator : public KeyValueRecordReader::Iterator {
+     public:
+        explicit Iterator(std::unique_ptr<SortMergeReader::Iterator>&& iterator)
+            : iterator_(std::move(iterator)) {}
+
+        Result<bool> HasNext() const override {
+            return iterator_->HasNext();
+        }
+
+        Result<KeyValue> Next() override {
+            return std::move(iterator_->Next());
+        }
+
+     private:
+        std::unique_ptr<SortMergeReader::Iterator> iterator_;
+    };
+
+    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader::Iterator> iterator,
+                               reader_->NextBatch());
+        if (!iterator) {
+            return std::unique_ptr<KeyValueRecordReader::Iterator>();
+        }
+        return std::make_unique<Iterator>(std::move(iterator));
+    }
+
+    void Close() override {
+        reader_->Close();
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return reader_->GetReaderMetrics();
+    }
+
+ private:
+    std::unique_ptr<SortMergeReader> reader_;
+};
+
+}  // namespace
 
 class MergeFileSplitRead::RealtimeReaderBuilder {
  public:
@@ -145,15 +193,34 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
         std::vector<std::vector<SortedRun>> disk_sections;
         PAIMON_RETURN_NOT_OK(
             owner_->CreateDiskSections(data_files, deletion_files, &dv_factory, &disk_sections));
+        std::vector<std::unique_ptr<KeyValueRecordReader>> section_readers;
+        ScopeGuard section_readers_guard([&section_readers]() {
+            for (const std::unique_ptr<KeyValueRecordReader>& reader : section_readers) {
+                reader->Close();
+            }
+        });
+        section_readers.reserve(disk_sections.size());
+        std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper;
+        if (!disk_sections.empty()) {
+            PAIMON_ASSIGN_OR_RAISE(merge_function_wrapper,
+                                   MergeFileSplitRead::CreateMergeFunctionWrapper(
+                                       owner_->options_, owner_->context_->GetTableSchema(),
+                                       owner_->value_schema_, owner_->pool_));
+        }
         for (const std::vector<SortedRun>& section : disk_sections) {
             PAIMON_ASSIGN_OR_RAISE(
-                std::vector<std::unique_ptr<KeyValueRecordReader>> section_readers,
-                owner_->CreateRecordReadersForSection(section, partition, dv_factory,
-                                                      owner_->predicate_for_keys_,
-                                                      data_file_path_factory));
-            for (std::unique_ptr<KeyValueRecordReader>& reader : section_readers) {
-                readers->push_back(std::move(reader));
-            }
+                std::unique_ptr<SortMergeReader> section_reader,
+                owner_->CreateSortMergeReaderForSection(
+                    section, partition, dv_factory, owner_->predicate_for_keys_,
+                    data_file_path_factory, /*drop_delete=*/false, merge_function_wrapper));
+            section_readers.push_back(
+                std::make_unique<SortMergeKeyValueRecordReader>(std::move(section_reader)));
+        }
+        if (!section_readers.empty()) {
+            std::unique_ptr<KeyValueRecordReader> concat_reader =
+                std::make_unique<ConcatKeyValueRecordReader>(std::move(section_readers));
+            section_readers_guard.Release();
+            readers->push_back(std::move(concat_reader));
         }
         return Status::OK();
     }
@@ -618,11 +685,24 @@ Result<std::unique_ptr<SortMergeReader>> MergeFileSplitRead::CreateSortMergeRead
     const std::vector<SortedRun>& section, const BinaryRow& partition,
     DeletionVector::Factory dv_factory, const std::shared_ptr<Predicate>& predicate,
     const std::shared_ptr<DataFilePathFactory>& data_file_path_factory, bool drop_delete) {
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper,
+                           GetMergeFunctionWrapper());
+    return CreateSortMergeReaderForSection(section, partition, dv_factory, predicate,
+                                           data_file_path_factory, drop_delete,
+                                           merge_function_wrapper);
+}
+
+Result<std::unique_ptr<SortMergeReader>> MergeFileSplitRead::CreateSortMergeReaderForSection(
+    const std::vector<SortedRun>& section, const BinaryRow& partition,
+    DeletionVector::Factory dv_factory, const std::shared_ptr<Predicate>& predicate,
+    const std::shared_ptr<DataFilePathFactory>& data_file_path_factory, bool drop_delete,
+    const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper) {
     PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<KeyValueRecordReader>> record_readers,
                            CreateRecordReadersForSection(section, partition, dv_factory, predicate,
                                                          data_file_path_factory));
-    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> sort_merge_reader,
-                           CreateSortMergeReader(std::move(record_readers)));
+    PAIMON_ASSIGN_OR_RAISE(
+        std::unique_ptr<SortMergeReader> sort_merge_reader,
+        CreateSortMergeReader(std::move(record_readers), merge_function_wrapper));
     if (drop_delete) {
         sort_merge_reader = std::make_unique<DropDeleteReader>(std::move(sort_merge_reader));
     }
@@ -657,6 +737,12 @@ Result<std::unique_ptr<SortMergeReader>> MergeFileSplitRead::CreateSortMergeRead
     std::vector<std::unique_ptr<KeyValueRecordReader>>&& record_readers) {
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper,
                            GetMergeFunctionWrapper());
+    return CreateSortMergeReader(std::move(record_readers), merge_function_wrapper);
+}
+
+Result<std::unique_ptr<SortMergeReader>> MergeFileSplitRead::CreateSortMergeReader(
+    std::vector<std::unique_ptr<KeyValueRecordReader>>&& record_readers,
+    const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper) const {
     auto sort_engine = options_.GetSortEngine();
     if (sort_engine == SortEngine::MIN_HEAP) {
         return std::make_unique<SortMergeReaderWithMinHeap>(
