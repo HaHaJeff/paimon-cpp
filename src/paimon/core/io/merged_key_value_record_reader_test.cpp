@@ -128,6 +128,54 @@ class MalformedBitmapBatchReader : public BatchReader {
     int32_t row_id_;
 };
 
+class ScriptedKeyValueRecordReader final : public KeyValueRecordReader {
+ public:
+    ScriptedKeyValueRecordReader(std::vector<KeyValue>&& key_values, int32_t* next_batch_count)
+        : key_values_(std::move(key_values)), next_batch_count_(next_batch_count) {}
+
+    class Iterator final : public KeyValueRecordReader::Iterator {
+     public:
+        explicit Iterator(KeyValue&& key_value) : key_value_(std::move(key_value)) {}
+
+        Result<bool> HasNext() const override {
+            return key_value_.has_value();
+        }
+
+        Result<KeyValue> Next() override {
+            KeyValue result = std::move(key_value_.value());
+            key_value_.reset();
+            return result;
+        }
+
+     private:
+        std::optional<KeyValue> key_value_;
+    };
+
+    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
+        ++(*next_batch_count_);
+        if (*next_batch_count_ == 1) {
+            return std::make_unique<Iterator>(std::move(key_values_[0]));
+        }
+        if (*next_batch_count_ == 2) {
+            return Status::IOError("scripted lookahead failure");
+        }
+        if (*next_batch_count_ == 3) {
+            return std::make_unique<Iterator>(std::move(key_values_[1]));
+        }
+        return std::unique_ptr<KeyValueRecordReader::Iterator>();
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return nullptr;
+    }
+
+    void Close() override {}
+
+ private:
+    std::vector<KeyValue> key_values_;
+    int32_t* next_batch_count_;
+};
+
 }  // namespace
 
 class MergedKeyValueRecordReaderTest : public testing::Test {
@@ -459,29 +507,26 @@ TEST_F(MergedKeyValueRecordReaderTest, TestQueryReaderRequiresStoreAlignedSchema
     ASSERT_NOK_WITH_MSG(reader->NextBatch(), "field count");
 }
 
-TEST_F(MergedKeyValueRecordReaderTest, TestMergedReaderErrorRetry) {
-    std::shared_ptr<arrow::Field> key = MakeField("key", arrow::int32(), 0);
-    std::shared_ptr<arrow::Schema> value_schema = arrow::schema({key});
-    std::shared_ptr<arrow::Schema> prepared_schema = MakePreparedSchema({key});
-    std::shared_ptr<arrow::DataType> prepared_type = arrow::struct_(prepared_schema->fields());
-    std::shared_ptr<arrow::Array> prepared_array =
-        arrow::ipc::internal::json::ArrayFromJSON(prepared_type, R"([[0, 10, 0, 1]])").ValueOrDie();
-    auto failing_reader = std::make_unique<MockFileBatchReader>(prepared_array, prepared_type, 1);
-    failing_reader->SetNextBatchStatus(Status::IOError("stable prepared error"));
-    ASSERT_OK_AND_ASSIGN(
-        std::unique_ptr<KeyValueRecordReader> reader,
-        AdaptPreparedBatchReaderForTest(std::move(failing_reader), prepared_schema,
-                                        OffsetRange(0, 1), value_schema, value_schema, pool_));
+TEST_F(MergedKeyValueRecordReaderTest, TestMergedReaderInitializationErrorIsTerminal) {
+    std::vector<DataField> key_fields = {DataField(0, arrow::field("key", arrow::int32()))};
+    std::vector<KeyValue> key_values =
+        KeyValueChecker::GenerateKeyValues({10, 11}, {{1}, {2}}, {{1}, {2}}, pool_);
+    int32_t next_batch_count = 0;
+    auto reader =
+        std::make_unique<ScriptedKeyValueRecordReader>(std::move(key_values), &next_batch_count);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<FieldsComparator> key_comparator,
-                         FieldsComparator::Create({DataField(0, key)}, true));
+                         FieldsComparator::Create(key_fields, true));
     MergedKeyValueRecordReader merged_reader(std::move(reader), key_comparator,
                                              merge_function_wrapper_);
 
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> first = merged_reader.NextBatch();
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> retry = merged_reader.NextBatch();
-    ASSERT_NOK(first);
-    ASSERT_NOK(retry);
+    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> second_retry =
+        merged_reader.NextBatch();
+    ASSERT_NOK_WITH_MSG(first, "scripted lookahead failure");
     ASSERT_EQ(first.status().ToString(), retry.status().ToString());
+    ASSERT_EQ(first.status().ToString(), second_retry.status().ToString());
+    ASSERT_EQ(2, next_batch_count);
 }
 
 TEST_F(MergedKeyValueRecordReaderTest, TestPreparedReaderSafeDecode) {

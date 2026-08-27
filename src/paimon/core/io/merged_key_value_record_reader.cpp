@@ -123,7 +123,6 @@ Result<std::unique_ptr<KeyValueRecordReader::Iterator>> MergedKeyValueRecordRead
     if (visited_) {
         return std::unique_ptr<KeyValueRecordReader::Iterator>();
     }
-    visited_ = true;
 
     auto iterator = std::make_unique<Iterator>(this);
     Result<bool> has_next_result = iterator->HasNext();
@@ -132,6 +131,7 @@ Result<std::unique_ptr<KeyValueRecordReader::Iterator>> MergedKeyValueRecordRead
         return initialization_error_.value();
     }
     bool has_next = std::move(has_next_result).value();
+    visited_ = true;
     if (!has_next) {
         return std::unique_ptr<KeyValueRecordReader::Iterator>();
     }
