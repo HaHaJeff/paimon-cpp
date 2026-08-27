@@ -67,6 +67,12 @@ class FileSystem;
 }  // namespace paimon
 
 namespace paimon::test {
+namespace {
+
+class TestingSplit : public Split {};
+
+}  // namespace
+
 // Parameter: min_heap/loser_tree; enable/disable IO prefetch; enable/disable multi thread row to
 // batch
 class MergeFileSplitReadTest : public ::testing::Test,
@@ -737,6 +743,54 @@ TEST_P(MergeFileSplitReadTest, TestRealtimeReadConcatenatesOrderedDiskSections) 
     CheckResult(result_array, expected_array, read_schema);
     ASSERT_TRUE(batch_reader->GetReaderMetrics());
     batch_reader->Close();
+}
+
+TEST_P(MergeFileSplitReadTest, TestRealtimeReadValidatesDiskSplits) {
+    std::string path =
+        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
+    ReadContextBuilder context_builder(path);
+    context_builder.SetReadFieldNames({"k0", "k1", "s1", "v0"});
+    context_builder.SetOptions(
+        {{Options::SEQUENCE_FIELD, "s0,s1"}, {Options::MERGE_ENGINE, "deduplicate"}});
+    AddOptions(&context_builder);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
+    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
+                         CreateMergeFileSplitRead(internal_context));
+
+    std::vector<std::shared_ptr<DataSplit>> prepared_splits = PrepareDataSplit();
+    std::shared_ptr<DataSplitImpl> first =
+        std::dynamic_pointer_cast<DataSplitImpl>(prepared_splits[0]);
+    ASSERT_NE(nullptr, first);
+
+    std::vector<std::shared_ptr<Split>> non_data_splits = {std::make_shared<TestingSplit>()};
+    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(non_data_splits, {}),
+                        "merge input disk split is not a data split");
+    std::vector<std::shared_ptr<Split>> mixed_partition_splits = {prepared_splits[0],
+                                                                 prepared_splits[1]};
+    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(mixed_partition_splits, {}),
+                        "merge input disk splits do not share a partition-bucket");
+
+    std::vector<std::shared_ptr<DataFileMeta>> before_data_files = first->DataFiles();
+    DataSplitImpl::Builder before_builder(first->Partition(), first->Bucket(), first->BucketPath(),
+                                          std::move(before_data_files));
+    std::vector<std::shared_ptr<DataFileMeta>> before_files = first->DataFiles();
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<DataSplitImpl> before_split,
+        before_builder.WithBeforeFiles(std::move(before_files)).RawConvertible(false).Build());
+    std::vector<std::shared_ptr<Split>> before_splits = {before_split};
+    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(before_splits, {}),
+                        "merge input disk split must not contain before files");
+
+    std::vector<std::shared_ptr<DataFileMeta>> deletion_data_files = first->DataFiles();
+    DataSplitImpl::Builder deletion_builder(first->Partition(), first->Bucket(),
+                                            first->BucketPath(), std::move(deletion_data_files));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<DataSplitImpl> deletion_split,
+        deletion_builder.WithDataDeletionFiles({std::nullopt}).RawConvertible(false).Build());
+    std::vector<std::shared_ptr<Split>> deletion_splits = {deletion_split};
+    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(deletion_splits, {}),
+                        "deletion files must be empty or match data files");
 }
 
 TEST_P(MergeFileSplitReadTest, TestLookUp) {

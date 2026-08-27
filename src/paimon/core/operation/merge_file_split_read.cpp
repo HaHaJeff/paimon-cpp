@@ -149,28 +149,28 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
 
     Status CollectDiskReaders(const std::vector<std::shared_ptr<Split>>& disk_splits,
                               std::vector<std::unique_ptr<KeyValueRecordReader>>* readers) {
-        std::shared_ptr<DataSplitImpl> first_split =
-            std::dynamic_pointer_cast<DataSplitImpl>(disk_splits.front());
-        if (!first_split) {
-            return Status::Invalid("merge input disk split is not a data split");
-        }
-        const BinaryRow& partition = first_split->Partition();
-        const int32_t bucket = first_split->Bucket();
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFilePathFactory> data_file_path_factory,
-                               owner_->path_factory_->CreateDataFilePathFactory(partition, bucket));
-
-        std::vector<std::shared_ptr<DataFileMeta>> data_files;
-        std::vector<std::optional<DeletionFile>> deletion_files;
+        std::vector<std::shared_ptr<DataSplitImpl>> data_splits;
+        data_splits.reserve(disk_splits.size());
         for (const std::shared_ptr<Split>& disk_split : disk_splits) {
             std::shared_ptr<DataSplitImpl> data_split =
                 std::dynamic_pointer_cast<DataSplitImpl>(disk_split);
-            if (!data_split || !(data_split->Partition() == partition) ||
-                data_split->Bucket() != bucket) {
+            if (!data_split) {
+                return Status::Invalid("merge input disk split is not a data split");
+            }
+            data_splits.push_back(std::move(data_split));
+        }
+        const std::shared_ptr<DataSplitImpl>& first_split = data_splits.front();
+        const BinaryRow& partition = first_split->Partition();
+        const int32_t bucket = first_split->Bucket();
+
+        std::vector<std::shared_ptr<DataFileMeta>> data_files;
+        std::vector<std::optional<DeletionFile>> deletion_files;
+        for (const std::shared_ptr<DataSplitImpl>& data_split : data_splits) {
+            if (!(data_split->Partition() == partition) || data_split->Bucket() != bucket) {
                 return Status::Invalid("merge input disk splits do not share a partition-bucket");
             }
-            if (!data_split->BeforeFiles().empty() || data_split->IsStreaming() ||
-                data_split->Bucket() == BucketModeDefine::POSTPONE_BUCKET) {
-                return Status::Invalid("additional merge input requires fixed-bucket batch splits");
+            if (!data_split->BeforeFiles().empty()) {
+                return Status::Invalid("merge input disk split must not contain before files");
             }
             const std::vector<std::shared_ptr<DataFileMeta>>& split_files = data_split->DataFiles();
             const std::vector<std::optional<DeletionFile>>& split_deletion_files =
@@ -188,11 +188,16 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
                                       split_deletion_files.end());
             }
         }
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFilePathFactory> data_file_path_factory,
+                               owner_->path_factory_->CreateDataFilePathFactory(partition, bucket));
 
         DeletionVector::Factory dv_factory;
         std::vector<std::vector<SortedRun>> disk_sections;
         PAIMON_RETURN_NOT_OK(
             owner_->CreateDiskSections(data_files, deletion_files, &dv_factory, &disk_sections));
+        if (disk_sections.empty()) {
+            return Status::OK();
+        }
         std::vector<std::unique_ptr<KeyValueRecordReader>> section_readers;
         ScopeGuard section_readers_guard([&section_readers]() {
             for (const std::unique_ptr<KeyValueRecordReader>& reader : section_readers) {
@@ -200,13 +205,11 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
             }
         });
         section_readers.reserve(disk_sections.size());
-        std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper;
-        if (!disk_sections.empty()) {
-            PAIMON_ASSIGN_OR_RAISE(merge_function_wrapper,
-                                   MergeFileSplitRead::CreateMergeFunctionWrapper(
-                                       owner_->options_, owner_->context_->GetTableSchema(),
-                                       owner_->value_schema_, owner_->pool_));
-        }
+        PAIMON_ASSIGN_OR_RAISE(
+            std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper,
+            MergeFileSplitRead::CreateMergeFunctionWrapper(owner_->options_,
+                                                           owner_->context_->GetTableSchema(),
+                                                           owner_->value_schema_, owner_->pool_));
         for (const std::vector<SortedRun>& section : disk_sections) {
             PAIMON_ASSIGN_OR_RAISE(
                 std::unique_ptr<SortMergeReader> section_reader,
@@ -216,12 +219,10 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
             section_readers.push_back(
                 std::make_unique<SortMergeKeyValueRecordReader>(std::move(section_reader)));
         }
-        if (!section_readers.empty()) {
-            std::unique_ptr<KeyValueRecordReader> concat_reader =
-                std::make_unique<ConcatKeyValueRecordReader>(std::move(section_readers));
-            section_readers_guard.Release();
-            readers->push_back(std::move(concat_reader));
-        }
+        std::unique_ptr<KeyValueRecordReader> concat_reader =
+            std::make_unique<ConcatKeyValueRecordReader>(std::move(section_readers));
+        section_readers_guard.Release();
+        readers->push_back(std::move(concat_reader));
         return Status::OK();
     }
 
