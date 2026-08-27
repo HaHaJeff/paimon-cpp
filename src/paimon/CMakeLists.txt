@@ -791,6 +791,7 @@ if(PAIMON_BUILD_TESTS)
                     core/memory/writer_memory_manager_test.cpp
                     core/realtime/arrow_realtime_store_test.cpp
                     core/realtime/primary_key_realtime_store_test.cpp
+                    core/realtime/prepared_key_value_reader_test.cpp
                     core/realtime/realtime_context_test.cpp
                     core/realtime/realtime_reader_test.cpp
                     core/mergetree/levels_test.cpp

@@ -169,38 +169,6 @@ Result<std::vector<int32_t>> ResolveFieldIndexes(
     return result;
 }
 
-Status ValidateReaderParameters(const std::shared_ptr<arrow::Schema>& prepared_schema,
-                                const std::shared_ptr<arrow::Schema>& key_schema,
-                                const std::shared_ptr<arrow::Schema>& value_schema,
-                                const std::shared_ptr<MemoryPool>& memory_pool) {
-    PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
-    if (!key_schema) {
-        return Status::Invalid("prepared key schema cannot be null");
-    }
-    if (!value_schema) {
-        return Status::Invalid("prepared value schema cannot be null");
-    }
-    if (!memory_pool) {
-        return Status::Invalid("prepared reader memory pool cannot be null");
-    }
-    return Status::OK();
-}
-
-Status ValidateExactCommitSchema(const std::shared_ptr<arrow::Schema>& prepared_schema,
-                                 const std::shared_ptr<arrow::Schema>& value_schema) {
-    if (prepared_schema->num_fields() !=
-        value_schema->num_fields() + SpecialFields::kPreparedKeyValueValueStartIndex) {
-        return Status::Invalid("commit requires the exact prepared writer schema");
-    }
-    for (int32_t i = 0; i < value_schema->num_fields(); ++i) {
-        if (!prepared_schema->field(i + SpecialFields::kPreparedKeyValueValueStartIndex)
-                 ->Equals(value_schema->field(i), true)) {
-            return Status::Invalid("commit requires the exact prepared writer schema");
-        }
-    }
-    return Status::OK();
-}
-
 class PreparedReaderPlan {
  public:
     static Result<std::shared_ptr<const PreparedReaderPlan>> Create(
@@ -471,19 +439,6 @@ Status PreparedKeyValueReaderFactory::ValidateTransportSchema(
     return Status::OK();
 }
 
-namespace {
-
-std::unique_ptr<KeyValueRecordReader> AdaptPreparedBatchReader(
-    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<const PreparedReaderPlan>& plan,
-    const std::optional<OffsetRange>& visible_offsets,
-    const std::shared_ptr<MemoryPool>& memory_pool,
-    const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage) {
-    return std::make_unique<PreparedKeyValueReader>(std::move(reader), plan, visible_offsets,
-                                                    memory_pool, offset_coverage);
-}
-
-}  // namespace
-
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
 PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchReader>>&& readers,
                                               const std::shared_ptr<arrow::Schema>& prepared_schema,
@@ -493,9 +448,6 @@ PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchR
                                               const std::shared_ptr<MemoryPool>& memory_pool) {
     std::vector<std::unique_ptr<KeyValueRecordReader>> adapted_readers;
     ScopeGuard remaining_raw_readers_guard([&readers]() { CloseReaders(readers); });
-    if (visible_offsets.begin > visible_offsets.end) {
-        return Status::Invalid("prepared visible offset range begin exceeds end");
-    }
     if (readers.empty() && visible_offsets.begin < visible_offsets.end) {
         return Status::Invalid(
             "PK real-time store returned no query readers for a non-empty visible range");
@@ -505,8 +457,7 @@ PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchR
             return Status::Invalid("PK real-time store returned a null query reader");
         }
     }
-    PAIMON_RETURN_NOT_OK(
-        ValidateReaderParameters(prepared_schema, key_schema, value_schema, memory_pool));
+    PAIMON_RETURN_NOT_OK(ValidateTransportSchema(prepared_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<const PreparedReaderPlan> plan,
                            PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
@@ -514,8 +465,8 @@ PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchR
                                                           /*allow_committed_prefix=*/true));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        adapted_readers.push_back(AdaptPreparedBatchReader(std::move(reader), plan, visible_offsets,
-                                                           memory_pool, offset_coverage));
+        adapted_readers.push_back(std::make_unique<PreparedKeyValueReader>(
+            std::move(reader), plan, visible_offsets, memory_pool, offset_coverage));
     }
     remaining_raw_readers_guard.Release();
     return adapted_readers;
@@ -539,9 +490,7 @@ PreparedKeyValueReaderFactory::CreateForCommit(
             return Status::Invalid("PK real-time store returned a null commit reader");
         }
     }
-    PAIMON_RETURN_NOT_OK(
-        ValidateReaderParameters(prepared_schema, key_schema, value_schema, memory_pool));
-    PAIMON_RETURN_NOT_OK(ValidateExactCommitSchema(prepared_schema, value_schema));
+    PAIMON_RETURN_NOT_OK(ValidateTransportSchema(prepared_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<const PreparedReaderPlan> plan,
                            PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
@@ -549,8 +498,8 @@ PreparedKeyValueReaderFactory::CreateForCommit(
                                                           /*allow_committed_prefix=*/false));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        adapted_readers.push_back(AdaptPreparedBatchReader(std::move(reader), plan, std::nullopt,
-                                                           memory_pool, offset_coverage));
+        adapted_readers.push_back(std::make_unique<PreparedKeyValueReader>(
+            std::move(reader), plan, std::nullopt, memory_pool, offset_coverage));
     }
     remaining_raw_readers_guard.Release();
     return adapted_readers;
