@@ -132,6 +132,13 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
         const std::vector<std::shared_ptr<Split>>& disk_splits,
         std::vector<std::unique_ptr<KeyValueRecordReader>>&& additional_readers,
         MergeFileSplitRead* owner) {
+        ScopeGuard additional_readers_guard([&additional_readers]() {
+            for (const std::unique_ptr<KeyValueRecordReader>& reader : additional_readers) {
+                if (reader) {
+                    reader->Close();
+                }
+            }
+        });
         RealtimeReaderBuilder builder(owner);
         std::vector<std::unique_ptr<KeyValueRecordReader>> readers;
         if (!disk_splits.empty()) {
@@ -141,6 +148,7 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
         for (std::unique_ptr<KeyValueRecordReader>& additional_reader : additional_readers) {
             readers.push_back(std::move(additional_reader));
         }
+        additional_readers_guard.Release();
         return builder.CreateMergedReader(std::move(readers));
     }
 
@@ -219,15 +227,32 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
 
     Result<std::unique_ptr<BatchReader>> CreateMergedReader(
         std::vector<std::unique_ptr<KeyValueRecordReader>>&& record_readers) {
+        ScopeGuard record_readers_guard([&record_readers]() {
+            for (const std::unique_ptr<KeyValueRecordReader>& reader : record_readers) {
+                if (reader) {
+                    reader->Close();
+                }
+            }
+        });
         if (record_readers.empty()) {
+            record_readers_guard.Release();
             return std::make_unique<ConcatBatchReader>(std::vector<std::unique_ptr<BatchReader>>{},
                                                        owner_->pool_);
         }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<SortMergeReader> sort_merge_reader,
                                owner_->CreateSortMergeReader(std::move(record_readers)));
-        return owner_->CreateProjectedReader(std::move(sort_merge_reader),
-                                             owner_->context_->GetPredicate(),
-                                             /*complete_row_kind=*/true);
+        record_readers_guard.Release();
+        ScopeGuard sort_merge_reader_guard([&sort_merge_reader]() {
+            if (sort_merge_reader) {
+                sort_merge_reader->Close();
+            }
+        });
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> result,
+                               owner_->CreateProjectedReader(std::move(sort_merge_reader),
+                                                             owner_->context_->GetPredicate(),
+                                                             /*complete_row_kind=*/true));
+        sort_merge_reader_guard.Release();
+        return result;
     }
 
     MergeFileSplitRead* owner_;
@@ -665,8 +690,15 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateProjectedReader(
             std::move(sort_merge_reader), raw_read_schema_, projection_,
             options_.GetReadBatchSize(), thread_number, pool_);
     }
-    PAIMON_ASSIGN_OR_RAISE(projection_reader,
+    ScopeGuard projection_reader_guard([&projection_reader]() {
+        if (projection_reader) {
+            projection_reader->Close();
+        }
+    });
+    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> filtered_reader,
                            ApplyPredicateFilterIfNeeded(std::move(projection_reader), predicate));
+    projection_reader_guard.Release();
+    projection_reader = std::move(filtered_reader);
     if (complete_row_kind) {
         return std::make_unique<CompleteRowKindBatchReader>(std::move(projection_reader), pool_);
     }

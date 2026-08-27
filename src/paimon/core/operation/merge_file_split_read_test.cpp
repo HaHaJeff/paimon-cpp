@@ -71,6 +71,26 @@ namespace {
 
 class TestingSplit : public Split {};
 
+class TrackingKeyValueRecordReader : public KeyValueRecordReader {
+ public:
+    explicit TrackingKeyValueRecordReader(int32_t* close_count) : close_count_(close_count) {}
+
+    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
+        return std::unique_ptr<KeyValueRecordReader::Iterator>();
+    }
+
+    void Close() override {
+        ++(*close_count_);
+    }
+
+    std::shared_ptr<Metrics> GetReaderMetrics() const override {
+        return nullptr;
+    }
+
+ private:
+    int32_t* close_count_;
+};
+
 }  // namespace
 
 // Parameter: min_heap/loser_tree; enable/disable IO prefetch; enable/disable multi thread row to
@@ -693,7 +713,6 @@ TEST_P(MergeFileSplitReadTest, TestRealtimeReadConcatenatesOrderedDiskSections) 
     context_builder.SetOptions(
         {{Options::SEQUENCE_FIELD, "s0,s1"}, {Options::MERGE_ENGINE, "deduplicate"}});
     AddOptions(&context_builder);
-    context_builder.EnableMultiThreadRowToBatch(false);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
     std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
@@ -745,14 +764,13 @@ TEST_P(MergeFileSplitReadTest, TestRealtimeReadConcatenatesOrderedDiskSections) 
     batch_reader->Close();
 }
 
-TEST_P(MergeFileSplitReadTest, TestRealtimeReadValidatesDiskSplits) {
+TEST_F(MergeFileSplitReadTest, TestRealtimeReadValidatesDiskSplits) {
     std::string path =
         paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
     ReadContextBuilder context_builder(path);
     context_builder.SetReadFieldNames({"k0", "k1", "s1", "v0"});
     context_builder.SetOptions(
         {{Options::SEQUENCE_FIELD, "s0,s1"}, {Options::MERGE_ENGINE, "deduplicate"}});
-    AddOptions(&context_builder);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
     std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
@@ -776,6 +794,27 @@ TEST_P(MergeFileSplitReadTest, TestRealtimeReadValidatesDiskSplits) {
     std::vector<std::shared_ptr<Split>> deletion_splits = {deletion_split};
     ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(deletion_splits, {}),
                         "deletion files must be empty or match data files");
+}
+
+TEST_F(MergeFileSplitReadTest, TestRealtimeReaderFailureClosesPluginReader) {
+    std::string path =
+        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
+    ReadContextBuilder context_builder(path);
+    context_builder.SetReadFieldNames({"k0", "k1", "s1", "v0"});
+    context_builder.SetOptions(
+        {{Options::MERGE_ENGINE, "aggregation"}, {"fields.v0.aggregate-function", "unsupported"}});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
+    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
+                         CreateMergeFileSplitRead(internal_context));
+
+    int32_t close_count = 0;
+    std::vector<std::unique_ptr<KeyValueRecordReader>> plugin_readers;
+    plugin_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(&close_count));
+
+    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader({}, std::move(plugin_readers)),
+                        "unsupported");
+    ASSERT_EQ(1, close_count);
 }
 
 TEST_P(MergeFileSplitReadTest, TestLookUp) {

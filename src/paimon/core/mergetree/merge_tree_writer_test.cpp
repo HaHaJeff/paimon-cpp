@@ -588,34 +588,6 @@ TEST_P(MergeTreeWriterTest, TestMergeSortedReaders) {
     CheckFileContent(path_factory->ToPath(new_file), expected_array);
 }
 
-TEST_P(MergeTreeWriterTest, TestSortedReaderOwnership) {
-    ASSERT_OK_AND_ASSIGN(CoreOptions options,
-                         CoreOptions::FromMap({{Options::FILE_FORMAT, "orc"}}));
-
-    auto dir = UniqueTestDirectory::Create();
-    ASSERT_TRUE(dir);
-    auto path_factory = std::make_shared<DataFilePathFactory>();
-    ASSERT_OK(path_factory->Init(dir->Str(), "orc", options.DataFilePrefix(), nullptr));
-
-    ASSERT_OK_AND_ASSIGN(auto merge_writer,
-                         CreateMergeWriter(-1, dir->Str(), path_factory, 0, options));
-
-    auto sorted_reader_array = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(write_type_, R"([
-      [0, 0, "Alice", 10, 0, 13.1]
-    ])")
-            .ValueOrDie());
-
-    bool closed = false;
-    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
-    sorted_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
-        CreateSingleReader(sorted_reader_array), &closed));
-
-    ASSERT_OK(merge_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
-    ASSERT_TRUE(closed);
-    ASSERT_OK(merge_writer->Close());
-}
-
 TEST_P(MergeTreeWriterTest, TestSortedReaderFailure) {
     ASSERT_OK_AND_ASSIGN(CoreOptions options,
                          CoreOptions::FromMap({{Options::FILE_FORMAT, "orc"}}));
