@@ -60,25 +60,33 @@ void CloseReaders(const std::vector<std::unique_ptr<Reader>>& readers) {
 
 class RealtimeOffsetCoverage {
  public:
-    static Result<std::shared_ptr<RealtimeOffsetCoverage>> Create(const OffsetRange& sealed_offsets,
-                                                                  size_t reader_count) {
-        if (sealed_offsets.begin < 0 || sealed_offsets.end < sealed_offsets.begin) {
-            return Status::Invalid("PK real-time store returned an invalid sealed offset range");
+    static Result<std::shared_ptr<RealtimeOffsetCoverage>> Create(const OffsetRange& offsets,
+                                                                  size_t reader_count,
+                                                                  bool allow_committed_prefix) {
+        if (offsets.begin < 0 || offsets.end < offsets.begin) {
+            return Status::Invalid("PK real-time store returned an invalid offset range");
         }
         return std::shared_ptr<RealtimeOffsetCoverage>(
-            new RealtimeOffsetCoverage(sealed_offsets, reader_count));
+            new RealtimeOffsetCoverage(offsets, reader_count, allow_committed_prefix));
     }
 
     Status Add(const arrow::Int64Array& offsets) {
         for (int64_t row = 0; row < offsets.length(); ++row) {
             const int64_t offset = offsets.Value(row);
-            if (offset < sealed_offsets_.begin || offset >= sealed_offsets_.end) {
+            if (allow_committed_prefix_ && offset < 0) {
+                return Status::Invalid("PK real-time store reader offset must be non-negative");
+            }
+            if (allow_committed_prefix_ && offset < offsets_.begin) {
+                continue;
+            }
+            if (offset < offsets_.begin || offset >= offsets_.end) {
                 return Status::Invalid(
-                    "PK real-time store commit reader offset is outside the sealed range");
+                    allow_committed_prefix_
+                        ? "PK real-time store query reader offset is outside the visible range"
+                        : "PK real-time store commit reader offset is outside the sealed range");
             }
             if (!seen_offsets_.CheckedAdd(offset)) {
-                return Status::Invalid(
-                    "PK real-time store commit readers did not cover the sealed range");
+                return CoverageError();
             }
         }
         return Status::OK();
@@ -87,19 +95,29 @@ class RealtimeOffsetCoverage {
     Status FinishReader() {
         ++finished_reader_count_;
         if (finished_reader_count_ == reader_count_ &&
-            seen_offsets_.Cardinality() != sealed_offsets_.Count()) {
-            return Status::Invalid(
-                "PK real-time store commit readers did not cover the sealed range");
+            seen_offsets_.Cardinality() != offsets_.Count()) {
+            return CoverageError();
         }
         return Status::OK();
     }
 
  private:
-    RealtimeOffsetCoverage(const OffsetRange& sealed_offsets, size_t reader_count)
-        : sealed_offsets_(sealed_offsets), reader_count_(reader_count) {}
+    RealtimeOffsetCoverage(const OffsetRange& offsets, size_t reader_count,
+                           bool allow_committed_prefix)
+        : offsets_(offsets),
+          reader_count_(reader_count),
+          allow_committed_prefix_(allow_committed_prefix) {}
 
-    OffsetRange sealed_offsets_;
+    Status CoverageError() const {
+        return Status::Invalid(
+            allow_committed_prefix_
+                ? "PK real-time store query readers did not cover the visible range"
+                : "PK real-time store commit readers did not cover the sealed range");
+    }
+
+    OffsetRange offsets_;
     size_t reader_count_;
+    bool allow_committed_prefix_;
     RoaringBitmap64 seen_offsets_;
     size_t finished_reader_count_ = 0;
 };
@@ -151,6 +169,23 @@ Result<std::vector<int32_t>> ResolveFieldIndexes(
     return result;
 }
 
+Status ValidateReaderParameters(const std::shared_ptr<arrow::Schema>& prepared_schema,
+                                const std::shared_ptr<arrow::Schema>& key_schema,
+                                const std::shared_ptr<arrow::Schema>& value_schema,
+                                const std::shared_ptr<MemoryPool>& memory_pool) {
+    PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
+    if (!key_schema) {
+        return Status::Invalid("prepared key schema cannot be null");
+    }
+    if (!value_schema) {
+        return Status::Invalid("prepared value schema cannot be null");
+    }
+    if (!memory_pool) {
+        return Status::Invalid("prepared reader memory pool cannot be null");
+    }
+    return Status::OK();
+}
+
 Status ValidateExactCommitSchema(const std::shared_ptr<arrow::Schema>& prepared_schema,
                                  const std::shared_ptr<arrow::Schema>& value_schema) {
     if (prepared_schema->num_fields() !=
@@ -171,22 +206,7 @@ class PreparedReaderPlan {
     static Result<std::shared_ptr<const PreparedReaderPlan>> Create(
         const std::shared_ptr<arrow::Schema>& prepared_schema,
         const std::shared_ptr<arrow::Schema>& key_schema,
-        const std::shared_ptr<arrow::Schema>& value_schema,
-        const std::shared_ptr<MemoryPool>& memory_pool, bool exact_commit_schema) {
-        PAIMON_RETURN_NOT_OK(
-            PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
-        if (!key_schema) {
-            return Status::Invalid("prepared key schema cannot be null");
-        }
-        if (!value_schema) {
-            return Status::Invalid("prepared value schema cannot be null");
-        }
-        if (!memory_pool) {
-            return Status::Invalid("prepared reader memory pool cannot be null");
-        }
-        if (exact_commit_schema) {
-            PAIMON_RETURN_NOT_OK(ValidateExactCommitSchema(prepared_schema, value_schema));
-        }
+        const std::shared_ptr<arrow::Schema>& value_schema) {
         std::unordered_map<int32_t, int32_t> field_indexes;
         field_indexes.reserve(prepared_schema->num_fields() -
                               SpecialFields::kPreparedKeyValueValueStartIndex);
@@ -396,6 +416,10 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
                                 row, offsets.length()));
             }
         }
+        if (visible_offsets_.has_value() && selection.Cardinality() != offsets.length()) {
+            return Status::Invalid(
+                "PK real-time store query reader bitmap must cover every raw mutation");
+        }
         if (!visible_offsets_.has_value()) {
             selected_rows_.reserve(offsets.length());
             for (int64_t row = 0; row < offsets.length(); ++row) {
@@ -467,50 +491,16 @@ Status PreparedKeyValueReaderFactory::ValidateTransportSchema(
 
 namespace {
 
-Result<std::unique_ptr<KeyValueRecordReader>> AdaptPreparedBatchReaderImpl(
+std::unique_ptr<KeyValueRecordReader> AdaptPreparedBatchReader(
     std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<const PreparedReaderPlan>& plan,
     const std::optional<OffsetRange>& visible_offsets,
     const std::shared_ptr<MemoryPool>& memory_pool,
     const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage) {
-    std::unique_ptr<BatchReader> owned_reader = std::move(reader);
-    if (!owned_reader) {
-        return Status::Invalid("prepared batch reader cannot be null");
-    }
-    ScopeGuard close_guard([&owned_reader]() -> void { owned_reader->Close(); });
-    std::unique_ptr<KeyValueRecordReader> result = std::make_unique<PreparedKeyValueReader>(
-        std::move(owned_reader), plan, visible_offsets, memory_pool, offset_coverage);
-    close_guard.Release();
-    return result;
+    return std::make_unique<PreparedKeyValueReader>(std::move(reader), plan, visible_offsets,
+                                                    memory_pool, offset_coverage);
 }
 
 }  // namespace
-
-Result<std::unique_ptr<KeyValueRecordReader>> PreparedKeyValueReaderFactory::Create(
-    std::unique_ptr<BatchReader>&& reader, const std::shared_ptr<arrow::Schema>& prepared_schema,
-    const std::optional<OffsetRange>& visible_offsets,
-    const std::shared_ptr<arrow::Schema>& key_schema,
-    const std::shared_ptr<arrow::Schema>& value_schema,
-    const std::shared_ptr<MemoryPool>& memory_pool) {
-    std::unique_ptr<BatchReader> owned_reader = std::move(reader);
-    ScopeGuard reader_guard([&owned_reader]() {
-        if (owned_reader) {
-            owned_reader->Close();
-        }
-    });
-    if (visible_offsets.has_value() && visible_offsets->begin > visible_offsets->end) {
-        return Status::Invalid("prepared visible offset range begin exceeds end");
-    }
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<const PreparedReaderPlan> plan,
-        PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema, memory_pool,
-                                   /*exact_commit_schema=*/!visible_offsets.has_value()));
-    PAIMON_ASSIGN_OR_RAISE(
-        std::unique_ptr<KeyValueRecordReader> result,
-        AdaptPreparedBatchReaderImpl(std::move(owned_reader), plan, visible_offsets, memory_pool,
-                                     /*offset_coverage=*/nullptr));
-    reader_guard.Release();
-    return result;
-}
 
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
 PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchReader>>&& readers,
@@ -520,31 +510,32 @@ PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchR
                                               const std::shared_ptr<arrow::Schema>& value_schema,
                                               const std::shared_ptr<MemoryPool>& memory_pool) {
     std::vector<std::unique_ptr<KeyValueRecordReader>> adapted_readers;
-    ScopeGuard readers_guard([&readers, &adapted_readers]() {
-        CloseReaders(readers);
-        CloseReaders(adapted_readers);
-    });
+    ScopeGuard remaining_raw_readers_guard([&readers]() { CloseReaders(readers); });
     if (visible_offsets.begin > visible_offsets.end) {
         return Status::Invalid("prepared visible offset range begin exceeds end");
+    }
+    if (readers.empty() && visible_offsets.begin < visible_offsets.end) {
+        return Status::Invalid(
+            "PK real-time store returned no query readers for a non-empty visible range");
     }
     for (const std::unique_ptr<BatchReader>& reader : readers) {
         if (!reader) {
             return Status::Invalid("PK real-time store returned a null query reader");
         }
     }
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<const PreparedReaderPlan> plan,
-        PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema, memory_pool,
-                                   /*exact_commit_schema=*/false));
+    PAIMON_RETURN_NOT_OK(
+        ValidateReaderParameters(prepared_schema, key_schema, value_schema, memory_pool));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<const PreparedReaderPlan> plan,
+                           PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
+                           RealtimeOffsetCoverage::Create(visible_offsets, readers.size(),
+                                                          /*allow_committed_prefix=*/true));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        PAIMON_ASSIGN_OR_RAISE(
-            std::unique_ptr<KeyValueRecordReader> adapted_reader,
-            AdaptPreparedBatchReaderImpl(std::move(reader), plan, visible_offsets, memory_pool,
-                                         /*offset_coverage=*/nullptr));
-        adapted_readers.push_back(std::move(adapted_reader));
+        adapted_readers.push_back(AdaptPreparedBatchReader(std::move(reader), plan, visible_offsets,
+                                                           memory_pool, offset_coverage));
     }
-    readers_guard.Release();
+    remaining_raw_readers_guard.Release();
     return adapted_readers;
 }
 
@@ -556,29 +547,30 @@ PreparedKeyValueReaderFactory::CreateForCommit(
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<MemoryPool>& memory_pool) {
     std::vector<std::unique_ptr<KeyValueRecordReader>> adapted_readers;
-    ScopeGuard readers_guard([&readers, &adapted_readers]() {
-        CloseReaders(readers);
-        CloseReaders(adapted_readers);
-    });
+    ScopeGuard remaining_raw_readers_guard([&readers]() { CloseReaders(readers); });
+    if (readers.empty()) {
+        return Status::Invalid(
+            "PK real-time store returned no commit readers for a sealed segment");
+    }
     for (const std::unique_ptr<BatchReader>& reader : readers) {
         if (!reader) {
             return Status::Invalid("PK real-time store returned a null commit reader");
         }
     }
-    PAIMON_ASSIGN_OR_RAISE(
-        std::shared_ptr<const PreparedReaderPlan> plan,
-        PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema, memory_pool,
-                                   /*exact_commit_schema=*/true));
+    PAIMON_RETURN_NOT_OK(
+        ValidateReaderParameters(prepared_schema, key_schema, value_schema, memory_pool));
+    PAIMON_RETURN_NOT_OK(ValidateExactCommitSchema(prepared_schema, value_schema));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<const PreparedReaderPlan> plan,
+                           PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
-                           RealtimeOffsetCoverage::Create(sealed_offsets, readers.size()));
+                           RealtimeOffsetCoverage::Create(sealed_offsets, readers.size(),
+                                                          /*allow_committed_prefix=*/false));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<KeyValueRecordReader> adapted_reader,
-                               AdaptPreparedBatchReaderImpl(std::move(reader), plan, std::nullopt,
-                                                            memory_pool, offset_coverage));
-        adapted_readers.push_back(std::move(adapted_reader));
+        adapted_readers.push_back(AdaptPreparedBatchReader(std::move(reader), plan, std::nullopt,
+                                                           memory_pool, offset_coverage));
     }
-    readers_guard.Release();
+    remaining_raw_readers_guard.Release();
     return adapted_readers;
 }
 

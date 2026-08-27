@@ -18,9 +18,7 @@
 
 #pragma once
 
-#include <cstdint>
 #include <memory>
-#include <optional>
 #include <vector>
 
 #include "arrow/type_fwd.h"
@@ -38,14 +36,6 @@ class PreparedKeyValueReaderFactory {
     ~PreparedKeyValueReaderFactory() = delete;
 
     static Status ValidateTransportSchema(const std::shared_ptr<arrow::Schema>& prepared_schema);
-
-    static Result<std::unique_ptr<KeyValueRecordReader>> Create(
-        std::unique_ptr<BatchReader>&& reader,
-        const std::shared_ptr<arrow::Schema>& prepared_schema,
-        const std::optional<OffsetRange>& visible_offsets,
-        const std::shared_ptr<arrow::Schema>& key_schema,
-        const std::shared_ptr<arrow::Schema>& value_schema,
-        const std::shared_ptr<MemoryPool>& memory_pool);
 
     static Result<std::vector<std::unique_ptr<KeyValueRecordReader>>> CreateForQuery(
         std::vector<std::unique_ptr<BatchReader>>&& readers,

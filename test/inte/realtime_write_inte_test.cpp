@@ -540,21 +540,20 @@ class FailAfterPhysicalFileRealtimeStore final : public DelegatingRealtimeStore 
     std::shared_ptr<std::atomic<bool>> saw_artifacts_;
 };
 
-enum class CommitReaderMalformation { DROP_LAST, DUPLICATE_OFFSET, OUT_OF_RANGE_OFFSET };
+enum class ReaderMalformation { DROP_LAST, DUPLICATE_OFFSET, OUT_OF_RANGE_OFFSET };
 
 class CorruptingBatchReader final : public BatchReader {
  public:
-    CorruptingBatchReader(std::unique_ptr<BatchReader> delegate,
-                          CommitReaderMalformation malformation)
+    CorruptingBatchReader(std::unique_ptr<BatchReader> delegate, ReaderMalformation malformation)
         : delegate_(std::move(delegate)), malformation_(malformation) {}
 
     Result<ReadBatch> NextBatch() override {
         switch (malformation_) {
-            case CommitReaderMalformation::DROP_LAST:
+            case ReaderMalformation::DROP_LAST:
                 return DropLast();
-            case CommitReaderMalformation::DUPLICATE_OFFSET:
+            case ReaderMalformation::DUPLICATE_OFFSET:
                 return SubstituteOffset(/*offset=*/0);
-            case CommitReaderMalformation::OUT_OF_RANGE_OFFSET:
+            case ReaderMalformation::OUT_OF_RANGE_OFFSET:
                 return SubstituteOffset(/*offset=*/-1);
         }
         return Status::Invalid("unknown commit reader malformation");
@@ -624,14 +623,14 @@ class CorruptingBatchReader final : public BatchReader {
     }
 
     std::unique_ptr<BatchReader> delegate_;
-    CommitReaderMalformation malformation_;
+    ReaderMalformation malformation_;
     std::optional<ReadBatch> buffered_;
 };
 
 class MalformedCoverageRealtimeStore final : public DelegatingRealtimeStore {
  public:
     MalformedCoverageRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
-                                   CommitReaderMalformation malformation)
+                                   ReaderMalformation malformation)
         : DelegatingRealtimeStore(delegate), malformation_(malformation) {}
 
     Result<std::vector<std::unique_ptr<BatchReader>>> CreateCommitReaders(
@@ -645,7 +644,26 @@ class MalformedCoverageRealtimeStore final : public DelegatingRealtimeStore {
     }
 
  private:
-    CommitReaderMalformation malformation_;
+    ReaderMalformation malformation_;
+};
+
+class MissingQueryOffsetRealtimeStore final : public DelegatingRealtimeStore {
+ public:
+    explicit MissingQueryOffsetRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate)
+        : DelegatingRealtimeStore(delegate) {}
+
+    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
+        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
+        const RealtimeQueryContext& context) override {
+        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
+                               delegate_->CreateQueryReaders(view, offset_begin, context));
+        if (readers.empty()) {
+            return Status::Invalid("query offset drop requires a reader");
+        }
+        readers[0] = std::make_unique<CorruptingBatchReader>(std::move(readers[0]),
+                                                             ReaderMalformation::DROP_LAST);
+        return readers;
+    }
 };
 
 }  // namespace
@@ -1447,8 +1465,8 @@ class RealtimeWriteInteTest : public ::testing::Test {
         ASSERT_OK(writer->Close());
     }
 
-    void CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation malformation,
-                                                const std::string& expected_error) {
+    void CheckPkRejectsReaderMalformation(ReaderMalformation malformation,
+                                          const std::string& expected_error) {
         CreatePkTable();
         auto factory = MakeDecoratingFactory<MalformedCoverageRealtimeStore>(malformation);
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
@@ -2385,18 +2403,34 @@ TEST_F(RealtimeWriteInteTest, TestPkMultipleStoredBatchesMergeForQueryAndCommit)
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsMalformedCoverage) {
-    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::DROP_LAST,
-                                           "commit readers did not cover the sealed range");
+    CheckPkRejectsReaderMalformation(ReaderMalformation::DROP_LAST,
+                                     "commit readers did not cover the sealed range");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsDuplicateOffset) {
-    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::DUPLICATE_OFFSET,
-                                           "commit readers did not cover the sealed range");
+    CheckPkRejectsReaderMalformation(ReaderMalformation::DUPLICATE_OFFSET,
+                                     "commit readers did not cover the sealed range");
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkRejectsOutOfRangeOffset) {
-    CheckPkRejectsCommitReaderMalformation(CommitReaderMalformation::OUT_OF_RANGE_OFFSET,
-                                           "offset is outside the sealed range");
+    CheckPkRejectsReaderMalformation(ReaderMalformation::OUT_OF_RANGE_OFFSET,
+                                     "offset is outside the sealed range");
+}
+
+TEST_F(RealtimeWriteInteTest, TestPkRejectsMissingQueryOffset) {
+    CreatePkTable();
+    auto factory = MakeDecoratingFactory<MissingQueryOffsetRealtimeStore>();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
+                         RealtimeContext::Create(factory));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
+                         CreateRealtimeWriter(realtime_context));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         MakeBatch({Row{1, "one", "p0"}, Row{2, "two", "p0"}},
+                                   /*partitioned=*/false));
+    ASSERT_OK(writer->Write(std::move(batch)));
+    ASSERT_NOK_WITH_MSG(ReadRows(realtime_context),
+                        "query readers did not cover the visible range");
+    ASSERT_OK(writer->Close());
 }
 
 TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
