@@ -67,7 +67,6 @@ class MergedKeyValueRecordReader : public KeyValueRecordReader {
 
  private:
     bool visited_ = false;
-    std::optional<Status> initialization_error_;
     std::unique_ptr<KeyValueRecordReader> reader_;
     std::shared_ptr<FieldsComparator> key_comparator_;
     std::shared_ptr<MergeFunctionWrapper<KeyValue>> merge_function_wrapper_;

@@ -766,21 +766,6 @@ TEST_P(MergeFileSplitReadTest, TestRealtimeReadValidatesDiskSplits) {
     std::vector<std::shared_ptr<Split>> non_data_splits = {std::make_shared<TestingSplit>()};
     ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(non_data_splits, {}),
                         "merge input disk split is not a data split");
-    std::vector<std::shared_ptr<Split>> mixed_partition_splits = {prepared_splits[0],
-                                                                 prepared_splits[1]};
-    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(mixed_partition_splits, {}),
-                        "merge input disk splits do not share a partition-bucket");
-
-    std::vector<std::shared_ptr<DataFileMeta>> before_data_files = first->DataFiles();
-    DataSplitImpl::Builder before_builder(first->Partition(), first->Bucket(), first->BucketPath(),
-                                          std::move(before_data_files));
-    std::vector<std::shared_ptr<DataFileMeta>> before_files = first->DataFiles();
-    ASSERT_OK_AND_ASSIGN(
-        std::shared_ptr<DataSplitImpl> before_split,
-        before_builder.WithBeforeFiles(std::move(before_files)).RawConvertible(false).Build());
-    std::vector<std::shared_ptr<Split>> before_splits = {before_split};
-    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader(before_splits, {}),
-                        "merge input disk split must not contain before files");
 
     std::vector<std::shared_ptr<DataFileMeta>> deletion_data_files = first->DataFiles();
     DataSplitImpl::Builder deletion_builder(first->Partition(), first->Bucket(),

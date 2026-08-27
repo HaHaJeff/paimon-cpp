@@ -117,21 +117,13 @@ Status MergedKeyValueRecordReader::Iterator::LoadNextRawKeyValue() const {
 }
 
 Result<std::unique_ptr<KeyValueRecordReader::Iterator>> MergedKeyValueRecordReader::NextBatch() {
-    if (initialization_error_.has_value()) {
-        return initialization_error_.value();
-    }
     if (visited_) {
         return std::unique_ptr<KeyValueRecordReader::Iterator>();
     }
+    visited_ = true;
 
     auto iterator = std::make_unique<Iterator>(this);
-    Result<bool> has_next_result = iterator->HasNext();
-    if (!has_next_result.ok()) {
-        initialization_error_ = has_next_result.status();
-        return initialization_error_.value();
-    }
-    bool has_next = std::move(has_next_result).value();
-    visited_ = true;
+    PAIMON_ASSIGN_OR_RAISE(bool has_next, iterator->HasNext());
     if (!has_next) {
         return std::unique_ptr<KeyValueRecordReader::Iterator>();
     }

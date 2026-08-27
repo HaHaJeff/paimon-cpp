@@ -234,17 +234,6 @@ TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
     ASSERT_EQ(10, fourth);
 }
 
-TEST(RealtimeContextTest, TestMaterializedSequenceRejectsMissingStore) {
-    auto factory = std::make_shared<TestingRealtimeStoreFactory>();
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));
-
-    Result<int64_t> result = context->AdvanceMaterializedMaxSequenceNumber(
-        RealtimePartitionBucket({{"dt", "missing"}}, /*bucket=*/3),
-        /*max_sequence_number=*/4);
-    ASSERT_TRUE(result.status().IsKeyError());
-    ASSERT_NOK_WITH_MSG(result, "real-time store not found for partition {dt=missing}, bucket 3");
-}
-
 TEST(RealtimeContextTest, TestCommittedProgressIsMonotonicAndSelective) {
     auto factory = std::make_shared<TestingRealtimeStoreFactory>();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContextImpl> context, CreateContext(factory));

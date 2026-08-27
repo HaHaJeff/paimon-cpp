@@ -264,10 +264,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
           pool_(pool),
           offset_coverage_(offset_coverage) {}
 
-    ~PreparedKeyValueReader() override {
-        Close();
-    }
-
     class Iterator final : public KeyValueRecordReader::Iterator {
      public:
         explicit Iterator(PreparedKeyValueReader* reader) : reader_(reader) {}
@@ -298,15 +294,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     };
 
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
-        if (first_error_.has_value()) {
-            return first_error_.value();
-        }
-        Result<std::unique_ptr<KeyValueRecordReader::Iterator>> result = NextBatchImpl();
-        if (!result.ok()) {
-            first_error_ = result.status();
-            Close();
-        }
-        return result;
+        return NextBatchImpl();
     }
 
     std::shared_ptr<Metrics> GetReaderMetrics() const override {
@@ -314,10 +302,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     }
 
     void Close() override {
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
         ResetBatchState();
         reader_->Close();
     }
@@ -454,8 +438,6 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     }
 
  private:
-    bool closed_ = false;
-    std::optional<Status> first_error_;
     std::unique_ptr<BatchReader> reader_;
     std::shared_ptr<const PreparedReaderPlan> plan_;
     std::optional<OffsetRange> visible_offsets_;

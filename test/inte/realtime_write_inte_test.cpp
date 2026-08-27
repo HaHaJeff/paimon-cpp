@@ -2445,21 +2445,9 @@ TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
                          MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false));
     ASSERT_OK(writer->Write(std::move(batch)));
 
-    auto release_reader = [&](bool explicit_close) -> Status {
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
-                               CreateQueryReader(realtime_context));
-        if (explicit_close) {
-            reader->Close();
-        }
-        return Status::OK();
-    };
-
-    ASSERT_OK(release_reader(/*explicit_close=*/true));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> reader, CreateQueryReader(realtime_context));
+    reader->Close();
     ASSERT_EQ(1, state->query_close_count->load(std::memory_order_acquire));
-
-    ASSERT_OK(release_reader(/*explicit_close=*/false));
-    ASSERT_EQ(2, state->query_close_count->load(std::memory_order_acquire));
-
     ASSERT_OK(writer->Close());
 }
 

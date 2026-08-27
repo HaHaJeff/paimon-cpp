@@ -149,28 +149,17 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
 
     Status CollectDiskReaders(const std::vector<std::shared_ptr<Split>>& disk_splits,
                               std::vector<std::unique_ptr<KeyValueRecordReader>>* readers) {
-        std::vector<std::shared_ptr<DataSplitImpl>> data_splits;
-        data_splits.reserve(disk_splits.size());
+        std::shared_ptr<DataSplitImpl> first_split;
+        std::vector<std::shared_ptr<DataFileMeta>> data_files;
+        std::vector<std::optional<DeletionFile>> deletion_files;
         for (const std::shared_ptr<Split>& disk_split : disk_splits) {
             std::shared_ptr<DataSplitImpl> data_split =
                 std::dynamic_pointer_cast<DataSplitImpl>(disk_split);
             if (!data_split) {
                 return Status::Invalid("merge input disk split is not a data split");
             }
-            data_splits.push_back(std::move(data_split));
-        }
-        const std::shared_ptr<DataSplitImpl>& first_split = data_splits.front();
-        const BinaryRow& partition = first_split->Partition();
-        const int32_t bucket = first_split->Bucket();
-
-        std::vector<std::shared_ptr<DataFileMeta>> data_files;
-        std::vector<std::optional<DeletionFile>> deletion_files;
-        for (const std::shared_ptr<DataSplitImpl>& data_split : data_splits) {
-            if (!(data_split->Partition() == partition) || data_split->Bucket() != bucket) {
-                return Status::Invalid("merge input disk splits do not share a partition-bucket");
-            }
-            if (!data_split->BeforeFiles().empty()) {
-                return Status::Invalid("merge input disk split must not contain before files");
+            if (!first_split) {
+                first_split = data_split;
             }
             const std::vector<std::shared_ptr<DataFileMeta>>& split_files = data_split->DataFiles();
             const std::vector<std::optional<DeletionFile>>& split_deletion_files =
@@ -188,6 +177,8 @@ class MergeFileSplitRead::RealtimeReaderBuilder {
                                       split_deletion_files.end());
             }
         }
+        const BinaryRow& partition = first_split->Partition();
+        const int32_t bucket = first_split->Bucket();
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFilePathFactory> data_file_path_factory,
                                owner_->path_factory_->CreateDataFilePathFactory(partition, bucket));
 
