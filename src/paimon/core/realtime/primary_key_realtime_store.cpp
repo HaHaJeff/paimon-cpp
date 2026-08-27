@@ -33,7 +33,6 @@
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/scope_guard.h"
-#include "paimon/core/realtime/prepared_key_value_reader.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/macros.h"
 #include "paimon/memory/memory_pool.h"
@@ -138,9 +137,9 @@ class StoredBatchReader final : public BatchReader {
 
 class PrimaryKeyRealtimeStore::Impl {
  public:
-    Impl(std::shared_ptr<arrow::Schema> prepared_schema,
+    Impl(std::shared_ptr<arrow::Schema> transport_schema,
          std::shared_ptr<arrow::MemoryPool> arrow_pool)
-        : prepared_schema_(std::move(prepared_schema)), arrow_pool_(std::move(arrow_pool)) {}
+        : transport_schema_(std::move(transport_schema)), arrow_pool_(std::move(arrow_pool)) {}
 
     Status Write(RealtimeWriteBatch&& write_batch) {
         if (!write_batch.batch || !write_batch.batch->GetData()) {
@@ -154,15 +153,15 @@ class PrimaryKeyRealtimeStore::Impl {
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
             std::shared_ptr<arrow::Array> array,
             arrow::ImportArray(write_batch.batch->GetData(),
-                               arrow::struct_(prepared_schema_->fields())));
+                               arrow::struct_(transport_schema_->fields())));
         if (!array || array->type_id() != arrow::Type::STRUCT) {
-            return Status::Invalid("PK real-time prepared batch is not a StructArray");
+            return Status::Invalid("PK real-time transport batch is not a StructArray");
         }
-        std::shared_ptr<arrow::StructArray> prepared =
+        std::shared_ptr<arrow::StructArray> transport =
             checked_pointer_cast<arrow::StructArray>(array);
         std::lock_guard<std::mutex> lock(mutex_);
-        building_.push_back(StoredBatch{prepared, write_batch.offset_range,
-                                        ArrowUtils::GetArrayMemoryUsage(prepared->data())});
+        building_.push_back(StoredBatch{transport, write_batch.offset_range,
+                                        ArrowUtils::GetArrayMemoryUsage(transport->data())});
         building_memory_usage_ += building_.back().memory_usage;
         return Status::OK();
     }
@@ -218,7 +217,6 @@ class PrimaryKeyRealtimeStore::Impl {
         }
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> read_schema,
                                           arrow::ImportSchema(context.read_schema));
-        PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(read_schema));
         std::vector<std::unique_ptr<BatchReader>> readers;
         for (const std::shared_ptr<Segment>& segment : typed->Segments()) {
             for (const StoredBatch& batch : segment->Batches()) {
@@ -260,7 +258,7 @@ class PrimaryKeyRealtimeStore::Impl {
     }
 
  private:
-    std::shared_ptr<arrow::Schema> prepared_schema_;
+    std::shared_ptr<arrow::Schema> transport_schema_;
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
     mutable std::mutex mutex_;
     std::vector<StoredBatch> building_;
@@ -273,15 +271,14 @@ PrimaryKeyRealtimeStore::PrimaryKeyRealtimeStore(std::unique_ptr<Impl>&& impl)
 PrimaryKeyRealtimeStore::~PrimaryKeyRealtimeStore() = default;
 
 Result<std::shared_ptr<PrimaryKeyRealtimeStore>> PrimaryKeyRealtimeStore::Create(
-    const std::shared_ptr<arrow::Schema>& prepared_schema,
+    const std::shared_ptr<arrow::Schema>& transport_schema,
     const std::shared_ptr<MemoryPool>& memory_pool) {
-    PAIMON_RETURN_NOT_OK(PreparedKeyValueReaderFactory::ValidateTransportSchema(prepared_schema));
     if (!memory_pool) {
         return Status::Invalid("PK real-time store memory pool is null");
     }
     std::shared_ptr<arrow::MemoryPool> arrow_pool = GetArrowPool(memory_pool);
     return std::shared_ptr<PrimaryKeyRealtimeStore>(new PrimaryKeyRealtimeStore(
-        std::make_unique<Impl>(prepared_schema, std::move(arrow_pool))));
+        std::make_unique<Impl>(transport_schema, std::move(arrow_pool))));
 }
 Status PrimaryKeyRealtimeStore::Write(RealtimeWriteBatch&& batch) {
     return impl_->Write(std::move(batch));

@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include "paimon/core/realtime/prepared_key_value_reader.h"
+#include "paimon/core/realtime/realtime_primary_key_reader.h"
 
 #include <cstdint>
 #include <memory>
@@ -122,19 +122,20 @@ class RealtimeOffsetCoverage {
     size_t finished_reader_count_ = 0;
 };
 
-Status CheckPreparedField(const std::shared_ptr<arrow::Schema>& schema, int32_t field_idx,
-                          const DataField& expected_field) {
+Status CheckTransportField(const std::shared_ptr<arrow::Schema>& schema, int32_t field_idx,
+                           const DataField& expected_field) {
     if (schema->num_fields() <= field_idx) {
-        return Status::Invalid(fmt::format("prepared schema missing transport field {} at index {}",
-                                           expected_field.Name(), field_idx));
+        return Status::Invalid(
+            fmt::format("realtime primary-key transport schema is missing field {} at index {}",
+                        expected_field.Name(), field_idx));
     }
     const std::shared_ptr<arrow::Field>& field = schema->field(field_idx);
     PAIMON_ASSIGN_OR_RAISE(int32_t field_id, NestedProjectionUtils::GetPaimonFieldId(field));
     if (field->name() != expected_field.Name() || !field->type()->Equals(*expected_field.Type()) ||
         field->nullable() || field_id != expected_field.Id()) {
         return Status::Invalid(fmt::format(
-            "prepared schema field {} must be non-null {}:{} with field id {}, got {}:{} "
-            "nullable={} field id {}",
+            "realtime primary-key transport schema field {} must be non-null {}:{} with field id "
+            "{}, got {}:{} nullable={} field id {}",
             field_idx, expected_field.Name(), expected_field.Type()->ToString(),
             expected_field.Id(), field->name(), field->type()->ToString(), field->nullable(),
             field_id));
@@ -143,7 +144,7 @@ Status CheckPreparedField(const std::shared_ptr<arrow::Schema>& schema, int32_t 
 }
 
 Result<std::vector<int32_t>> ResolveFieldIndexes(
-    const std::shared_ptr<arrow::Schema>& prepared_schema,
+    const std::shared_ptr<arrow::Schema>& transport_schema,
     const std::unordered_map<int32_t, int32_t>& field_indexes,
     const std::shared_ptr<arrow::Schema>& row_schema) {
     std::vector<int32_t> result;
@@ -153,50 +154,49 @@ Result<std::vector<int32_t>> ResolveFieldIndexes(
                                NestedProjectionUtils::GetPaimonFieldId(row_field));
         auto field_index = field_indexes.find(field_id);
         if (field_index == field_indexes.end()) {
-            return Status::Invalid(
-                fmt::format("cannot find field id {} in prepared schema", field_id));
-        }
-        const std::shared_ptr<arrow::Field>& prepared_field =
-            prepared_schema->field(field_index->second);
-        if (!prepared_field->type()->Equals(row_field->type())) {
             return Status::Invalid(fmt::format(
-                "prepared field id {} type {} does not match row "
-                "type {}",
-                field_id, prepared_field->type()->ToString(), row_field->type()->ToString()));
+                "cannot find field id {} in realtime primary-key transport schema", field_id));
+        }
+        const std::shared_ptr<arrow::Field>& transport_field =
+            transport_schema->field(field_index->second);
+        if (!transport_field->type()->Equals(row_field->type())) {
+            return Status::Invalid(fmt::format(
+                "realtime primary-key transport field id {} type {} does not match row type {}",
+                field_id, transport_field->type()->ToString(), row_field->type()->ToString()));
         }
         result.push_back(field_index->second);
     }
     return result;
 }
 
-class PreparedReaderPlan {
+class RealtimePrimaryKeyReaderPlan {
  public:
-    static Result<std::shared_ptr<const PreparedReaderPlan>> Create(
-        const std::shared_ptr<arrow::Schema>& prepared_schema,
+    static Result<std::shared_ptr<const RealtimePrimaryKeyReaderPlan>> Create(
+        const std::shared_ptr<arrow::Schema>& transport_schema,
         const std::shared_ptr<arrow::Schema>& key_schema,
         const std::shared_ptr<arrow::Schema>& value_schema) {
         std::unordered_map<int32_t, int32_t> field_indexes;
-        field_indexes.reserve(prepared_schema->num_fields() -
-                              SpecialFields::kPreparedKeyValueValueStartIndex);
-        for (int32_t i = SpecialFields::kPreparedKeyValueValueStartIndex;
-             i < prepared_schema->num_fields(); ++i) {
+        field_indexes.reserve(transport_schema->num_fields() -
+                              RealtimePrimaryKeyLayout::kValueStartIndex);
+        for (int32_t i = RealtimePrimaryKeyLayout::kValueStartIndex;
+             i < transport_schema->num_fields(); ++i) {
             PAIMON_ASSIGN_OR_RAISE(int32_t field_id, NestedProjectionUtils::GetPaimonFieldId(
-                                                         prepared_schema->field(i)));
+                                                         transport_schema->field(i)));
             if (!field_indexes.emplace(field_id, i).second) {
-                return Status::Invalid(
-                    fmt::format("duplicate field id {} in prepared schema", field_id));
+                return Status::Invalid(fmt::format(
+                    "duplicate field id {} in realtime primary-key transport schema", field_id));
             }
         }
         PAIMON_ASSIGN_OR_RAISE(std::vector<int32_t> key_field_indexes,
-                               ResolveFieldIndexes(prepared_schema, field_indexes, key_schema));
+                               ResolveFieldIndexes(transport_schema, field_indexes, key_schema));
         PAIMON_ASSIGN_OR_RAISE(std::vector<int32_t> value_field_indexes,
-                               ResolveFieldIndexes(prepared_schema, field_indexes, value_schema));
-        return std::shared_ptr<const PreparedReaderPlan>(new PreparedReaderPlan(
-            prepared_schema, std::move(key_field_indexes), std::move(value_field_indexes)));
+                               ResolveFieldIndexes(transport_schema, field_indexes, value_schema));
+        return std::shared_ptr<const RealtimePrimaryKeyReaderPlan>(new RealtimePrimaryKeyReaderPlan(
+            transport_schema, std::move(key_field_indexes), std::move(value_field_indexes)));
     }
 
-    const std::shared_ptr<arrow::Schema>& PreparedSchema() const {
-        return prepared_schema_;
+    const std::shared_ptr<arrow::Schema>& TransportSchema() const {
+        return transport_schema_;
     }
 
     const std::vector<int32_t>& KeyFieldIndexes() const {
@@ -208,24 +208,25 @@ class PreparedReaderPlan {
     }
 
  private:
-    PreparedReaderPlan(const std::shared_ptr<arrow::Schema>& schema,
-                       std::vector<int32_t>&& key_indexes, std::vector<int32_t>&& value_indexes)
-        : prepared_schema_(schema),
+    RealtimePrimaryKeyReaderPlan(const std::shared_ptr<arrow::Schema>& schema,
+                                 std::vector<int32_t>&& key_indexes,
+                                 std::vector<int32_t>&& value_indexes)
+        : transport_schema_(schema),
           key_field_indexes_(std::move(key_indexes)),
           value_field_indexes_(std::move(value_indexes)) {}
 
-    const std::shared_ptr<arrow::Schema> prepared_schema_;
+    const std::shared_ptr<arrow::Schema> transport_schema_;
     const std::vector<int32_t> key_field_indexes_;
     const std::vector<int32_t> value_field_indexes_;
 };
 
-class PreparedKeyValueReader final : public KeyValueRecordReader {
+class RealtimePrimaryKeyReader final : public KeyValueRecordReader {
  public:
-    PreparedKeyValueReader(std::unique_ptr<BatchReader>&& reader,
-                           const std::shared_ptr<const PreparedReaderPlan>& plan,
-                           const std::optional<OffsetRange>& visible_offsets,
-                           const std::shared_ptr<MemoryPool>& pool,
-                           const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage)
+    RealtimePrimaryKeyReader(std::unique_ptr<BatchReader>&& reader,
+                             const std::shared_ptr<const RealtimePrimaryKeyReaderPlan>& plan,
+                             const std::optional<OffsetRange>& visible_offsets,
+                             const std::shared_ptr<MemoryPool>& pool,
+                             const std::shared_ptr<RealtimeOffsetCoverage>& offset_coverage)
         : reader_(std::move(reader)),
           plan_(plan),
           visible_offsets_(visible_offsets),
@@ -234,7 +235,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
     class Iterator final : public KeyValueRecordReader::Iterator {
      public:
-        explicit Iterator(PreparedKeyValueReader* reader) : reader_(reader) {}
+        explicit Iterator(RealtimePrimaryKeyReader* reader) : reader_(reader) {}
 
         Result<bool> HasNext() const override {
             return cursor_ < reader_->RowCount();
@@ -242,7 +243,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
         Result<KeyValue> Next() override {
             if (cursor_ >= reader_->RowCount()) {
-                return Status::Invalid("No more prepared key values in current iterator");
+                return Status::Invalid("No more realtime primary-key values in current iterator");
             }
             const int64_t row = reader_->RowAt(cursor_);
             std::shared_ptr<InternalRow> key =
@@ -257,7 +258,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         }
 
      private:
-        PreparedKeyValueReader* reader_;
+        RealtimePrimaryKeyReader* reader_;
         int64_t cursor_ = 0;
     };
 
@@ -278,13 +279,8 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
     Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatchImpl() {
         while (true) {
             ResetBatchState();
-            BatchReader::ReadBatchWithBitmap batch_with_bitmap;
-            if (visible_offsets_.has_value()) {
-                PAIMON_ASSIGN_OR_RAISE(batch_with_bitmap, reader_->NextBatchWithBitmap());
-            } else {
-                PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatch batch, reader_->NextBatch());
-                batch_with_bitmap.first = std::move(batch);
-            }
+            PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatchWithBitmap batch_with_bitmap,
+                                   reader_->NextBatchWithBitmap());
             if (BatchReader::IsEofBatch(batch_with_bitmap)) {
                 if (offset_coverage_ && !offset_coverage_finished_) {
                     offset_coverage_finished_ = true;
@@ -297,23 +293,24 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
             PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> arrow_array,
                                               arrow::ImportArray(c_array.get(), c_schema.get()));
             if (!arrow_array || arrow_array->type_id() != arrow::Type::STRUCT) {
-                return Status::Invalid("cannot cast prepared batch to StructArray");
+                return Status::Invalid(
+                    "cannot cast realtime primary-key transport batch to StructArray");
             }
             std::shared_ptr<arrow::StructArray> data_batch =
                 checked_pointer_cast<arrow::StructArray>(arrow_array);
-            PAIMON_RETURN_NOT_OK(ValidatePreparedBatch(data_batch));
+            PAIMON_RETURN_NOT_OK(ValidateTransportBatch(data_batch));
 
             std::shared_ptr<arrow::NumericArray<arrow::Int64Type>> offset_array =
                 checked_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
-                    data_batch->field(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex));
+                    data_batch->field(RealtimePrimaryKeyLayout::kRealtimeOffsetIndex));
             if (offset_coverage_) {
                 PAIMON_RETURN_NOT_OK(offset_coverage_->Add(*offset_array));
             }
 
             row_kind_array_ = checked_pointer_cast<arrow::NumericArray<arrow::Int8Type>>(
-                data_batch->field(SpecialFields::kPreparedKeyValueValueKindIndex));
+                data_batch->field(RealtimePrimaryKeyLayout::kValueKindIndex));
             sequence_number_array_ = checked_pointer_cast<arrow::NumericArray<arrow::Int64Type>>(
-                data_batch->field(SpecialFields::kPreparedKeyValueSequenceNumberIndex));
+                data_batch->field(RealtimePrimaryKeyLayout::kSequenceNumberIndex));
             arrow::ArrayVector key_fields;
             key_fields.reserve(plan_->KeyFieldIndexes().size());
             for (int32_t index : plan_->KeyFieldIndexes()) {
@@ -336,53 +333,48 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
         }
     }
 
-    Status ValidatePreparedBatch(const std::shared_ptr<arrow::StructArray>& data_batch) const {
-        if (data_batch->num_fields() != plan_->PreparedSchema()->num_fields()) {
+    Status ValidateTransportBatch(const std::shared_ptr<arrow::StructArray>& data_batch) const {
+        if (data_batch->num_fields() != plan_->TransportSchema()->num_fields()) {
             return Status::Invalid(fmt::format(
-                "prepared batch field count {} does not match prepared schema field count {}",
-                data_batch->num_fields(), plan_->PreparedSchema()->num_fields()));
+                "realtime primary-key transport batch field count {} does not match schema field "
+                "count {}",
+                data_batch->num_fields(), plan_->TransportSchema()->num_fields()));
         }
         const arrow::FieldVector& batch_fields = data_batch->type()->fields();
         for (int32_t i = 0; i < data_batch->num_fields(); ++i) {
-            if (!batch_fields[i]->Equals(plan_->PreparedSchema()->field(i), true)) {
+            if (!batch_fields[i]->Equals(plan_->TransportSchema()->field(i), true)) {
                 return Status::Invalid(fmt::format(
-                    "prepared batch field {} does not match declared prepared schema", i));
+                    "realtime primary-key transport batch field {} does not match declared schema",
+                    i));
             }
         }
-        if (data_batch->field(SpecialFields::kPreparedKeyValueValueKindIndex)->null_count() != 0 ||
-            data_batch->field(SpecialFields::kPreparedKeyValueSequenceNumberIndex)->null_count() !=
-                0 ||
-            data_batch->field(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex)->null_count() !=
-                0) {
-            return Status::Invalid("prepared transport columns must not contain nulls");
+        if (data_batch->field(RealtimePrimaryKeyLayout::kValueKindIndex)->null_count() != 0 ||
+            data_batch->field(RealtimePrimaryKeyLayout::kSequenceNumberIndex)->null_count() != 0 ||
+            data_batch->field(RealtimePrimaryKeyLayout::kRealtimeOffsetIndex)->null_count() != 0) {
+            return Status::Invalid("realtime primary-key transport columns must not contain nulls");
         }
         return Status::OK();
     }
 
     Result<bool> SelectRows(const arrow::Int64Array& offsets, RoaringBitmap32&& selection) {
         for (auto iter = selection.Begin(); iter != selection.End(); ++iter) {
-            const int32_t row = *iter;
-            if (row < 0 || row >= offsets.length()) {
+            const uint32_t row = *iter;
+            if (static_cast<int64_t>(row) >= offsets.length()) {
                 return Status::Invalid(
-                    fmt::format("selected row id {} is out of bounds for prepared batch length {}",
+                    fmt::format("selected row id {} is out of bounds for realtime primary-key "
+                                "transport batch length {}",
                                 row, offsets.length()));
             }
         }
-        if (visible_offsets_.has_value() && selection.Cardinality() != offsets.length()) {
+        if (selection.Cardinality() != offsets.length()) {
             return Status::Invalid(
-                "PK real-time store query reader bitmap must cover every raw mutation");
+                "PK real-time store reader bitmap must cover every raw "
+                "transport row");
         }
-        if (!visible_offsets_.has_value()) {
-            selected_rows_.reserve(offsets.length());
-            for (int64_t row = 0; row < offsets.length(); ++row) {
-                selected_rows_.push_back(row);
-            }
-            return true;
-        }
-        for (auto iter = selection.Begin(); iter != selection.End(); ++iter) {
-            const int32_t row = *iter;
-            const int64_t offset = offsets.Value(row);
-            if (offset >= visible_offsets_->begin && offset < visible_offsets_->end) {
+        selected_rows_.reserve(offsets.length());
+        for (int64_t row = 0; row < offsets.length(); ++row) {
+            if (!visible_offsets_.has_value() || (offsets.Value(row) >= visible_offsets_->begin &&
+                                                  offsets.Value(row) < visible_offsets_->end)) {
                 selected_rows_.push_back(row);
             }
         }
@@ -407,7 +399,7 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
  private:
     std::unique_ptr<BatchReader> reader_;
-    std::shared_ptr<const PreparedReaderPlan> plan_;
+    std::shared_ptr<const RealtimePrimaryKeyReaderPlan> plan_;
     std::optional<OffsetRange> visible_offsets_;
     std::shared_ptr<MemoryPool> pool_;
     std::shared_ptr<RealtimeOffsetCoverage> offset_coverage_;
@@ -421,31 +413,39 @@ class PreparedKeyValueReader final : public KeyValueRecordReader {
 
 }  // namespace
 
-Status PreparedKeyValueReaderFactory::ValidateTransportSchema(
-    const std::shared_ptr<arrow::Schema>& prepared_schema) {
-    if (!prepared_schema ||
-        prepared_schema->num_fields() < SpecialFields::kPreparedKeyValueValueStartIndex) {
-        return Status::Invalid("prepared schema must contain realtime transport fields");
+std::shared_ptr<arrow::Schema> RealtimePrimaryKeyLayout::CreateSchema(
+    const std::vector<std::shared_ptr<arrow::Field>>& value_fields) {
+    arrow::FieldVector fields = {
+        DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())->WithNullable(false),
+        DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
+            ->WithNullable(false),
+        DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
+    fields.insert(fields.end(), value_fields.begin(), value_fields.end());
+    return arrow::schema(std::move(fields));
+}
+
+Status RealtimePrimaryKeyLayout::ValidateSchema(
+    const std::shared_ptr<arrow::Schema>& transport_schema) {
+    if (!transport_schema || transport_schema->num_fields() < kValueStartIndex) {
+        return Status::Invalid(
+            "realtime primary-key transport schema must contain transport fields");
     }
-    PAIMON_RETURN_NOT_OK(CheckPreparedField(prepared_schema,
-                                            SpecialFields::kPreparedKeyValueValueKindIndex,
-                                            SpecialFields::ValueKind()));
-    PAIMON_RETURN_NOT_OK(CheckPreparedField(prepared_schema,
-                                            SpecialFields::kPreparedKeyValueSequenceNumberIndex,
-                                            SpecialFields::SequenceNumber()));
-    PAIMON_RETURN_NOT_OK(CheckPreparedField(prepared_schema,
-                                            SpecialFields::kPreparedKeyValueRealtimeOffsetIndex,
-                                            SpecialFields::RealtimeOffset()));
+    PAIMON_RETURN_NOT_OK(
+        CheckTransportField(transport_schema, kValueKindIndex, SpecialFields::ValueKind()));
+    PAIMON_RETURN_NOT_OK(CheckTransportField(transport_schema, kSequenceNumberIndex,
+                                             SpecialFields::SequenceNumber()));
+    PAIMON_RETURN_NOT_OK(CheckTransportField(transport_schema, kRealtimeOffsetIndex,
+                                             SpecialFields::RealtimeOffset()));
     return Status::OK();
 }
 
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
-PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchReader>>&& readers,
-                                              const std::shared_ptr<arrow::Schema>& prepared_schema,
-                                              const OffsetRange& visible_offsets,
-                                              const std::shared_ptr<arrow::Schema>& key_schema,
-                                              const std::shared_ptr<arrow::Schema>& value_schema,
-                                              const std::shared_ptr<MemoryPool>& memory_pool) {
+RealtimePrimaryKeyReaderFactory::CreateForQuery(
+    std::vector<std::unique_ptr<BatchReader>>&& readers,
+    const std::shared_ptr<arrow::Schema>& transport_schema, const OffsetRange& visible_offsets,
+    const std::shared_ptr<arrow::Schema>& key_schema,
+    const std::shared_ptr<arrow::Schema>& value_schema,
+    const std::shared_ptr<MemoryPool>& memory_pool) {
     std::vector<std::unique_ptr<KeyValueRecordReader>> adapted_readers;
     ScopeGuard remaining_raw_readers_guard([&readers]() { CloseReaders(readers); });
     if (readers.empty() && visible_offsets.begin < visible_offsets.end) {
@@ -457,15 +457,16 @@ PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchR
             return Status::Invalid("PK real-time store returned a null query reader");
         }
     }
-    PAIMON_RETURN_NOT_OK(ValidateTransportSchema(prepared_schema));
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<const PreparedReaderPlan> plan,
-                           PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema));
+    PAIMON_RETURN_NOT_OK(RealtimePrimaryKeyLayout::ValidateSchema(transport_schema));
+    PAIMON_ASSIGN_OR_RAISE(
+        std::shared_ptr<const RealtimePrimaryKeyReaderPlan> plan,
+        RealtimePrimaryKeyReaderPlan::Create(transport_schema, key_schema, value_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
                            RealtimeOffsetCoverage::Create(visible_offsets, readers.size(),
                                                           /*allow_committed_prefix=*/true));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        adapted_readers.push_back(std::make_unique<PreparedKeyValueReader>(
+        adapted_readers.push_back(std::make_unique<RealtimePrimaryKeyReader>(
             std::move(reader), plan, visible_offsets, memory_pool, offset_coverage));
     }
     remaining_raw_readers_guard.Release();
@@ -473,9 +474,9 @@ PreparedKeyValueReaderFactory::CreateForQuery(std::vector<std::unique_ptr<BatchR
 }
 
 Result<std::vector<std::unique_ptr<KeyValueRecordReader>>>
-PreparedKeyValueReaderFactory::CreateForCommit(
+RealtimePrimaryKeyReaderFactory::CreateForCommit(
     std::vector<std::unique_ptr<BatchReader>>&& readers,
-    const std::shared_ptr<arrow::Schema>& prepared_schema, const OffsetRange& sealed_offsets,
+    const std::shared_ptr<arrow::Schema>& transport_schema, const OffsetRange& sealed_offsets,
     const std::shared_ptr<arrow::Schema>& key_schema,
     const std::shared_ptr<arrow::Schema>& value_schema,
     const std::shared_ptr<MemoryPool>& memory_pool) {
@@ -490,15 +491,16 @@ PreparedKeyValueReaderFactory::CreateForCommit(
             return Status::Invalid("PK real-time store returned a null commit reader");
         }
     }
-    PAIMON_RETURN_NOT_OK(ValidateTransportSchema(prepared_schema));
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<const PreparedReaderPlan> plan,
-                           PreparedReaderPlan::Create(prepared_schema, key_schema, value_schema));
+    PAIMON_RETURN_NOT_OK(RealtimePrimaryKeyLayout::ValidateSchema(transport_schema));
+    PAIMON_ASSIGN_OR_RAISE(
+        std::shared_ptr<const RealtimePrimaryKeyReaderPlan> plan,
+        RealtimePrimaryKeyReaderPlan::Create(transport_schema, key_schema, value_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<RealtimeOffsetCoverage> offset_coverage,
                            RealtimeOffsetCoverage::Create(sealed_offsets, readers.size(),
                                                           /*allow_committed_prefix=*/false));
     adapted_readers.reserve(readers.size());
     for (std::unique_ptr<BatchReader>& reader : readers) {
-        adapted_readers.push_back(std::make_unique<PreparedKeyValueReader>(
+        adapted_readers.push_back(std::make_unique<RealtimePrimaryKeyReader>(
             std::move(reader), plan, std::nullopt, memory_pool, offset_coverage));
     }
     remaining_raw_readers_guard.Release();

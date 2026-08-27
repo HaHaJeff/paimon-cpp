@@ -677,6 +677,7 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateProjectedReader(
     if (!force_keep_delete_) {
         sort_merge_reader = std::make_unique<DropDeleteReader>(std::move(sort_merge_reader));
     }
+    // KeyValueProjectionReader converts KeyValue objects to arrow array according to projection
     std::unique_ptr<BatchReader> projection_reader;
     if (!context_->EnableMultiThreadRowToBatch()) {
         PAIMON_ASSIGN_OR_RAISE(

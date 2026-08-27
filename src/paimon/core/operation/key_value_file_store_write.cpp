@@ -35,6 +35,7 @@
 #include "paimon/core/operation/file_store_scan.h"
 #include "paimon/core/operation/key_value_file_store_scan.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
+#include "paimon/core/realtime/realtime_primary_key_reader.h"
 #include "paimon/core/realtime/realtime_primary_key_writer.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/utils/file_store_path_factory.h"
@@ -124,7 +125,7 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     std::shared_ptr<CompactManager> compact_manager;
     std::shared_ptr<RealtimeContextImpl> realtime_context_impl;
     std::optional<RealtimeStoreState> realtime_store_state;
-    std::shared_ptr<arrow::Schema> prepared_schema;
+    std::shared_ptr<arrow::Schema> transport_schema;
     if (realtime_context_) {
         std::vector<std::pair<std::string, std::string>> partition_values;
         PAIMON_ASSIGN_OR_RAISE(partition_values,
@@ -132,10 +133,10 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
         partition_map =
             std::map<std::string, std::string>(partition_values.begin(), partition_values.end());
         PAIMON_ASSIGN_OR_RAISE(realtime_context_impl, RealtimeContextImpl::Cast(realtime_context_));
-        prepared_schema = SpecialFields::PreparedKeyValueSchema(schema_->fields());
+        transport_schema = RealtimePrimaryKeyLayout::CreateSchema(schema_->fields());
         auto c_write_schema = std::make_unique<ArrowSchema>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(
-            arrow::ExportSchema(*prepared_schema, c_write_schema.get()));
+            arrow::ExportSchema(*transport_schema, c_write_schema.get()));
         PAIMON_ASSIGN_OR_RAISE(
             RealtimeStoreState store_state,
             realtime_context_impl->GetOrCreateRealtimeStore(
@@ -164,9 +165,10 @@ Result<std::shared_ptr<BatchWriter>> KeyValueFileStoreWrite::CreateWriter(
     if (!realtime_context_) {
         return std::shared_ptr<BatchWriter>(std::move(writer));
     }
-    return RealtimePrimaryKeyWriter::Create(
-        partition_map, bucket, schema_, prepared_schema, trimmed_primary_keys, key_comparator_,
-        realtime_context_impl, realtime_store_state.value(), restore_max_seq_number, writer, pool_);
+    return RealtimePrimaryKeyWriter::Create(partition_map, bucket, schema_, transport_schema,
+                                            trimmed_primary_keys, key_comparator_, options_,
+                                            realtime_context_impl, realtime_store_state.value(),
+                                            restore_max_seq_number, writer, pool_);
 }
 
 Status KeyValueFileStoreWrite::RefreshCommittedSnapshot(int64_t snapshot_id) {

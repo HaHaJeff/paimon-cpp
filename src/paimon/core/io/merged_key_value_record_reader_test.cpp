@@ -35,7 +35,7 @@
 #include "paimon/common/utils/fields_comparator.h"
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
-#include "paimon/core/realtime/prepared_key_value_reader.h"
+#include "paimon/core/realtime/realtime_primary_key_reader.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/realtime/offset_range.h"
 #include "paimon/testing/mock/mock_file_batch_reader.h"

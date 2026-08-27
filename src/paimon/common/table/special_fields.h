@@ -36,10 +36,6 @@ struct SpecialFields {
 
     static constexpr char KEY_FIELD_PREFIX[] = "_KEY_";
     static constexpr int32_t KEY_VALUE_SPECIAL_FIELD_COUNT = 2;
-    static constexpr int32_t kPreparedKeyValueValueKindIndex = 0;
-    static constexpr int32_t kPreparedKeyValueSequenceNumberIndex = 1;
-    static constexpr int32_t kPreparedKeyValueRealtimeOffsetIndex = 2;
-    static constexpr int32_t kPreparedKeyValueValueStartIndex = 3;
 
     static const DataField& SequenceNumber() {
         static const DataField data_field = DataField(
@@ -96,16 +92,6 @@ struct SpecialFields {
         target_fields.push_back(DataField::ConvertDataFieldToArrowField(ValueKind()));
         target_fields.insert(target_fields.end(), schema->fields().begin(), schema->fields().end());
         return arrow::schema(target_fields);
-    }
-
-    static std::shared_ptr<arrow::Schema> PreparedKeyValueSchema(
-        const arrow::FieldVector& value_fields) {
-        arrow::FieldVector fields = {
-            DataField::ConvertDataFieldToArrowField(ValueKind())->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SequenceNumber())->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(RealtimeOffset())};
-        fields.insert(fields.end(), value_fields.begin(), value_fields.end());
-        return arrow::schema(std::move(fields));
     }
 };
 

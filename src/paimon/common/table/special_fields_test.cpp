@@ -66,27 +66,6 @@ TEST(SpecialFieldsTest, TestKeyValueSpecialFieldCount) {
     ASSERT_EQ(SpecialFields::KEY_VALUE_SPECIAL_FIELD_COUNT, 2);
 }
 
-TEST(SpecialFieldsTest, TestPreparedKeyValueSchema) {
-    arrow::FieldVector value_fields = {arrow::field("key", arrow::int64(), false),
-                                       arrow::field("value", arrow::utf8())};
-    std::shared_ptr<arrow::Schema> schema = SpecialFields::PreparedKeyValueSchema(value_fields);
-
-    ASSERT_EQ(SpecialFields::kPreparedKeyValueValueKindIndex, 0);
-    ASSERT_EQ(SpecialFields::kPreparedKeyValueSequenceNumberIndex, 1);
-    ASSERT_EQ(SpecialFields::kPreparedKeyValueRealtimeOffsetIndex, 2);
-    ASSERT_EQ(SpecialFields::kPreparedKeyValueValueStartIndex, 3);
-    ASSERT_EQ(schema->field(0)->name(), "_VALUE_KIND");
-    ASSERT_EQ(schema->field(1)->name(), "_SEQUENCE_NUMBER");
-    ASSERT_EQ(schema->field(2)->name(), "_REALTIME_OFFSET");
-    ASSERT_EQ(schema->field(3)->name(), "key");
-    ASSERT_EQ(schema->field(4)->name(), "value");
-    ASSERT_FALSE(schema->field(0)->nullable());
-    ASSERT_FALSE(schema->field(1)->nullable());
-    ASSERT_EQ(schema->field(2)->nullable(), SpecialFields::RealtimeOffset().Nullable());
-    ASSERT_FALSE(schema->field(3)->nullable());
-    ASSERT_TRUE(schema->field(4)->nullable());
-}
-
 TEST(SpecialFieldsTest, TestIsSystemField) {
     ASSERT_TRUE(SpecialFields::IsSystemField("_SEQUENCE_NUMBER"));
     ASSERT_TRUE(SpecialFields::IsSystemField("_VALUE_KIND"));

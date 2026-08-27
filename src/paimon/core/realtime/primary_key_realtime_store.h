@@ -35,7 +35,7 @@ class MemoryPool;
 class PrimaryKeyRealtimeStore final : public RealtimeStore {
  public:
     static Result<std::shared_ptr<PrimaryKeyRealtimeStore>> Create(
-        const std::shared_ptr<arrow::Schema>& prepared_schema,
+        const std::shared_ptr<arrow::Schema>& transport_schema,
         const std::shared_ptr<MemoryPool>& memory_pool);
 
     ~PrimaryKeyRealtimeStore() override;
