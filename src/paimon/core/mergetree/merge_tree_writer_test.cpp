@@ -642,6 +642,19 @@ TEST_P(MergeTreeWriterTest, TestSortedReaderFailure) {
       [0, 0, "Alice", 10, 0, 13.1]
     ])")
             .ValueOrDie());
+    bool first_mixed_reader_closed = false;
+    bool second_mixed_reader_closed = false;
+    std::vector<std::unique_ptr<KeyValueRecordReader>> mixed_readers;
+    mixed_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
+        CreateSingleReader(sorted_reader_array), &first_mixed_reader_closed));
+    mixed_readers.push_back(nullptr);
+    mixed_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(
+        CreateSingleReader(sorted_reader_array), &second_mixed_reader_closed));
+    Status mixed_status = merge_writer->WriteSortedReadersToFiles(std::move(mixed_readers));
+    ASSERT_TRUE(mixed_status.IsInvalid());
+    ASSERT_TRUE(first_mixed_reader_closed);
+    ASSERT_TRUE(second_mixed_reader_closed);
+
     Status expected_status = Status::IOError("sorted reader failure");
     bool failing_reader_closed = false;
     std::vector<std::unique_ptr<KeyValueRecordReader>> failing_readers;

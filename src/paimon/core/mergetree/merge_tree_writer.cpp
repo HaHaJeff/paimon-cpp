@@ -174,6 +174,7 @@ Status MergeTreeWriter::WriteSortedReadersToFiles(
 
     auto sort_merge_reader = std::make_unique<SortMergeReaderWithLoserTree>(
         std::move(readers), key_comparator_, user_defined_seq_comparator_, merge_function_wrapper_);
+    raw_readers_guard.Release();
     auto create_consumer = [target_schema = write_schema_, pool = pool_]()
         -> Result<std::unique_ptr<RowToArrowArrayConverter<KeyValue, KeyValueBatch>>> {
         return KeyValueMetaProjectionConsumer::Create(target_schema, pool);
@@ -181,7 +182,6 @@ Status MergeTreeWriter::WriteSortedReadersToFiles(
     auto async_key_value_producer_consumer =
         std::make_unique<AsyncKeyValueProducerAndConsumer<KeyValue, KeyValueBatch>>(
             std::move(sort_merge_reader), create_consumer, options_.GetWriteBatchSize(), 1, pool_);
-    raw_readers_guard.Release();
     ScopeGuard async_readers_guard([&]() -> void { async_key_value_producer_consumer->Close(); });
     std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>> rolling_writer;
     PAIMON_ASSIGN_OR_RAISE(rolling_writer, CreateRollingRowWriter());
