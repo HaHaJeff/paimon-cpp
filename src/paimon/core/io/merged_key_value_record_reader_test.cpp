@@ -18,10 +18,7 @@
 
 #include "paimon/core/io/merged_key_value_record_reader.h"
 
-#include <cstdint>
 #include <memory>
-#include <optional>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -31,13 +28,10 @@
 #include "gtest/gtest.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
-#include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/fields_comparator.h"
 #include "paimon/core/mergetree/compact/deduplicate_merge_function.h"
 #include "paimon/core/mergetree/compact/reducer_merge_function_wrapper.h"
-#include "paimon/core/realtime/realtime_primary_key_reader.h"
 #include "paimon/memory/memory_pool.h"
-#include "paimon/realtime/offset_range.h"
 #include "paimon/testing/mock/mock_file_batch_reader.h"
 #include "paimon/testing/mock/mock_key_value_data_file_record_reader.h"
 #include "paimon/testing/utils/key_value_checker.h"
