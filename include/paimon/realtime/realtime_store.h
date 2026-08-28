@@ -189,6 +189,7 @@ class PAIMON_EXPORT RealtimeStoreFactory {
  public:
     virtual ~RealtimeStoreFactory() = default;
 
+    /// Creates a store configured with the supplied schema, statistics, options, and memory pool.
     /// Creates a store for the requested table mode.
     /// The factory consumes `request`, including ownership of `request.write_schema`.
     virtual Result<std::shared_ptr<RealtimeStore>> Create(RealtimeStoreCreateRequest&& request) = 0;
