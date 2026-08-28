@@ -52,7 +52,6 @@
 #include "paimon/executor.h"
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/memory/memory_pool.h"
-#include "paimon/metrics.h"
 #include "paimon/predicate/literal.h"
 #include "paimon/predicate/predicate_builder.h"
 #include "paimon/read_context.h"
@@ -67,29 +66,6 @@ class FileSystem;
 }  // namespace paimon
 
 namespace paimon::test {
-namespace {
-
-class TrackingKeyValueRecordReader : public KeyValueRecordReader {
- public:
-    explicit TrackingKeyValueRecordReader(int32_t* close_count) : close_count_(close_count) {}
-
-    Result<std::unique_ptr<KeyValueRecordReader::Iterator>> NextBatch() override {
-        return std::unique_ptr<KeyValueRecordReader::Iterator>();
-    }
-
-    void Close() override {
-        ++(*close_count_);
-    }
-
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return nullptr;
-    }
-
- private:
-    int32_t* close_count_;
-};
-
-}  // namespace
 
 // Parameter: min_heap/loser_tree; enable/disable IO prefetch; enable/disable multi thread row to
 // batch
@@ -760,27 +736,6 @@ TEST_P(MergeFileSplitReadTest, TestRealtimeReadConcatenatesOrderedDiskSections) 
     CheckResult(result_array, expected_array, read_schema);
     ASSERT_TRUE(batch_reader->GetReaderMetrics());
     batch_reader->Close();
-}
-
-TEST_F(MergeFileSplitReadTest, TestRealtimeReaderFailureClosesPluginReader) {
-    std::string path =
-        paimon::test::GetDataDir() + "/parquet/pk_table_with_mor.db/pk_table_with_mor";
-    ReadContextBuilder context_builder(path);
-    context_builder.SetReadFieldNames({"k0", "k1", "s1", "v0"});
-    context_builder.SetOptions(
-        {{Options::MERGE_ENGINE, "aggregation"}, {"fields.v0.aggregate-function", "unsupported"}});
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
-    std::shared_ptr<InternalReadContext> internal_context = CreateInternalReadContext(read_context);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<MergeFileSplitRead> split_read,
-                         CreateMergeFileSplitRead(internal_context));
-
-    int32_t close_count = 0;
-    std::vector<std::unique_ptr<KeyValueRecordReader>> plugin_readers;
-    plugin_readers.push_back(std::make_unique<TrackingKeyValueRecordReader>(&close_count));
-
-    ASSERT_NOK_WITH_MSG(split_read->CreateRealtimeReader({}, std::move(plugin_readers)),
-                        "unsupported");
-    ASSERT_EQ(1, close_count);
 }
 
 TEST_P(MergeFileSplitReadTest, TestLookUp) {

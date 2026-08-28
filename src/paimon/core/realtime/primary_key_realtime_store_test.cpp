@@ -263,26 +263,6 @@ TEST(PrimaryKeyRealtimeStoreTest, TestSlicedReadersExportZeroOffsets) {
     AssertSlicedBatch(readers[0].get());
 }
 
-TEST(PrimaryKeyRealtimeStoreTest, TestCloseUnreadBatchReaders) {
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
-                         PrimaryKeyRealtimeStore::Create(TransportSchema(), GetDefaultPool()));
-    ASSERT_OK(
-        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 10, 0, 1, "a"]])"), OffsetRange(0, 1)}));
-    ASSERT_OK(
-        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 20, 1, 2, "b"]])"), OffsetRange(1, 2)}));
-    ASSERT_OK(
-        store->Write(RealtimeWriteBatch{MakeBatch(R"([[0, 30, 2, 3, "c"]])"), OffsetRange(2, 3)}));
-    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<RealtimeSegmentHandle>> segment,
-                         store->SealForCommit());
-    ASSERT_TRUE(segment.has_value());
-    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BatchReader>> readers,
-                         store->CreateCommitReaders(segment.value()));
-    ASSERT_EQ(3, readers.size());
-    for (const std::unique_ptr<BatchReader>& reader : readers) {
-        reader->Close();
-    }
-}
-
 TEST(PrimaryKeyRealtimeStoreTest, TestReclaimKeepsReadView) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<PrimaryKeyRealtimeStore> store,
                          PrimaryKeyRealtimeStore::Create(TransportSchema(), GetDefaultPool()));

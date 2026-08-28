@@ -217,8 +217,10 @@ TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
     const std::map<std::string, std::string> partition = {{"dt", "2026-08-02"}};
     const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/0);
 
-    ASSERT_OK(
-        GetOrCreateAppendStore(context, partition, 0, MakeWriteSchema(), {}, GetDefaultPool()));
+    ASSERT_OK(context->GetOrCreateRealtimeStore(
+        RealtimeStoreCreateRequest{
+            MakeWriteSchema(), /*options=*/{}, GetDefaultPool(), RealtimeStoreMode::PRIMARY_KEY},
+        partition_bucket));
 
     ASSERT_OK_AND_ASSIGN(int64_t first, context->AdvanceMaterializedMaxSequenceNumber(
                                             partition_bucket, /*max_sequence_number=*/4));

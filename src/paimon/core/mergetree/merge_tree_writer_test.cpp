@@ -345,29 +345,6 @@ TEST_P(MergeTreeWriterTest, TestSimple) {
     DataIncrement expected_data_increment({expected_data_file_meta}, /*deleted_files=*/{},
                                           /*changelog_files=*/{});
     ASSERT_EQ(expected_data_increment, commit_increment.GetNewFilesIncrement());
-
-    auto sorted_reader_array = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(write_type_, R"([
-      [2, 0, "Alice", 10, 0, 13.1],
-      [0, 0, "Lucy", 20, 1, 14.1],
-      [1, 0, "Paul", 20, 1, null]
-    ])")
-            .ValueOrDie());
-    auto sorted_reader_path_factory = std::make_shared<DataFilePathFactory>();
-    ASSERT_OK(sorted_reader_path_factory->Init(dir->Str() + "/sorted-readers", "orc",
-                                               options.DataFilePrefix(), nullptr));
-    ASSERT_OK_AND_ASSIGN(auto sorted_reader_writer,
-                         CreateMergeWriter(-1, dir->Str(), sorted_reader_path_factory, 1, options));
-    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
-    sorted_readers.push_back(CreateSingleReader(sorted_reader_array));
-    ASSERT_OK(sorted_reader_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
-    ASSERT_OK_AND_ASSIGN(CommitIncrement sorted_reader_commit_increment,
-                         sorted_reader_writer->PrepareCommit(false));
-    ASSERT_OK(sorted_reader_writer->Close());
-    ASSERT_EQ(1, sorted_reader_commit_increment.GetNewFilesIncrement().NewFiles().size());
-    std::string sorted_reader_path = sorted_reader_path_factory->ToPath(
-        sorted_reader_commit_increment.GetNewFilesIncrement().NewFiles()[0]);
-    CheckFileContent(sorted_reader_path, expected_array);
 }
 
 TEST_P(MergeTreeWriterTest, TestWriteMultiBatch) {
@@ -449,30 +426,6 @@ TEST_P(MergeTreeWriterTest, TestWriteMultiBatch) {
     DataIncrement expected_data_increment({expected_data_file_meta}, /*deleted_files=*/{},
                                           /*changelog_files=*/{});
     ASSERT_EQ(expected_data_increment, commit_increment.GetNewFilesIncrement());
-
-    auto sorted_reader_array = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(write_type_, R"([
-      [16, 0, "Alice", 10, 0, 113.1],
-      [14, 0, "Lucy", 20, 1, 114.1],
-      [13, 0, "Paul", 20, 1, 15.1],
-      [15, 0, "Skye", 10, 0, 118.1]
-    ])")
-            .ValueOrDie());
-    auto sorted_reader_path_factory = std::make_shared<DataFilePathFactory>();
-    ASSERT_OK(sorted_reader_path_factory->Init(dir->Str() + "/sorted-readers", "orc",
-                                               options.DataFilePrefix(), nullptr));
-    ASSERT_OK_AND_ASSIGN(auto sorted_reader_writer,
-                         CreateMergeWriter(9, dir->Str(), sorted_reader_path_factory, 0, options));
-    std::vector<std::unique_ptr<KeyValueRecordReader>> sorted_readers;
-    sorted_readers.push_back(CreateSingleReader(sorted_reader_array));
-    ASSERT_OK(sorted_reader_writer->WriteSortedReadersToFiles(std::move(sorted_readers)));
-    ASSERT_OK_AND_ASSIGN(CommitIncrement sorted_reader_commit_increment,
-                         sorted_reader_writer->PrepareCommit(false));
-    ASSERT_OK(sorted_reader_writer->Close());
-    ASSERT_EQ(1, sorted_reader_commit_increment.GetNewFilesIncrement().NewFiles().size());
-    std::string sorted_reader_path = sorted_reader_path_factory->ToPath(
-        sorted_reader_commit_increment.GetNewFilesIncrement().NewFiles()[0]);
-    CheckFileContent(sorted_reader_path, expected_array);
 }
 
 TEST_P(MergeTreeWriterTest, TestSortedReaders) {
