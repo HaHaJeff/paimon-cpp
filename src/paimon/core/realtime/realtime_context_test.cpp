@@ -218,8 +218,8 @@ TEST(RealtimeContextTest, TestReconcilesPrimaryKeyInitialSequence) {
     const RealtimePartitionBucket partition_bucket(partition, /*bucket=*/0);
 
     ASSERT_OK(context->GetOrCreateRealtimeStore(
-        RealtimeStoreCreateRequest{
-            MakeWriteSchema(), /*options=*/{}, GetDefaultPool(), RealtimeStoreMode::PRIMARY_KEY},
+        RealtimeStoreCreateRequest{MakeWriteSchema(), /*options=*/{}, GetDefaultPool(),
+                                   RealtimeStoreMode::PRIMARY_KEY},
         partition_bucket));
 
     ASSERT_OK_AND_ASSIGN(int64_t first, context->AdvanceMaterializedMaxSequenceNumber(
