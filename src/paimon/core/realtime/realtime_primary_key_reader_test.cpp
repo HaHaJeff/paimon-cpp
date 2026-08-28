@@ -685,4 +685,27 @@ TEST_F(RealtimePrimaryKeyReaderTest, TestFactoryFailureClosesReaders) {
     ASSERT_EQ(factory_failure_close_count, 1);
 }
 
+TEST_F(RealtimePrimaryKeyReaderTest, TestQueryReaderClose) {
+    std::vector<DataField> value_fields = {DataField(0, arrow::field("k0", arrow::int32())),
+                                           DataField(1, arrow::field("v0", arrow::int32()))};
+    std::shared_ptr<arrow::Schema> value_schema =
+        DataField::ConvertDataFieldsToArrowSchema(value_fields);
+    std::shared_ptr<arrow::Schema> key_schema = arrow::schema({value_schema->field(0)});
+    std::shared_ptr<arrow::Schema> transport_schema = MakeTransportSchema(value_schema->fields());
+    std::shared_ptr<arrow::DataType> transport_type = arrow::struct_(transport_schema->fields());
+    std::shared_ptr<arrow::Array> transport_array =
+        arrow::ipc::internal::json::ArrayFromJSON(transport_type, R"([[0, 10, 0, 1, 100]])")
+            .ValueOrDie();
+
+    int32_t close_count = 0;
+    auto batch_reader = std::make_unique<TrackingBatchReader>(
+        std::make_unique<MockFileBatchReader>(transport_array, transport_type, 1), &close_count);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<KeyValueRecordReader> reader,
+                         CreateRealtimePrimaryKeyQueryReaderForTest(
+                             std::move(batch_reader), transport_schema, OffsetRange(0, 1),
+                             key_schema, value_schema, pool_));
+    reader->Close();
+    ASSERT_EQ(close_count, 1);
+}
+
 }  // namespace paimon::test

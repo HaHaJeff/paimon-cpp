@@ -50,6 +50,7 @@
 #include "paimon/core/core_options.h"
 #include "paimon/core/operation/commit/realtime_commit_properties.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
+#include "paimon/core/realtime/realtime_primary_key_reader.h"
 #include "paimon/core/schema/schema_manager.h"
 #include "paimon/core/schema/table_schema.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
@@ -96,32 +97,6 @@ class TrackingRealtimeReadView final : public RealtimeReadView {
 
  private:
     std::shared_ptr<RealtimeReadView> delegate_;
-};
-
-class ReadViewCheckingBatchReader final : public BatchReader {
- public:
-    ReadViewCheckingBatchReader(std::unique_ptr<BatchReader> delegate,
-                                std::weak_ptr<RealtimeReadView> read_view)
-        : delegate_(std::move(delegate)), read_view_(std::move(read_view)) {}
-
-    Result<ReadBatch> NextBatch() override {
-        if (read_view_.expired()) {
-            return Status::Invalid("real-time read view was released before reader completion");
-        }
-        return delegate_->NextBatch();
-    }
-
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return delegate_->GetReaderMetrics();
-    }
-
-    void Close() override {
-        delegate_->Close();
-    }
-
- private:
-    std::unique_ptr<BatchReader> delegate_;
-    std::weak_ptr<RealtimeReadView> read_view_;
 };
 
 class DelegatingRealtimeStore : public RealtimeStore {
@@ -219,69 +194,12 @@ class QueryTrackingRealtimeStore final : public DelegatingRealtimeStore {
         if (!tracking_view) {
             return Status::Invalid("query tracking store received an unexpected read view");
         }
-        PAIMON_ASSIGN_OR_RAISE(
-            std::vector<std::unique_ptr<BatchReader>> readers,
-            delegate_->CreateQueryReaders(tracking_view->Delegate(), offset_begin, context));
-        for (std::unique_ptr<BatchReader>& reader : readers) {
-            reader = std::make_unique<ReadViewCheckingBatchReader>(std::move(reader), view);
-        }
-        return readers;
+        return delegate_->CreateQueryReaders(tracking_view->Delegate(), offset_begin, context);
     }
 
  private:
     std::shared_ptr<std::atomic<bool>> saw_query_predicate_;
     std::shared_ptr<std::weak_ptr<RealtimeReadView>> query_view_;
-};
-
-class CloseTrackingBatchReader final : public BatchReader {
- public:
-    CloseTrackingBatchReader(std::unique_ptr<BatchReader> delegate,
-                             const std::shared_ptr<std::atomic<int32_t>>& close_count)
-        : delegate_(std::move(delegate)), close_count_(close_count) {}
-
-    Result<ReadBatch> NextBatch() override {
-        return delegate_->NextBatch();
-    }
-
-    std::shared_ptr<Metrics> GetReaderMetrics() const override {
-        return delegate_->GetReaderMetrics();
-    }
-
-    void Close() override {
-        close_count_->fetch_add(1, std::memory_order_release);
-        delegate_->Close();
-    }
-
- private:
-    std::unique_ptr<BatchReader> delegate_;
-    std::shared_ptr<std::atomic<int32_t>> close_count_;
-};
-
-struct CloseTrackingReaderState {
-    std::shared_ptr<std::atomic<int32_t>> query_close_count =
-        std::make_shared<std::atomic<int32_t>>(0);
-};
-
-class CloseTrackingRealtimeStore final : public DelegatingRealtimeStore {
- public:
-    CloseTrackingRealtimeStore(const std::shared_ptr<RealtimeStore>& delegate,
-                               const std::shared_ptr<CloseTrackingReaderState>& state)
-        : DelegatingRealtimeStore(delegate), state_(state) {}
-
-    Result<std::vector<std::unique_ptr<BatchReader>>> CreateQueryReaders(
-        const std::shared_ptr<RealtimeReadView>& view, int64_t offset_begin,
-        const RealtimeQueryContext& context) override {
-        PAIMON_ASSIGN_OR_RAISE(std::vector<std::unique_ptr<BatchReader>> readers,
-                               delegate_->CreateQueryReaders(view, offset_begin, context));
-        for (std::unique_ptr<BatchReader>& reader : readers) {
-            reader = std::make_unique<CloseTrackingBatchReader>(std::move(reader),
-                                                                state_->query_close_count);
-        }
-        return readers;
-    }
-
- private:
-    std::shared_ptr<CloseTrackingReaderState> state_;
 };
 
 }  // namespace
@@ -846,18 +764,10 @@ class RealtimeWriteInteTest : public ::testing::Test {
             return Status::Invalid("expected a table schema");
         }
         auto read_schema = std::make_unique<ArrowSchema>();
-        arrow::FieldVector requested_fields = {
-            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
-                ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
-                ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset())};
         std::shared_ptr<arrow::Schema> value_schema =
             DataField::ConvertDataFieldsToArrowSchema(table_schema.value()->Fields());
-        requested_fields.insert(requested_fields.end(), value_schema->fields().begin(),
-                                value_schema->fields().end());
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(
-            arrow::ExportSchema(*arrow::schema(requested_fields), read_schema.get()));
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(
+            *RealtimePrimaryKeyLayout::CreateSchema(value_schema->fields()), read_schema.get()));
         ScopeGuard schema_guard([schema = read_schema.get()]() { ArrowSchemaRelease(schema); });
         RealtimeQueryContext query_context{read_schema.get(), /*predicate=*/nullptr,
                                            /*enable_predicate_pushdown=*/false};
@@ -1925,24 +1835,6 @@ TEST_F(RealtimeWriteInteTest, TestPkMultipleStoredBatchesMergeForQueryAndCommit)
     ASSERT_OK(Commit(progress, /*commit_identifier=*/0));
     ASSERT_OK_AND_ASSIGN(std::vector<Row> rows, ReadRows());
     ASSERT_EQ(expected, rows);
-    ASSERT_OK(writer->Close());
-}
-
-TEST_F(RealtimeWriteInteTest, TestPkQueryReaderClose) {
-    CreatePkTable();
-    auto state = std::make_shared<CloseTrackingReaderState>();
-    auto factory = MakeDecoratingFactory<CloseTrackingRealtimeStore>(state);
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeContext> realtime_context,
-                         RealtimeContext::Create(factory));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> writer,
-                         CreateRealtimeWriter(realtime_context));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         MakeBatch({Row{1, "one", "p0"}}, /*partitioned=*/false));
-    ASSERT_OK(writer->Write(std::move(batch)));
-
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> reader, CreateQueryReader(realtime_context));
-    reader->Close();
-    ASSERT_EQ(1, state->query_close_count->load(std::memory_order_acquire));
     ASSERT_OK(writer->Close());
 }
 

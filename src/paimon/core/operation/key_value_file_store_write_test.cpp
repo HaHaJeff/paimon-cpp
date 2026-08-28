@@ -50,6 +50,7 @@
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/operation/restore_files.h"
 #include "paimon/core/realtime/realtime_context_impl.h"
+#include "paimon/core/realtime/realtime_primary_key_reader.h"
 #include "paimon/core/stats/simple_stats.h"
 #include "paimon/core/table/sink/commit_message_impl.h"
 #include "paimon/file_store_commit.h"
@@ -257,17 +258,12 @@ class KeyValueFileStoreWriteTest : public ::testing::Test {
         if (views.size() != 1) {
             return Status::Invalid("expected exactly one real-time store");
         }
-        std::shared_ptr<arrow::Schema> transport_schema = arrow::schema({
-            DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind())
-                ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::SequenceNumber())
-                ->WithNullable(false),
-            DataField::ConvertDataFieldToArrowField(SpecialFields::RealtimeOffset()),
-            DataField::ConvertDataFieldToArrowField(
-                DataField(0, arrow::field("id", arrow::int64(), false))),
-            DataField::ConvertDataFieldToArrowField(
-                DataField(1, arrow::field("value", arrow::utf8()))),
-        });
+        arrow::FieldVector value_fields = {DataField::ConvertDataFieldToArrowField(DataField(
+                                               0, arrow::field("id", arrow::int64(), false))),
+                                           DataField::ConvertDataFieldToArrowField(
+                                               DataField(1, arrow::field("value", arrow::utf8())))};
+        std::shared_ptr<arrow::Schema> transport_schema =
+            RealtimePrimaryKeyLayout::CreateSchema(value_fields);
         auto c_schema = std::make_unique<ArrowSchema>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*transport_schema, c_schema.get()));
         RealtimeQueryContext query_context{c_schema.get(), nullptr, false};
