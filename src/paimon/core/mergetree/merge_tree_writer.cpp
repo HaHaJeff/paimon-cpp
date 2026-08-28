@@ -172,11 +172,11 @@ Status MergeTreeWriter::WriteSortedReadersToFiles(
         }
     }
 
-    // 2. prepare loser tree sort merge reader
+    // prepare loser tree sort merge reader
     auto sort_merge_reader = std::make_unique<SortMergeReaderWithLoserTree>(
         std::move(readers), key_comparator_, user_defined_seq_comparator_, merge_function_wrapper_);
     raw_readers_guard.Release();
-    // 3. project key value to arrow array
+    // project key value to arrow array
     auto create_consumer = [target_schema = write_schema_, pool = pool_]()
         -> Result<std::unique_ptr<RowToArrowArrayConverter<KeyValue, KeyValueBatch>>> {
         return KeyValueMetaProjectionConsumer::Create(target_schema, pool);
