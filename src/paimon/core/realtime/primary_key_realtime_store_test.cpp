@@ -361,11 +361,11 @@ TEST(PrimaryKeyRealtimeStoreTest, TestQueryPoolOutlivesStoreReaderAndExport) {
     std::weak_ptr<TestingMemoryPool> pool_lifetime = pool;
     auto write_schema = std::make_unique<ArrowSchema>();
     ASSERT_TRUE(arrow::ExportSchema(*stored_schema, write_schema.get()).ok());
-    RealtimeStoreCreateRequest request{std::move(write_schema),
-                                       /*options=*/{}, pool, RealtimeStoreMode::PRIMARY_KEY};
     ArrowRealtimeStoreFactory factory;
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeStore> store, factory.Create(std::move(request)));
-    request.memory_pool.reset();
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeStore> store,
+                         factory.Create(RealtimeStoreCreateRequest{
+                             std::move(write_schema),
+                             /*options=*/{}, pool, RealtimeStoreMode::PRIMARY_KEY}));
     ASSERT_OK(store->Write(
         RealtimeWriteBatch{MakeBatch(R"([[0, 1, 0, 7, "seven"]])"), OffsetRange(0, 1)}));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<RealtimeReadView> view, store->AcquireReadView());

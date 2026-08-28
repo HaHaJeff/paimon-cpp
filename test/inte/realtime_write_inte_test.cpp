@@ -45,6 +45,7 @@
 #include "paimon/catalog/identifier.h"
 #include "paimon/commit_context.h"
 #include "paimon/common/factories/io_hook.h"
+#include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/path_util.h"
@@ -564,11 +565,18 @@ class CorruptingBatchReader final : public BatchReader {
     }
 
     void Close() override {
-        buffered_.reset();
+        ReleaseBuffered();
         delegate_->Close();
     }
 
  private:
+    void ReleaseBuffered() {
+        if (buffered_.has_value()) {
+            ReaderUtils::ReleaseReadBatch(std::move(buffered_.value()));
+            buffered_.reset();
+        }
+    }
+
     Result<ReadBatch> DropLast() {
         if (!buffered_.has_value()) {
             PAIMON_ASSIGN_OR_RAISE(ReadBatch first, delegate_->NextBatch());
@@ -579,7 +587,7 @@ class CorruptingBatchReader final : public BatchReader {
         }
         PAIMON_ASSIGN_OR_RAISE(ReadBatch next, delegate_->NextBatch());
         if (BatchReader::IsEofBatch(next)) {
-            buffered_.reset();
+            ReleaseBuffered();
             return MakeEofBatch();
         }
         ReadBatch result = std::move(buffered_.value());
@@ -2096,8 +2104,8 @@ TEST_F(RealtimeWriteInteTest, TestPkPartitionBucketRecovery) {
     }
     ASSERT_EQ(OffsetRange(0, 2), first_ranges.at(p0b0));
     ASSERT_EQ(OffsetRange(0, 3), first_ranges.at(p1b1));
-    ASSERT_EQ((std::make_pair<int64_t, int64_t>(0, 1)), first_sequences.at(p0b0));
-    ASSERT_EQ((std::make_pair<int64_t, int64_t>(0, 2)), first_sequences.at(p1b1));
+    ASSERT_EQ((std::pair<int64_t, int64_t>(0, 1)), first_sequences.at(p0b0));
+    ASSERT_EQ((std::pair<int64_t, int64_t>(0, 2)), first_sequences.at(p1b1));
     ASSERT_OK_AND_ASSIGN(int64_t first_snapshot_id,
                          Commit(first_progress, /*commit_identifier=*/0));
     ASSERT_OK(first_writer->RefreshCommittedSnapshot(first_snapshot_id));
@@ -2139,8 +2147,8 @@ TEST_F(RealtimeWriteInteTest, TestPkPartitionBucketRecovery) {
     }
     ASSERT_EQ(OffsetRange(2, 4), second_ranges.at(p0b0));
     ASSERT_EQ(OffsetRange(3, 5), second_ranges.at(p1b1));
-    ASSERT_EQ((std::make_pair<int64_t, int64_t>(2, 3)), second_sequences.at(p0b0));
-    ASSERT_EQ((std::make_pair<int64_t, int64_t>(3, 4)), second_sequences.at(p1b1));
+    ASSERT_EQ((std::pair<int64_t, int64_t>(2, 3)), second_sequences.at(p0b0));
+    ASSERT_EQ((std::pair<int64_t, int64_t>(3, 4)), second_sequences.at(p1b1));
     ASSERT_OK_AND_ASSIGN(int64_t second_snapshot_id,
                          Commit(second_progress, /*commit_identifier=*/1));
     ASSERT_OK(second_writer->RefreshCommittedSnapshot(second_snapshot_id));

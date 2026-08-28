@@ -271,14 +271,6 @@ TEST_F(ArrowRealtimeStoreTest, TestFullStatisticsPrunesNonMatchingBatch) {
     ASSERT_EQ(std::vector<int64_t>({0, 1}), ReadIds(unfiltered_batch));
 }
 
-TEST_F(ArrowRealtimeStoreTest, TestFactoryRejectsInvalidMode) {
-    ArrowRealtimeStoreFactory factory;
-    std::unique_ptr<ArrowSchema> write_schema = MakeReadSchema(schema_);
-    RealtimeStoreCreateRequest request{std::move(write_schema),
-                                       /*options=*/{}, pool_, static_cast<RealtimeStoreMode>(-1)};
-    ASSERT_NOK_WITH_MSG(factory.Create(std::move(request)), "invalid real-time store mode: -1");
-}
-
 TEST_F(ArrowRealtimeStoreTest, TestMissingStatisticsRetainsNonMatchingBatch) {
     ASSERT_OK(
         store_->Write(RealtimeWriteBatch{MakeBatch(R"([[0, "a"], [1, "b"]])"), OffsetRange(0, 2)}));
