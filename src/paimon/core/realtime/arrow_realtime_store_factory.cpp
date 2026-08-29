@@ -25,6 +25,7 @@
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/realtime/arrow_realtime_store.h"
+#include "paimon/core/realtime/primary_key_realtime_store.h"
 #include "paimon/macros.h"
 
 namespace paimon {
@@ -48,8 +49,10 @@ Result<std::shared_ptr<RealtimeStore>> ArrowRealtimeStoreFactory::Create(
                                                         request.memory_pool, arrow_pool);
         }
         case RealtimeStoreMode::PRIMARY_KEY: {
-            return Status::NotImplemented(
-                "primary-key real-time store support is not installed");
+            PAIMON_ASSIGN_OR_RAISE(
+                std::shared_ptr<PrimaryKeyRealtimeStore> store,
+                PrimaryKeyRealtimeStore::Create(imported_schema, request.memory_pool));
+            return std::shared_ptr<RealtimeStore>(std::move(store));
         }
     }
     return Status::Invalid("invalid real-time store mode: ", static_cast<int32_t>(request.mode));
