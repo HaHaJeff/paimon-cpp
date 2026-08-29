@@ -201,7 +201,7 @@ set(PAIMON_REST_LINK_LIBS)
 if(PAIMON_ENABLE_REST)
     set(PAIMON_REST_LINK_LIBS OpenSSL::Crypto)
 endif()
-if(PAIMON_ENABLE_S3)
+if(PAIMON_ENABLE_OSS OR PAIMON_ENABLE_S3)
     list(APPEND PAIMON_COMMON_SRCS common/fs/object_store_file_system.cpp)
 endif()
 
@@ -288,6 +288,7 @@ set(PAIMON_CORE_SRCS
     core/io/vector_file_batch_reader.cpp
     core/io/file_index_evaluator.cpp
     core/io/key_value_data_file_record_reader.cpp
+    core/io/key_value_data_file_writer_factories.cpp
     core/io/key_value_data_file_writer_factory.cpp
     core/io/key_value_data_file_writer.cpp
     core/io/key_value_in_memory_record_reader.cpp
@@ -819,6 +820,7 @@ if(PAIMON_BUILD_TESTS)
                     core/mergetree/compact/deduplicate_merge_function_test.cpp
                     core/mergetree/compact/first_row_merge_function_test.cpp
                     core/mergetree/compact/first_row_merge_function_wrapper_test.cpp
+                    core/mergetree/compact/internal_row_equalizer_test.cpp
                     core/mergetree/compact/interval_partition_test.cpp
                     core/mergetree/compact/lookup_changelog_merge_function_wrapper_test.cpp
                     core/mergetree/compact/lookup_merge_tree_compact_rewriter_test.cpp
@@ -953,7 +955,7 @@ if(PAIMON_BUILD_TESTS)
     endif()
 
     set(PAIMON_OBJECT_STORE_FS_TEST_SOURCES)
-    if(PAIMON_ENABLE_S3)
+    if(PAIMON_ENABLE_OSS OR PAIMON_ENABLE_S3)
         list(APPEND PAIMON_OBJECT_STORE_FS_TEST_SOURCES
              common/fs/object_store_file_system_test.cpp)
     endif()

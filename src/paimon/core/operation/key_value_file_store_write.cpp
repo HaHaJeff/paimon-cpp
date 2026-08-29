@@ -84,7 +84,7 @@ KeyValueFileStoreWrite::KeyValueFileStoreWrite(
       compact_manager_factory_(std::make_unique<MergeTreeCompactManagerFactory>(
           options_, key_comparator_, user_defined_seq_comparator_, compaction_metrics_,
           table_schema_, schema_, schema_manager_, io_manager_, cache_manager_,
-          file_store_path_factory_, root_path_, pool_)),
+          file_store_path_factory_, root_path_, ignore_previous_files, pool_)),
       logger_(Logger::GetLogger("KeyValueFileStoreWrite")) {
     if (realtime_context_) {
         writer_memory_manager_ = std::make_unique<NoopWriterMemoryManager>();

@@ -17,6 +17,8 @@
  * under the License.
  */
 
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,6 +28,7 @@
 #include "gtest/gtest.h"
 #include "paimon/common/data/binary_row.h"
 #include "paimon/common/data/data_define.h"
+#include "paimon/common/utils/math.h"
 #include "paimon/core/global_index/indexed_split_impl.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/fs/local/local_file_system.h"
@@ -153,6 +156,34 @@ TEST(IndexedSplitTest, TestIndexedSplitWithScore) {
     auto roundtrip_indexed_split = std::dynamic_pointer_cast<IndexedSplitImpl>(roundtrip);
     ASSERT_EQ(*roundtrip_indexed_split, *expected_indexed_split)
         << roundtrip_indexed_split->ToString();
+}
+
+TEST(IndexedSplitTest, TestSerializeCanonicalizesNaNScore) {
+    auto pool = GetDefaultPool();
+    DataSplitImpl::Builder builder(
+        /*partition=*/BinaryRow::EmptyRow(),
+        /*bucket=*/0, /*bucket_path=*/"bucket-0",
+        /*data_files=*/{});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<DataSplitImpl> data_split, builder.Build());
+
+    const auto payload_nan = FloatingPointFromBits<float>(0xffc12345U);
+    const auto canonical_nan = FloatingPointFromBits<float>(kCanonicalFloatNaNBits);
+    auto indexed_split = std::make_shared<IndexedSplitImpl>(
+        data_split, std::vector<Range>{Range(0, 0)}, std::vector<float>{payload_nan});
+    auto canonical_indexed_split = std::make_shared<IndexedSplitImpl>(
+        data_split, std::vector<Range>{Range(0, 0)}, std::vector<float>{canonical_nan});
+
+    ASSERT_OK_AND_ASSIGN(std::string serialized, Split::Serialize(indexed_split, pool));
+    ASSERT_OK_AND_ASSIGN(std::string canonical_serialized,
+                         Split::Serialize(canonical_indexed_split, pool));
+    ASSERT_EQ(serialized, canonical_serialized);
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Split> roundtrip,
+                         Split::Deserialize(serialized.data(), serialized.size(), pool));
+    auto roundtrip_indexed_split = std::dynamic_pointer_cast<IndexedSplitImpl>(roundtrip);
+    ASSERT_TRUE(roundtrip_indexed_split);
+    ASSERT_EQ(roundtrip_indexed_split->Scores().size(), 1);
+    ASSERT_TRUE(std::isnan(roundtrip_indexed_split->Scores()[0]));
 }
 
 TEST(IndexedSplitTest, TestValidate) {
