@@ -100,6 +100,10 @@ class PAIMON_EXPORT FileStoreWrite {
     /// @param commit_identifier Identifier of this prepare-commit operation in streaming mode.
     /// @return Real-time commit messages with their partition-bucket offset ranges.
     /// @note Calling this method on a non-real-time writer or in batch mode returns an error.
+    /// @note If a write or prepare-commit fails after its in-memory effects may have changed, the
+    ///       caller must discard the writer and `RealtimeContext`, recreate both from the latest
+    ///       committed snapshot, and replay the uncommitted mutations from an external WAL. The
+    ///       real-time store is not a durable WAL and the failed writer must not be reused.
     virtual Result<std::vector<RealtimeCommitProgress>> PrepareCommitWithProgress(
         int64_t commit_identifier);
 

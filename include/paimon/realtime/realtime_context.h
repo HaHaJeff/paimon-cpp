@@ -74,6 +74,10 @@ using RealtimeOffsetMap = std::map<RealtimePartitionBucket, int64_t>;
 /// applications. Customize real-time storage and retrieval through `RealtimeStoreFactory` and
 /// `RealtimeStore` instead.
 ///
+/// A context belongs to one table and branch and supports one active `FileStoreWrite`. Do not
+/// reuse it for another table or branch, or concurrently from multiple active writers. Share that
+/// same context with the table's scan and read contexts so process-local rows remain visible.
+///
 /// A context is valid only for one uninterrupted committed-progress history. Overwrite, truncate,
 /// partition drop, and rollback operations do not automatically clear process-local real-time
 /// state. Applications must coordinate these operations with active real-time writers and recreate
