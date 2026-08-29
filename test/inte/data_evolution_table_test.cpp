@@ -32,6 +32,7 @@
 #include "paimon/core/global_index/indexed_split_impl.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/defs.h"
+#include "paimon/format/mosaic/mosaic_format_defs.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/global_index/bitmap_global_index_result.h"
 #include "paimon/global_index/indexed_split.h"
@@ -90,27 +91,36 @@ class DataEvolutionTableTest : public ::testing::Test,
         return CreateTable(/*partition_keys=*/{});
     }
 
-    Result<std::vector<std::shared_ptr<CommitMessage>>> WriteArray(
+    Result<std::vector<std::shared_ptr<CommitMessage>>> WriteArrays(
         const std::string& table_path, const std::map<std::string, std::string>& partition,
         const std::vector<std::string>& write_cols,
-        const std::shared_ptr<arrow::Array>& write_array) const {
+        const std::vector<std::shared_ptr<arrow::Array>>& write_arrays) const {
         // write
         WriteContextBuilder write_builder(table_path, "commit_user_1");
         write_builder.WithWriteSchema(write_cols);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteContext> write_context, write_builder.Finish());
         PAIMON_ASSIGN_OR_RAISE(auto file_store_write,
                                FileStoreWrite::Create(std::move(write_context)));
-        ArrowArray c_array;
-        EXPECT_TRUE(arrow::ExportArray(*write_array, &c_array).ok());
-        auto record_batch = std::make_unique<RecordBatch>(
-            partition, /*bucket=*/0,
-            /*row_kinds=*/std::vector<RecordBatch::RowKind>(), &c_array);
-        PAIMON_RETURN_NOT_OK(file_store_write->Write(std::move(record_batch)));
+        for (const auto& write_array : write_arrays) {
+            ArrowArray c_array;
+            PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*write_array, &c_array));
+            auto record_batch = std::make_unique<RecordBatch>(
+                partition, /*bucket=*/0,
+                /*row_kinds=*/std::vector<RecordBatch::RowKind>(), &c_array);
+            PAIMON_RETURN_NOT_OK(file_store_write->Write(std::move(record_batch)));
+        }
         PAIMON_ASSIGN_OR_RAISE(auto commit_msgs,
                                file_store_write->PrepareCommit(
                                    /*wait_compaction=*/false, /*commit_identifier=*/0));
         PAIMON_RETURN_NOT_OK(file_store_write->Close());
         return commit_msgs;
+    }
+
+    Result<std::vector<std::shared_ptr<CommitMessage>>> WriteArray(
+        const std::string& table_path, const std::map<std::string, std::string>& partition,
+        const std::vector<std::string>& write_cols,
+        const std::shared_ptr<arrow::Array>& write_array) const {
+        return WriteArrays(table_path, partition, write_cols, {write_array});
     }
 
     Result<std::vector<std::shared_ptr<CommitMessage>>> WriteArray(
@@ -400,10 +410,11 @@ class DataEvolutionTableTest : public ::testing::Test,
                        const std::shared_ptr<arrow::StructArray>& expected_array,
                        const std::shared_ptr<Predicate>& predicate = nullptr,
                        const std::vector<Range>& row_ranges = {},
-                       bool check_scan_plan_when_empty_result = true) const {
+                       bool check_scan_plan_when_empty_result = true,
+                       bool apply_predicate_to_scan = true) const {
         // scan
         ScanContextBuilder scan_context_builder(table_path);
-        scan_context_builder.SetPredicate(predicate);
+        scan_context_builder.SetPredicate(apply_predicate_to_scan ? predicate : nullptr);
         if (!row_ranges.empty()) {
             auto global_index_result = BitmapGlobalIndexResult::FromRanges(row_ranges);
             scan_context_builder.SetGlobalIndexResult(global_index_result);
@@ -839,6 +850,9 @@ TEST_P(DataEvolutionTableTest, TestOnlySomeColumns) {
 }
 
 TEST_P(DataEvolutionTableTest, TestMultipleSharedShreddingMapsPartialOverwrite) {
+    if (FileFormat() == "mosaic") {
+        return;
+    }
     if (FileFormat() == "avro") {
         return;
     }
@@ -1477,6 +1491,9 @@ TEST_P(DataEvolutionTableTest, TestPartitionWithPredicate) {
         {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, FileFormat()},
         {Options::FILE_SYSTEM, "local"},           {Options::ROW_TRACKING_ENABLED, "true"},
         {Options::DATA_EVOLUTION_ENABLED, "true"}, {"parquet.write.max-row-group-length", "1"}};
+    if (file_format == "mosaic") {
+        options.emplace(mosaic::MOSAIC_STATS_COLUMNS, "f0");
+    }
 
     CreateTable(partition_keys, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
@@ -1642,6 +1659,9 @@ TEST_P(DataEvolutionTableTest, TestPartitionWithPredicate) {
 
 TEST_P(DataEvolutionTableTest, TestAlterTable) {
     auto file_format = FileFormat();
+    if (file_format == "mosaic") {
+        return;
+    }
     if (file_format == "avro") {
         return;
     }
@@ -1738,6 +1758,9 @@ TEST_P(DataEvolutionTableTest, TestAlterTable) {
 }
 
 TEST_P(DataEvolutionTableTest, TestReadCompactFiles) {
+    if (FileFormat() == "mosaic") {
+        return;
+    }
     auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
@@ -1768,6 +1791,9 @@ TEST_P(DataEvolutionTableTest, TestReadCompactFiles) {
 }
 
 TEST_P(DataEvolutionTableTest, TestReadTableWithDenseStats) {
+    if (FileFormat() == "mosaic") {
+        return;
+    }
     auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
@@ -1849,6 +1875,9 @@ TEST_P(DataEvolutionTableTest, TestReadTableWithDenseStats) {
 }
 
 TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
+    if (FileFormat() == "mosaic") {
+        return;
+    }
     auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
@@ -1880,7 +1909,7 @@ TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
                               expected_array));
     }
     {
-        // first 4 records read with data evolution, ignore index
+        // The old file's f2 index does not contain 102, but the newer file owns f2.
         auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
                                                  FieldType::INT, Literal(102));
         auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
@@ -1892,51 +1921,45 @@ TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
     ])")
                 .ValueOrDie());
         ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
-                              expected_array, predicate));
+                              expected_array, predicate,
+                              /*row_ranges=*/{},
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
     }
     {
-        // f2 has bitmap index, but data evolution scan and read ignore index
+        // The bitmap proves that neither row range group contains f2 = 103.
         auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
                                                  FieldType::INT, Literal(103));
-        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow_data_type, R"([
-        ["Lily", 2, 102, 2.1],
-        ["Alice", 4, 104, 3.1],
-        ["Bob", 6, 106, 4.1],
-        ["David", 8, 108, 5.1]
-    ])")
-                .ValueOrDie());
         ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
-                              expected_array, predicate));
+                              /*expected_array=*/nullptr, predicate,
+                              /*row_ranges=*/{},
+                              /*check_scan_plan_when_empty_result=*/false,
+                              /*apply_predicate_to_scan=*/false));
     }
     {
-        // f2 has bitmap index, data evolution scan will ignore index => not empty plan
-        // data evolution split read will also ignore index => not empty read batch
+        // Scan planning keeps the split, but reader-side indexes skip both row range groups.
         auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
                                                  FieldType::INT, Literal(203));
+        ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
+                              /*expected_array=*/nullptr, predicate,
+                              /*row_ranges=*/{},
+                              /*check_scan_plan_when_empty_result=*/false,
+                              /*apply_predicate_to_scan=*/false));
+    }
+    {
+        // A single-file group applies the exact bitmap row selection.
+        auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
+                                                 FieldType::INT, Literal(202));
         auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
             arrow::ipc::internal::json::ArrayFromJSON(arrow_data_type, R"([
-        [null, null, 202, 6.1],
-        [null, null, 204, 7.1]
+        [null, null, 202, 6.1]
     ])")
                 .ValueOrDie());
         ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
                               expected_array, predicate,
                               /*row_ranges=*/{},
-                              /*check_scan_plan_when_empty_result=*/true));
-    }
-    {
-        // f2 has bitmap index, data evolution split read will ignore index
-        auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
-                                                 FieldType::INT, Literal(202));
-        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow_data_type, R"([
-        [null, null, 202, 6.1],
-        [null, null, 204, 7.1]
-    ])")
-                .ValueOrDie());
-        ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
-                              expected_array, predicate));
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
     }
     {
         auto predicate =
@@ -1953,7 +1976,7 @@ TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
     {
         // test row id with predicate
         std::vector<Range> row_ranges = {Range(0l, 2l)};
-        // row id = {0, 1, 2}, while data evolution split read will ignore index
+        // A merged group keeps all selected row ids to preserve column alignment.
         auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
                                                  FieldType::INT, Literal(106));
         CheckScanResult(table_path, /*predicate=*/predicate, /*row_ranges=*/row_ranges,
@@ -1967,26 +1990,195 @@ TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
                 .ValueOrDie());
         ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
                               expected_array, predicate,
-                              /*row_ranges=*/row_ranges));
+                              /*row_ranges=*/row_ranges,
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
     }
     {
         // test row id with predicate
         std::vector<Range> row_ranges = {Range(4l, 5l)};
-        // row id = {4, 5}, data evolution split read will ignore bitmap index
+        // The single-file bitmap selection is intersected with the row-id selection.
         auto predicate = PredicateBuilder::Equal(/*field_index=*/2, /*field_name=*/"f2",
                                                  FieldType::INT, Literal(204));
         CheckScanResult(table_path, /*predicate=*/predicate, /*row_ranges=*/row_ranges,
                         /*expected_first_row_ids=*/{4}, /*expected_row_counts=*/{2});
         auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
             arrow::ipc::internal::json::ArrayFromJSON(arrow_data_type, R"([
-        [null, null, 202, 6.1],
         [null, null, 204, 7.1]
     ])")
                 .ValueOrDie());
         ASSERT_OK(ScanAndRead(table_path, arrow::schema(arrow_data_type->fields())->field_names(),
                               expected_array, predicate,
-                              /*row_ranges=*/row_ranges));
+                              /*row_ranges=*/row_ranges,
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
     }
+}
+
+TEST_P(DataEvolutionTableTest, TestDataEvolutionPredicatePushDownBoundaries) {
+    if (FileFormat() == "mosaic") {
+        return;
+    }
+    auto file_format = FileFormat();
+    if (file_format == "avro") {
+        return;
+    }
+    std::string table_path = paimon::test::GetDataDir() + file_format +
+                             "/data_evolution_with_index.db/data_evolution_with_index";
+
+    {
+        // A file without f0 must not interpret the predicate as f0 = null.
+        auto predicate = PredicateBuilder::Equal(
+            /*field_index=*/0, /*field_name=*/"f0", FieldType::STRING,
+            Literal(FieldType::STRING, "Lily", 4));
+        auto read_type =
+            arrow::struct_({arrow::field("f0", arrow::utf8()), arrow::field("f2", arrow::int32())});
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(read_type, R"([
+        ["Lily", 102],
+        ["Alice", 104],
+        ["Bob", 106],
+        ["David", 108],
+        [null, 202],
+        [null, 204]
+    ])")
+                .ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, {"f0", "f2"}, expected_array, predicate,
+                              /*row_ranges=*/{},
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
+    }
+    {
+        // System fields are completed after reading and cannot be pushed into data files.
+        auto predicate = PredicateBuilder::Equal(/*field_index=*/1, /*field_name=*/"_ROW_ID",
+                                                 FieldType::BIGINT, Literal(99l));
+        auto read_type =
+            arrow::struct_({arrow::field("f2", arrow::int32()), SpecialFields::RowId().field_});
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(read_type, R"([
+        [102, 0],
+        [104, 1],
+        [106, 2],
+        [108, 3],
+        [202, 4],
+        [204, 5]
+    ])")
+                .ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, {"f2", "_ROW_ID"}, expected_array, predicate,
+                              /*row_ranges=*/{},
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
+    }
+    {
+        // Dropping a system-field conjunct must not drop a pushable data conjunct.
+        auto data_predicate = PredicateBuilder::Equal(
+            /*field_index=*/0, /*field_name=*/"f2", FieldType::INT, Literal(103));
+        auto system_predicate = PredicateBuilder::Equal(
+            /*field_index=*/1, /*field_name=*/"_ROW_ID", FieldType::BIGINT, Literal(0l));
+        ASSERT_OK_AND_ASSIGN(auto predicate,
+                             PredicateBuilder::And({data_predicate, system_predicate}));
+        ASSERT_OK(ScanAndRead(table_path, {"f2", "_ROW_ID"}, /*expected_array=*/nullptr, predicate,
+                              /*row_ranges=*/{},
+                              /*check_scan_plan_when_empty_result=*/false,
+                              /*apply_predicate_to_scan=*/false));
+    }
+    {
+        // Bitmap positions compose with row ranges without changing the physical row id.
+        auto predicate = PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f2",
+                                                 FieldType::INT, Literal(204));
+        auto read_type =
+            arrow::struct_({arrow::field("f2", arrow::int32()), SpecialFields::RowId().field_});
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(read_type, R"([
+        [204, 5]
+    ])")
+                .ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, {"f2", "_ROW_ID"}, expected_array, predicate,
+                              /*row_ranges=*/{Range(4l, 5l)},
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
+    }
+    {
+        // The bitmap selects row id 5 while the global-index selection keeps only row id 4.
+        auto predicate = PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f2",
+                                                 FieldType::INT, Literal(204));
+        ASSERT_OK(ScanAndRead(table_path, {"f2", "_ROW_ID"}, /*expected_array=*/nullptr, predicate,
+                              /*row_ranges=*/{Range(4l, 4l)},
+                              /*check_scan_plan_when_empty_result=*/false,
+                              /*apply_predicate_to_scan=*/false));
+    }
+    {
+        // The predicate keeps row ids {4, 5}; the global-index selection keeps {0, 1, 2, 3, 4}.
+        auto equal_202 = PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f2",
+                                                 FieldType::INT, Literal(202));
+        auto equal_204 = PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f2",
+                                                 FieldType::INT, Literal(204));
+        ASSERT_OK_AND_ASSIGN(auto predicate, PredicateBuilder::Or({equal_202, equal_204}));
+        auto read_type =
+            arrow::struct_({arrow::field("f2", arrow::int32()), SpecialFields::RowId().field_});
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(read_type, R"([
+        [202, 4]
+    ])")
+                .ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, {"f2", "_ROW_ID"}, expected_array, predicate,
+                              /*row_ranges=*/{Range(0l, 4l)},
+                              /*check_scan_plan_when_empty_result=*/true,
+                              /*apply_predicate_to_scan=*/false));
+    }
+}
+
+TEST_P(DataEvolutionTableTest, TestFormatPredicatePushDownWithoutFileIndex) {
+    if (FileFormat() == "avro") {
+        return;
+    }
+
+    std::map<std::string, std::string> options = {{Options::FILE_INDEX_READ_ENABLED, "false"},
+                                                  {Options::WRITE_BATCH_SIZE, "1"},
+                                                  {"parquet.page.size", "1"},
+                                                  {"parquet.enable-dictionary", "false"},
+                                                  {"parquet.write.enable-page-index", "true"},
+                                                  {"parquet.read.enable-page-index-filter", "true"},
+                                                  {"orc.stripe.size", "1"},
+                                                  {"orc.row.index.stride", "1"}};
+    if (FileFormat() == "mosaic") {
+        options.emplace(Options::FILE_BLOCK_SIZE, "1 B");
+        options.emplace(mosaic::MOSAIC_STATS_COLUMNS, "f0");
+    }
+    CreateDataEvolutionTable(/*deletion_vectors_enabled=*/false, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto input = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_), R"([
+        [1, "a", "x"],
+        [2, "b", "y"],
+        [3, "c", "z"],
+        [4, "d", "w"]
+    ])")
+            .ValueOrDie());
+    std::vector<std::shared_ptr<arrow::Array>> write_arrays;
+    for (int64_t i = 0; i < input->length(); i++) {
+        arrow::ArrayVector children;
+        for (const auto& child : input->fields()) {
+            children.push_back(child->Slice(i, 1));
+        }
+        write_arrays.push_back(arrow::StructArray::Make(children, fields_).ValueOrDie());
+    }
+    ASSERT_OK_AND_ASSIGN(auto commit_messages, WriteArrays(table_path, /*partition=*/{},
+                                                           {"f0", "f1", "f2"}, write_arrays));
+    ASSERT_OK(Commit(table_path, commit_messages));
+
+    auto predicate =
+        PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f0", FieldType::INT, Literal(3));
+    auto expected = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_), R"([
+        [3, "c", "z"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2"}, expected, predicate,
+                          /*row_ranges=*/{},
+                          /*check_scan_plan_when_empty_result=*/true,
+                          /*apply_predicate_to_scan=*/true));
 }
 
 TEST_P(DataEvolutionTableTest, TestPredicate) {
@@ -1994,7 +2186,16 @@ TEST_P(DataEvolutionTableTest, TestPredicate) {
         // Avro does not have stats.
         return;
     }
-    CreateTable();
+    if (FileFormat() == "mosaic") {
+        CreateTable(/*partition_keys=*/{}, {{Options::MANIFEST_FORMAT, "orc"},
+                                            {Options::FILE_FORMAT, FileFormat()},
+                                            {Options::FILE_SYSTEM, "local"},
+                                            {Options::ROW_TRACKING_ENABLED, "true"},
+                                            {Options::DATA_EVOLUTION_ENABLED, "true"},
+                                            {mosaic::MOSAIC_STATS_COLUMNS, "f0,f1,f2"}});
+    } else {
+        CreateTable();
+    }
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
     auto schema = arrow::schema(fields_);
 
@@ -2135,6 +2336,9 @@ TEST_P(DataEvolutionTableTest, TestWithRowIds) {
                                                   {Options::FILE_SYSTEM, "local"},
                                                   {Options::ROW_TRACKING_ENABLED, "true"},
                                                   {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    if (FileFormat() == "mosaic") {
+        options.emplace(mosaic::MOSAIC_STATS_COLUMNS, "f0,f1");
+    }
     CreateTable(/*partition_keys=*/{}, options);
 
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
@@ -2951,6 +3155,9 @@ std::vector<DataEvolutionTableParam> GetTestValuesForDataEvolutionTableTest() {
     std::vector<DataEvolutionTableParam> values;
     for (bool enable_snapshot_live_manifest_cache : {false, true}) {
         values.emplace_back("parquet", enable_snapshot_live_manifest_cache);
+#ifdef PAIMON_ENABLE_MOSAIC
+        values.emplace_back("mosaic", enable_snapshot_live_manifest_cache);
+#endif
 #ifdef PAIMON_ENABLE_ORC
         values.emplace_back("orc", enable_snapshot_live_manifest_cache);
 #endif

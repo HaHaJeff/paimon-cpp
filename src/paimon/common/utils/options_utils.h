@@ -76,13 +76,42 @@ class OptionsUtils {
         return value.value();
     }
 
+    template <typename T>
+    static Result<std::optional<T>> GetOptionalValueFromMap(
+        const std::map<std::string, std::string>& key_value_map, const std::string& key) {
+        Result<T> value = GetValueFromMap<T>(key_value_map, key);
+        if (value.ok()) {
+            return std::optional<T>(value.value());
+        }
+        if (value.status().IsNotExist()) {
+            return std::optional<T>();
+        }
+        return value.status();
+    }
+
+    static Result<std::string> GetNonEmptyValueFromMap(
+        const std::map<std::string, std::string>& key_value_map, const std::string& key) {
+        Result<std::string> value = GetValueFromMap<std::string>(key_value_map, key);
+        if (!value.ok()) {
+            return value.status();
+        }
+        if (value.value().empty()) {
+            return Status::Invalid(fmt::format("value for key {} must not be empty", key));
+        }
+        return value.value();
+    }
+
     /// Fetch options with specific prefix and remove prefix for key.
+    /// @param prefix Prefix used to select options and removed from the returned keys.
+    /// @param options Options to select from.
+    /// @return Options whose keys start with and are longer than `prefix`, with the prefix removed
+    /// from each key.
     static std::map<std::string, std::string> FetchOptionsWithPrefix(
         const std::string& prefix, const std::map<std::string, std::string>& options) {
         std::map<std::string, std::string> options_with_prefix;
-        int64_t prefix_len = prefix.size();
+        const std::string::size_type prefix_len = prefix.size();
         for (const auto& [key, value] : options) {
-            if (StringUtils::StartsWith(key, prefix)) {
+            if (key.size() > prefix_len && StringUtils::StartsWith(key, prefix)) {
                 options_with_prefix[key.substr(prefix_len)] = value;
             }
         }

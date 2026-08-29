@@ -85,6 +85,7 @@ set(PAIMON_COMMON_SRCS
     common/global_index/global_indexer_factory.cpp
     common/io/buffered_input_stream.cpp
     common/io/byte_array_input_stream.cpp
+    common/io/byte_array_output_stream.cpp
     common/io/data_input_stream.cpp
     common/io/data_output_stream.cpp
     common/io/memory_segment_output_stream.cpp
@@ -133,6 +134,7 @@ set(PAIMON_COMMON_SRCS
     common/predicate/starts_with.cpp
     common/reader/batch_reader.cpp
     common/reader/concat_batch_reader.cpp
+    common/reader/late_materializing_file_batch_reader.cpp
     common/reader/predicate_batch_reader.cpp
     common/reader/prefetch_file_batch_reader_impl.cpp
     common/reader/reader_utils.cpp
@@ -157,6 +159,7 @@ set(PAIMON_COMMON_SRCS
     common/utils/arrow/arrow_output_stream_adapter.cpp
     common/utils/arrow/arrow_utils.cpp
     common/utils/arrow/mem_utils.cpp
+    common/utils/arrow/vector_utils.cpp
     common/utils/binary_row_partition_computer.cpp
     common/utils/bit_set.cpp
     common/utils/bloom_filter.cpp
@@ -171,7 +174,7 @@ set(PAIMON_COMMON_SRCS
     common/data/shredding/map_shared_shredding_batch_converter.cpp
     common/data/shredding/map_shared_shredding_column_allocator.cpp
     common/data/shredding/lru_map_shared_shredding_column_allocator.cpp
-    common/data/shredding/map_shared_shredding_file_reader.cpp
+    common/data/shredding/map_shared_shredding_read_plan_factory.cpp
     common/data/shredding/shredding_file_reader.cpp
     common/utils/delta_varint_compressor.cpp
     common/utils/fields_comparator.cpp
@@ -194,7 +197,11 @@ if(PAIMON_ENABLE_S3 OR PAIMON_ENABLE_REST)
     list(APPEND PAIMON_COMMON_SRCS common/utils/http_client.cpp)
     set(PAIMON_CURL_LINK_LIBS CURL::libcurl)
 endif()
-if(PAIMON_ENABLE_S3)
+set(PAIMON_REST_LINK_LIBS)
+if(PAIMON_ENABLE_REST)
+    set(PAIMON_REST_LINK_LIBS OpenSSL::Crypto)
+endif()
+if(PAIMON_ENABLE_OSS OR PAIMON_ENABLE_S3)
     list(APPEND PAIMON_COMMON_SRCS common/fs/object_store_file_system.cpp)
 endif()
 
@@ -268,15 +275,20 @@ set(PAIMON_CORE_SRCS
     core/io/data_file_meta_first_row_id_legacy_serializer.cpp
     core/io/data_file_meta.cpp
     core/io/data_file_meta_serializer.cpp
+    core/io/data_file_meta_write_cols_legacy_serializer.cpp
     core/io/data_file_path_factory.cpp
+    core/io/data_file_index_writer.cpp
+    core/io/file_index_options.cpp
     core/io/append_data_file_writer_factory.cpp
     core/io/blob_data_file_writer_factory.cpp
     core/io/data_file_writer_factory.cpp
     core/io/data_file_writer.cpp
     core/io/field_mapping_reader.cpp
     core/io/complete_row_tracking_fields_reader.cpp
+    core/io/vector_file_batch_reader.cpp
     core/io/file_index_evaluator.cpp
     core/io/key_value_data_file_record_reader.cpp
+    core/io/key_value_data_file_writer_factories.cpp
     core/io/key_value_data_file_writer_factory.cpp
     core/io/key_value_data_file_writer.cpp
     core/io/key_value_in_memory_record_reader.cpp
@@ -373,9 +385,12 @@ set(PAIMON_CORE_SRCS
     core/operation/write_restore.cpp
     core/realtime/arrow_realtime_store.cpp
     core/realtime/arrow_realtime_store_factory.cpp
+    core/realtime/realtime_primary_key_reader.cpp
+    core/realtime/primary_key_realtime_store.cpp
     core/realtime/realtime_append_only_writer.cpp
     core/realtime/realtime_context.cpp
     core/realtime/realtime_context_impl.cpp
+    core/realtime/realtime_primary_key_writer.cpp
     core/postpone/postpone_bucket_writer.cpp
     core/schema/arrow_schema_validator.cpp
     core/schema/schema_manager.cpp
@@ -444,6 +459,7 @@ if(PAIMON_ENABLE_REST)
          rest/resource_paths.cpp
          rest/rest_api.cpp
          rest/rest_auth.cpp
+         rest/dlf_auth.cpp
          rest/rest_catalog.cpp
          rest/rest_messages.cpp
          rest/rest_util.cpp)
@@ -463,6 +479,7 @@ add_paimon_lib(paimon
                Threads::Threads
                RapidJSON
                ${PAIMON_CURL_LINK_LIBS}
+               ${PAIMON_REST_LINK_LIBS}
                DataSketches
                STATIC_LINK_LIBS
                arrow
@@ -475,6 +492,7 @@ add_paimon_lib(paimon
                RapidJSON
                DataSketches
                ${PAIMON_CURL_LINK_LIBS}
+               ${PAIMON_REST_LINK_LIBS}
                SHARED_LINK_FLAGS
                ${PAIMON_VERSION_SCRIPT_FLAGS})
 
@@ -575,6 +593,7 @@ if(PAIMON_BUILD_TESTS)
                     common/global_index/rangebitmap/range_bitmap_global_index_test.cpp
                     common/global_index/wrap/file_index_reader_wrapper_test.cpp
                     common/io/byte_array_input_stream_test.cpp
+                    common/io/byte_array_output_stream_test.cpp
                     common/io/data_input_output_stream_test.cpp
                     common/io/buffered_input_stream_test.cpp
                     common/io/memory_segment_output_stream_test.cpp
@@ -593,6 +612,7 @@ if(PAIMON_BUILD_TESTS)
                     common/predicate/predicate_utils_test.cpp
                     common/predicate/predicate_validator_test.cpp
                     common/reader/concat_batch_reader_test.cpp
+                    common/reader/late_materializing_file_batch_reader_test.cpp
                     common/reader/predicate_batch_reader_test.cpp
                     common/reader/prefetch_file_batch_reader_impl_test.cpp
                     common/reader/reader_utils_test.cpp
@@ -611,6 +631,7 @@ if(PAIMON_BUILD_TESTS)
                     common/utils/row_range_index_test.cpp
                     common/utils/var_length_int_utils_test.cpp
                     common/utils/arrow/arrow_utils_test.cpp
+                    common/utils/arrow/vector_utils_test.cpp
                     common/utils/arrow/arrow_stream_adapter_test.cpp
                     common/utils/arrow/mem_utils_test.cpp
                     common/utils/arrow/status_utils_test.cpp
@@ -644,7 +665,9 @@ if(PAIMON_BUILD_TESTS)
                     common/utils/range_helper_test.cpp
                     common/utils/read_ahead_cache_test.cpp
                     common/io/cache/lru_cache_test.cpp
+                    common/io/cache/cache_manager_test.cpp
                     common/utils/byte_range_combiner_test.cpp
+                    common/utils/saturating_cast_test.cpp
                     common/utils/scope_guard_test.cpp
                     common/utils/sensitive_config_utils_test.cpp
                     common/utils/serialization_utils_test.cpp
@@ -666,7 +689,7 @@ if(PAIMON_BUILD_TESTS)
                     common/data/shredding/sequential_map_shared_shredding_column_allocator_test.cpp
                     common/data/shredding/map_shared_shredding_field_dict_test.cpp
                     common/data/shredding/map_shared_shredding_context_test.cpp
-                    common/data/shredding/map_shared_shredding_file_reader_test.cpp
+                    common/data/shredding/map_shared_shredding_read_plan_factory_test.cpp
                     STATIC_LINK_LIBS
                     paimon_shared
                     test_utils_static
@@ -675,6 +698,7 @@ if(PAIMON_BUILD_TESTS)
 
     add_paimon_test(common_factories_test
                     SOURCES
+                    common/factories/singleton_test.cpp
                     common/factories/factory_creator_test.cpp
                     common/factories/io_hook_test.cpp
                     STATIC_LINK_LIBS
@@ -747,7 +771,10 @@ if(PAIMON_BUILD_TESTS)
                     core/io/key_value_in_memory_record_reader_test.cpp
                     core/io/merged_key_value_record_reader_test.cpp
                     core/io/complete_row_tracking_fields_reader_test.cpp
+                    core/io/vector_file_batch_reader_test.cpp
                     core/io/data_file_meta_test.cpp
+                    core/io/data_file_index_writer_test.cpp
+                    core/io/file_index_options_test.cpp
                     core/io/file_index_evaluator_test.cpp
                     core/io/single_file_writer_test.cpp
                     core/io/rolling_blob_file_writer_test.cpp
@@ -767,6 +794,8 @@ if(PAIMON_BUILD_TESTS)
                     core/manifest/index_manifest_file_handler_test.cpp
                     core/memory/writer_memory_manager_test.cpp
                     core/realtime/arrow_realtime_store_test.cpp
+                    core/realtime/primary_key_realtime_store_test.cpp
+                    core/realtime/realtime_primary_key_reader_test.cpp
                     core/realtime/realtime_context_test.cpp
                     core/realtime/realtime_reader_test.cpp
                     core/mergetree/levels_test.cpp
@@ -791,6 +820,7 @@ if(PAIMON_BUILD_TESTS)
                     core/mergetree/compact/deduplicate_merge_function_test.cpp
                     core/mergetree/compact/first_row_merge_function_test.cpp
                     core/mergetree/compact/first_row_merge_function_wrapper_test.cpp
+                    core/mergetree/compact/internal_row_equalizer_test.cpp
                     core/mergetree/compact/interval_partition_test.cpp
                     core/mergetree/compact/lookup_changelog_merge_function_wrapper_test.cpp
                     core/mergetree/compact/lookup_merge_tree_compact_rewriter_test.cpp
@@ -895,6 +925,7 @@ if(PAIMON_BUILD_TESTS)
                     core/utils/file_utils_test.cpp
                     core/utils/manifest_meta_reader_test.cpp
                     core/utils/offset_row_test.cpp
+                    core/utils/partition_utils_test.cpp
                     core/utils/partition_path_utils_test.cpp
                     core/utils/snapshot_manager_test.cpp
                     core/utils/tag_manager_test.cpp
@@ -924,7 +955,7 @@ if(PAIMON_BUILD_TESTS)
     endif()
 
     set(PAIMON_OBJECT_STORE_FS_TEST_SOURCES)
-    if(PAIMON_ENABLE_S3)
+    if(PAIMON_ENABLE_OSS OR PAIMON_ENABLE_S3)
         list(APPEND PAIMON_OBJECT_STORE_FS_TEST_SOURCES
              common/fs/object_store_file_system_test.cpp)
     endif()
@@ -951,6 +982,7 @@ if(PAIMON_BUILD_TESTS)
                         rest/rest_http_client_test.cpp
                         rest/mock_rest_server.cpp
                         rest/resource_paths_test.cpp
+                        rest/dlf_auth_test.cpp
                         rest/rest_catalog_test.cpp
                         rest/rest_messages_test.cpp
                         rest/rest_util_test.cpp

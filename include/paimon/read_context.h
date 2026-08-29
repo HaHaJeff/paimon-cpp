@@ -30,7 +30,7 @@
 #include "paimon/predicate/predicate.h"
 #include "paimon/result.h"
 #include "paimon/type_fwd.h"
-#include "paimon/utils/read_ahead_cache.h"
+#include "paimon/utils/prefetch_cache_config.h"
 #include "paimon/visibility.h"
 
 namespace paimon {
@@ -51,7 +51,7 @@ class PAIMON_EXPORT ReadContext {
                 const std::vector<std::string>& read_field_names,
                 const std::vector<int32_t>& read_field_ids,
                 const std::shared_ptr<Predicate>& predicate, bool enable_predicate_filter,
-                bool enable_prefetch, uint32_t prefetch_batch_count,
+                bool enable_prefetch, bool enable_late_materializing, uint32_t prefetch_batch_count,
                 uint32_t prefetch_max_parallel_num, bool enable_multi_thread_row_to_batch,
                 uint32_t row_to_batch_thread_number, const std::optional<std::string>& table_schema,
                 const std::shared_ptr<MemoryPool>& memory_pool,
@@ -59,9 +59,8 @@ class PAIMON_EXPORT ReadContext {
                 const std::shared_ptr<FileSystem>& specific_file_system,
                 const std::map<std::string, std::string>& fs_scheme_to_identifier_map,
                 const std::shared_ptr<RealtimeContext>& realtime_context,
-                const std::map<std::string, std::string>& options,
-                PrefetchCacheMode prefetch_cache_mode, const CacheConfig& cache_config,
-                const std::shared_ptr<Cache>& cache);
+                const std::map<std::string, std::string>& options, bool read_ahead_cache_enabled,
+                const CacheConfig& cache_config, const std::shared_ptr<Cache>& cache);
     ~ReadContext();
 
     const std::string& GetPath() const {
@@ -98,6 +97,9 @@ class PAIMON_EXPORT ReadContext {
     bool EnablePrefetch() const {
         return enable_prefetch_;
     }
+    bool EnableLateMaterializing() const {
+        return enable_late_materializing_;
+    }
     uint32_t GetPrefetchBatchCount() const {
         return prefetch_batch_count_;
     }
@@ -128,8 +130,8 @@ class PAIMON_EXPORT ReadContext {
         return realtime_context_;
     }
 
-    PrefetchCacheMode GetPrefetchCacheMode() const {
-        return prefetch_cache_mode_;
+    bool ReadAheadCacheEnabled() const {
+        return read_ahead_cache_enabled_;
     }
 
     const CacheConfig& GetCacheConfig() const {
@@ -164,6 +166,7 @@ class PAIMON_EXPORT ReadContext {
     std::shared_ptr<Predicate> predicate_;
     bool enable_predicate_filter_;
     bool enable_prefetch_;
+    bool enable_late_materializing_;
     uint32_t prefetch_batch_count_;
     uint32_t prefetch_max_parallel_num_;
     bool enable_multi_thread_row_to_batch_;
@@ -175,7 +178,7 @@ class PAIMON_EXPORT ReadContext {
     std::map<std::string, std::string> fs_scheme_to_identifier_map_;
     std::shared_ptr<RealtimeContext> realtime_context_;
     std::map<std::string, std::string> options_;
-    PrefetchCacheMode prefetch_cache_mode_;
+    bool read_ahead_cache_enabled_;
     CacheConfig cache_config_;
     std::shared_ptr<Cache> cache_;
     // Owns schema resources and releases ArrowSchema::release in destructor.
@@ -307,13 +310,22 @@ class PAIMON_EXPORT ReadContextBuilder {
     /// @return Reference to this builder for method chaining.
     ReadContextBuilder& EnablePrefetch(bool enabled);
 
-    /// Set prefetch cache mode for read operations.
-    ///
-    /// A prefetch cache is used to prebuffer data ranges before they are needed,
-    /// which can improve read performance by reducing redundant I/O operations.
-    /// @param mode (default: PrefetchCacheMode::ALWAYS)
+    /// Enable or disable late materialization (probe/payload two-phase reads). When enabled,
+    /// each parallel reader under the prefetch layer performs a probe read of predicate
+    /// columns first and only materializes payload columns for matched rows.
+    /// @param enabled Whether to enable late materialization (default: false)
     /// @return Reference to this builder for method chaining.
-    ReadContextBuilder& SetPrefetchCacheMode(PrefetchCacheMode mode);
+    /// @note Without a pushed-down predicate the late-materializing reader degrades to a
+    /// plain passthrough.
+    ReadContextBuilder& EnableLateMaterializing(bool enabled);
+
+    /// Enable or disable the read-ahead cache for read operations.
+    ///
+    /// A read-ahead cache is used to prebuffer data ranges before they are needed,
+    /// which can improve read performance by reducing redundant I/O operations.
+    /// @param enabled Whether to enable the read-ahead cache (default: true)
+    /// @return Reference to this builder for method chaining.
+    ReadContextBuilder& SetReadAheadCacheEnabled(bool enabled);
 
     /// Set the cache configuration for prefetch read operations.
     ///

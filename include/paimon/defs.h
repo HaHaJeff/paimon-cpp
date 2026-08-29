@@ -50,6 +50,8 @@ enum class FieldType {
     STRUCT = 15,
     BLOB = 16,
     VARIANT = 17,
+    /// Fixed-length dense vector represented by Arrow FixedSizeList.
+    VECTOR = 18,
     UNKNOWN = 128,
 };
 
@@ -154,6 +156,10 @@ struct PAIMON_EXPORT Options {
     /// 9, but the read and write speed will significantly decrease. Default value is 1.
     static const char FILE_COMPRESSION_ZSTD_LEVEL[];
 
+    /// "file.block-size" - File block size of format, default value of orc stripe is 64 MB,
+    /// parquet row group is 128 MB, and Mosaic row group is 256 MB.
+    static const char FILE_BLOCK_SIZE[];
+
     /// "manifest.target-file-size" - Suggested file size of a manifest file.
     /// Default value is 8MB.
     static const char MANIFEST_TARGET_FILE_SIZE[];
@@ -197,6 +203,14 @@ struct PAIMON_EXPORT Options {
     /// results retained per table, branch, and bucket. Setting it to 0 disables manifest entry
     /// cache. Default value is 0.
     static const char SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS[];
+
+    /// "scan.manifest-entry.lazy-decode.enabled" - Whether to deserialize only manifest entries
+    /// for the target bucket when rebuilding the cache. Default value is true.
+    static const char SCAN_MANIFEST_ENTRY_LAZY_DECODE_ENABLED[];
+
+    /// "prefetch.io-metrics.enabled" - Whether to collect per-I/O metrics for prefetch reads.
+    /// Default value is false.
+    static const char PREFETCH_IO_METRICS_ENABLED[];
 
     /// "read.batch-size" - Read batch size for any file format if it supports.
     /// The default value is 1024.
@@ -372,13 +386,33 @@ struct PAIMON_EXPORT Options {
     /// @note: bitmap64 dv is not supported.
     static const char DELETION_VECTOR_BITMAP64[];
 
-    ///  @note `CHANGELOG_PRODUCER` currently only support `none`
-    ///
     /// "changelog-producer" - Whether to double write to a changelog file. This changelog file
     /// keeps the details of data changes, it can be read directly during stream reads. This can be
     /// applied to tables with primary keys. Values can be "none", "input", "lookup",
     /// "full-compaction". Default value is "none".
+    /// @note C++ Paimon currently supports "none", "input", and "lookup".
     static const char CHANGELOG_PRODUCER[];
+
+    /// "changelog-producer.row-deduplicate" - Whether to generate update-before and update-after
+    /// changelog records when the row has not changed. This option is only valid for "lookup" or
+    /// "full-compaction" changelog producers. Default value is "false".
+    static const char CHANGELOG_PRODUCER_ROW_DEDUPLICATE[];
+
+    /// "changelog-producer.row-deduplicate-ignore-fields" - Comma-separated fields to ignore when
+    /// comparing rows for changelog deduplication. This option is only valid when
+    /// "changelog-producer.row-deduplicate" is "true".
+    static const char CHANGELOG_PRODUCER_ROW_DEDUPLICATE_IGNORE_FIELDS[];
+
+    /// "changelog-file.prefix" - Specify the file name prefix of changelog files. Default value is
+    /// "changelog-".
+    static const char CHANGELOG_FILE_PREFIX[];
+
+    /// "changelog-file.format" - Specify the file format of changelog files. No default value.
+    static const char CHANGELOG_FILE_FORMAT[];
+
+    /// "changelog-file.compression" - Specify the compression of changelog files. No default
+    /// value.
+    static const char CHANGELOG_FILE_COMPRESSION[];
 
     /// "force-lookup" - Whether to force the use of lookup for compaction. Default value is
     /// "false".
@@ -402,6 +436,10 @@ struct PAIMON_EXPORT Options {
 
     /// "file-index.read.enabled" - Whether enabled read file index. Default value is "true".
     static const char FILE_INDEX_READ_ENABLED[];
+
+    /// "file-index.in-manifest-threshold" - The threshold to store file index bytes in the
+    /// manifest. Default value is 500B.
+    static const char FILE_INDEX_IN_MANIFEST_THRESHOLD[];
 
     /// "data-file.external-paths" - The external paths where the data of this table will be
     /// written, multiple elements separated by commas.
@@ -552,9 +590,17 @@ struct PAIMON_EXPORT Options {
     /// "scan.timestamp" can be used as an alternative string input for the same mode.
     static const char SCAN_TIMESTAMP_MILLIS[];
 
+    /// "realtime.enabled" - Whether real-time write, commit, and read operations are enabled.
+    /// Default value is "false".
+    static const char REALTIME_ENABLED[];
+
     /// "realtime.read-view-ttl" - Lifetime of a real-time memory view pinned by scan planning
     /// before reader creation. Default value is "5 min".
     static const char REALTIME_READ_VIEW_TTL[];
+
+    /// "realtime.store.stats-mode" - Statistics collected by the default real-time store.
+    /// Supported values are "none" and "full". Default value is "none".
+    static const char REALTIME_STORE_STATS_MODE[];
 
     /// "scan.timestamp" - Optional timestamp string used in case of "from-timestamp" scan mode,
     /// as an alternative to "scan.timestamp-millis".

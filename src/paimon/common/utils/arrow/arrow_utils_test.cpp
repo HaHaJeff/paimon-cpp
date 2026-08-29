@@ -20,6 +20,7 @@
 #include "paimon/common/utils/arrow/arrow_utils.h"
 
 #include "arrow/api.h"
+#include "arrow/c/bridge.h"
 #include "arrow/ipc/api.h"
 #include "gtest/gtest.h"
 #include "paimon/common/types/data_field.h"
@@ -249,6 +250,42 @@ TEST(ArrowUtilsTest, TestCheckNullableMatchWithList) {
     }
 }
 
+TEST(ArrowUtilsTest, TestCheckNullableMatchRejectsNullVectorElement) {
+    auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
+    auto vector_field = arrow::field("embedding", vector_type);
+    arrow::FloatBuilder values_builder;
+    ASSERT_TRUE(values_builder.Append(1.0f).ok());
+    ASSERT_TRUE(values_builder.AppendNull().ok());
+    ASSERT_TRUE(values_builder.Append(3.0f).ok());
+    std::shared_ptr<arrow::Array> values = values_builder.Finish().ValueOrDie();
+    auto vector_data = arrow::ArrayData::Make(vector_type, 1, {nullptr}, {values->data()}, 0);
+    auto vector_array = arrow::MakeArray(vector_data);
+    auto struct_array = arrow::StructArray::Make({vector_array}, {vector_field}).ValueOrDie();
+
+    ASSERT_NOK_WITH_MSG(
+        ArrowUtils::CheckNullabilityMatch(arrow::schema({vector_field}), struct_array),
+        "VECTOR field embedding is invalid: VECTOR cannot contain null elements");
+}
+
+// Arrow accepts a FixedSizeList whose child is shorter than `length * list_size` when importing
+// it over the C data interface, so the nullability check must reject it rather than scan past the
+// end of the child.
+TEST(ArrowUtilsTest, TestCheckNullableMatchRejectsTruncatedVector) {
+    auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
+    auto vector_field = arrow::field("embedding", vector_type);
+    arrow::FloatBuilder values_builder;
+    ASSERT_TRUE(values_builder.AppendValues({1.0f, 2.0f, 3.0f}).ok());
+    std::shared_ptr<arrow::Array> values = values_builder.Finish().ValueOrDie();
+    auto vector_data = arrow::ArrayData::Make(vector_type, /*length=*/2, {nullptr},
+                                              {values->data()}, /*null_count=*/0);
+    auto vector_array = arrow::MakeArray(vector_data);
+    auto struct_array = arrow::StructArray::Make({vector_array}, {vector_field}).ValueOrDie();
+
+    ASSERT_NOK_WITH_MSG(
+        ArrowUtils::CheckNullabilityMatch(arrow::schema({vector_field}), struct_array),
+        "VECTOR field embedding is invalid: VECTOR holds 3 elements while 2 rows of dimension 3");
+}
+
 TEST(ArrowUtilsTest, TestCheckNullableMatchWithMap) {
     auto key_field = arrow::field("key", arrow::int32(), /*nullable=*/false);
     auto value_field = arrow::field("value", arrow::int32(), /*nullable=*/true);
@@ -465,6 +502,33 @@ TEST(ArrowUtilsTest, TestNormalizeRecordBatchOffsets) {
     ASSERT_EQ(unchanged_batch.get(), normalized_batch.get());
 }
 
+TEST(ArrowUtilsTest, TestNormalizeArrayOffsetsSlicesZeroOffsetStructChildren) {
+    std::shared_ptr<arrow::Array> ints =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::int32(), "[0, 1, 2, 3]").ValueOrDie();
+    std::shared_ptr<arrow::Array> texts =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::utf8(), R"(["a", "b", "c", "d"])")
+            .ValueOrDie();
+    std::shared_ptr<arrow::Array> array =
+        arrow::StructArray::Make({ints, texts}, std::vector<std::string>{"i", "s"}).ValueOrDie();
+    std::shared_ptr<arrow::Array> sliced = array->Slice(/*offset=*/0, /*length=*/2);
+    ASSERT_EQ(0, sliced->offset());
+    ASSERT_EQ(4, sliced->data()->child_data[0]->length);
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> normalized,
+                         ArrowUtils::NormalizeArrayOffsets(sliced, arrow::default_memory_pool()));
+    ASSERT_TRUE(normalized->Equals(sliced));
+    ASSERT_EQ(0, normalized->offset());
+    ASSERT_EQ(2, normalized->data()->child_data[0]->length);
+    ASSERT_EQ(2, normalized->data()->child_data[1]->length);
+
+    ::ArrowArray c_array = {};
+    ::ArrowSchema c_schema = {};
+    ASSERT_TRUE(arrow::ExportArray(*normalized, &c_array, &c_schema).ok());
+    std::shared_ptr<arrow::RecordBatch> batch =
+        arrow::ImportRecordBatch(&c_array, &c_schema).ValueOrDie();
+    ASSERT_EQ(2, batch->num_rows());
+}
+
 namespace {
 
 /// A buffer that rebasing must expose as a view into the source.
@@ -523,6 +587,9 @@ std::vector<NormalizeCase> NormalizeCases() {
         {arrow::list(arrow::utf8()),
          R"([["a"], null, ["bb", "ccc"], [], ["d"], null, ["e", "f"], [], ["g"], ["h"]])",
          {{{0}, 2}}},
+        {arrow::fixed_size_list(arrow::int32(), 2),
+         "[[0, 1], null, [2, 3], [4, 5], [6, 7], null, [8, 9], [10, 11], [12, 13], [14, 15]]",
+         {{{0}, 1}}},
         {arrow::struct_({int_field, text_field}),
          R"([{"a": 0, "b": "x"}, null, {"a": 2, "b": null}, {"a": null, "b": "yyy"},
              {"a": 4, "b": "z"}, {"a": 5, "b": ""}, null, {"a": 7, "b": "w"},
@@ -757,6 +824,14 @@ TEST(ArrowUtilsTest, TestEqualsIgnoreNullable) {
         ASSERT_FALSE(ArrowUtils::EqualsIgnoreNullable(struct_type1, struct_type2));
         ASSERT_TRUE(ArrowUtils::EqualsIgnoreNullable(struct_type1, struct_type3));
         ASSERT_FALSE(ArrowUtils::EqualsIgnoreNullable(struct_type1, struct_type4));
+    }
+    {
+        auto vector3 = arrow::fixed_size_list(arrow::float32(), 3);
+        auto vector3_non_null =
+            arrow::fixed_size_list(arrow::field("item", arrow::float32(), false), 3);
+        auto vector5 = arrow::fixed_size_list(arrow::float32(), 5);
+        ASSERT_TRUE(ArrowUtils::EqualsIgnoreNullable(vector3, vector3_non_null));
+        ASSERT_FALSE(ArrowUtils::EqualsIgnoreNullable(vector3, vector5));
     }
     {
         // test complex

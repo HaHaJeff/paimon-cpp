@@ -54,8 +54,9 @@ struct DeletionFile;
 /// splits)->CompleteRowKindBatchReader->(PredicateBatchReader)
 /// ->ConcatBatchReader across
 /// files->FieldMappingReader->(ApplyBitmapIndexBatchReader)->(CompleteRowTrackingFieldsBatchReader)
-/// ->(ShreddingFileReader)->(MapSharedShreddingFileReader)->(DelegatingPrefetchReader)
-/// ->(PrefetchFileBatchReader)->FormatReader
+/// ->(ShreddingFileReader)->(VectorFileBatchReader)
+/// ->(DelegatingPrefetchReader)->(PrefetchFileBatchReader)
+/// ->(LateMaterializingFileBatchReader)->FormatReader
 
 class RawFileSplitRead : public AbstractSplitRead {
  public:

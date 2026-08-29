@@ -255,9 +255,9 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
                                                      partition_values.end());
     auto c_write_schema = std::make_unique<ArrowSchema>();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*write_schema_, c_write_schema.get()));
-    return RealtimeAppendOnlyWriter::Create(partition_map, bucket, std::move(c_write_schema),
-                                            realtime_context_, writer, write_schema_,
-                                            options_.ToMap(), pool_);
+    return RealtimeAppendOnlyWriter::Create(
+        partition_map, bucket, std::move(c_write_schema), realtime_context_, writer, write_schema_,
+        options_.GetRealtimeStoreStatisticsMode(), options_.ToMap(), pool_);
 }
 
 Result<AppendOnlyFileStoreWrite::WriterFactory> AppendOnlyFileStoreWrite::GetDataFileWriterFactory(
@@ -290,14 +290,8 @@ Result<std::unique_ptr<BatchReader>> AppendOnlyFileStoreWrite::CreateFilesReader
         .WithMemoryPool(pool_);
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<ReadContext> read_context, context_builder.Finish());
     std::map<std::string, std::string> options = options_.ToMap();
-    // TODO(xinyu.lxy): temporarily disabled pre-buffer for parquet, which may cause high
-    // memory usage during compaction. Will fix via parquet format refactor.
-    auto new_options = options;
-    if (new_options.find("parquet.read.enable-pre-buffer") == new_options.end()) {
-        new_options["parquet.read.enable-pre-buffer"] = "false";
-    }
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<InternalReadContext> internal_read_context,
-                           InternalReadContext::Create(read_context, table_schema_, new_options));
+                           InternalReadContext::Create(read_context, table_schema_, options));
     auto read = std::make_unique<RawFileSplitRead>(file_store_path_factory_, internal_read_context,
                                                    pool_, compact_executor_);
 

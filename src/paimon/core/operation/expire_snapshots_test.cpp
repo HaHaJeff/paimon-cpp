@@ -148,7 +148,7 @@ class ExpireSnapshotsTest : public testing::Test {
             /*embedded_index=*/nullptr, /*file_source=*/std::nullopt,
             /*external_path=*/std::nullopt,
             /*value_stats_cols=*/std::nullopt, /*first_row_id=*/std::nullopt,
-            /*write_cols=*/std::nullopt);
+            /*write_cols=*/std::nullopt, /*column_max_sequence_numbers=*/std::nullopt);
         return ManifestEntry(kind, row, bucket, /*total_buckets=*/3, data_file_meta);
     }
 
@@ -170,7 +170,7 @@ TEST_F(ExpireSnapshotsTest, TestInvalidInput) {
     {
         ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({}));
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         ASSERT_OK_AND_ASSIGN(int32_t count, expire.Expire());
         ASSERT_EQ(count, 0);
     }
@@ -178,7 +178,7 @@ TEST_F(ExpireSnapshotsTest, TestInvalidInput) {
         ASSERT_OK_AND_ASSIGN(CoreOptions options,
                              CoreOptions::FromMap({{Options::SNAPSHOT_NUM_RETAINED_MIN, "0"}}));
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         ASSERT_NOK(expire.Expire());
     }
     {
@@ -186,7 +186,7 @@ TEST_F(ExpireSnapshotsTest, TestInvalidInput) {
                              CoreOptions::FromMap({{Options::SNAPSHOT_NUM_RETAINED_MIN, "10"},
                                                    {Options::SNAPSHOT_NUM_RETAINED_MAX, "9"}}));
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         ASSERT_NOK(expire.Expire());
     }
     {
@@ -194,7 +194,7 @@ TEST_F(ExpireSnapshotsTest, TestInvalidInput) {
                              CoreOptions::FromMap({{Options::SNAPSHOT_NUM_RETAINED_MIN, "10"},
                                                    {Options::SNAPSHOT_NUM_RETAINED_MAX, "10"}}));
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         ASSERT_OK_AND_ASSIGN(int32_t count, expire.Expire());
         ASSERT_EQ(count, 0);
     }
@@ -204,7 +204,7 @@ TEST_F(ExpireSnapshotsTest, TestInvalidInput) {
                                                    {Options::SNAPSHOT_NUM_RETAINED_MIN, "10"},
                                                    {Options::SNAPSHOT_NUM_RETAINED_MAX, "10"}}));
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         ASSERT_NOK(expire.Expire());
     }
     {
@@ -212,7 +212,7 @@ TEST_F(ExpireSnapshotsTest, TestInvalidInput) {
                              CoreOptions::FromMap({{Options::SNAPSHOT_NUM_RETAINED_MIN, "10"},
                                                    {Options::SNAPSHOT_NUM_RETAINED_MAX, "10"}}));
         ExpireSnapshots expire(nullptr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         ASSERT_NOK(expire.Expire());
     }
 }
@@ -222,7 +222,7 @@ TEST_F(ExpireSnapshotsTest, TestGetDataFileToDelete) {
     ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({}));
     {
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         std::map<std::string, ManifestEntry> data_file_to_delete;
         std::vector<ManifestEntry> data_file_entries;
         data_file_entries.push_back(CreateManifestEntry("file1", /*bucket=*/0, FileKind::Delete()));
@@ -237,7 +237,7 @@ TEST_F(ExpireSnapshotsTest, TestGetDataFileToDelete) {
     }
     {
         ExpireSnapshots expire(mgr, path_factory_, manifest_list_, manifest_file_, fs_,
-                               options.GetExpireConfig(), executor_);
+                               options.GetExpireConfig(), options.RealtimeEnabled(), executor_);
         std::map<std::string, ManifestEntry> data_file_to_delete;
         std::vector<ManifestEntry> data_file_entries;
         data_file_entries.push_back(CreateManifestEntry("file1", /*bucket=*/0, FileKind::Add()));

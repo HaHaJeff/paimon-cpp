@@ -27,87 +27,31 @@
 #include <vector>
 
 #include "paimon/fs/file_system.h"
-#include "paimon/memory/bytes.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/result.h"
 #include "paimon/status.h"
+#include "paimon/utils/prefetch_cache_config.h"
 #include "paimon/visibility.h"
 
 namespace paimon {
 
-/// PrefetchCacheMode
-/// Cache prefetch switch modes.
-/// Controls whether to enable cache prefetching under different circumstances, such as queries with
-/// predicates or bitmap indexes.
-///
-/// - ALWAYS: Enable cache in all scenarios.
-/// - EXCLUDE_PREDICATE: Disable cache when query has predicates.
-/// - EXCLUDE_BITMAP: Disable cache when using bitmap index.
-/// - EXCLUDE_BITMAP_OR_PREDICATE: Disable cache if query has predicates or bitmap index.
-/// - NEVER: Always disable cache.
-enum class PAIMON_EXPORT PrefetchCacheMode {
-    ALWAYS = 1,
-    EXCLUDE_PREDICATE = 2,
-    EXCLUDE_BITMAP = 3,
-    EXCLUDE_BITMAP_OR_PREDICATE = 4,
-    NEVER = 5
-};
+class Metrics;
 
-/// Configuration parameters for the read-ahead cache behavior.
-///
-/// This struct controls various limits and prefetching strategies used by
-/// ReadAheadCache to balance memory usage, I/O efficiency, and latency hiding.
-class PAIMON_EXPORT CacheConfig {
+/// Metric names for the read-ahead cache.
+class PAIMON_EXPORT ReadAheadCacheMetrics {
  public:
-    CacheConfig();
-    CacheConfig(uint64_t buffer_size_limit, uint64_t range_size_limit, uint64_t hole_size_limit,
-                uint64_t pre_buffer_limit);
-
-    /// Returns the maximum total size (in bytes) of cached data.
-    uint64_t GetBufferSizeLimit() const {
-        return buffer_size_limit_;
-    }
-
-    /// Sets the maximum total size (in bytes) of cached data.
-    void SetBufferSizeLimit(uint64_t buffer_size_limit) {
-        buffer_size_limit_ = buffer_size_limit;
-    }
-
-    /// Returns the maximum allowed size (in bytes) for a single cached range.
-    uint64_t GetRangeSizeLimit() const {
-        return range_size_limit_;
-    }
-
-    /// Sets the maximum allowed size (in bytes) for a single cached range.
-    void SetRangeSizeLimit(uint64_t range_size_limit) {
-        range_size_limit_ = range_size_limit;
-    }
-
-    /// Returns the maximum gap size (in bytes) considered mergeable between adjacent ranges.
-    uint64_t GetHoleSizeLimit() const {
-        return hole_size_limit_;
-    }
-
-    /// Sets the maximum gap size (in bytes) considered mergeable between adjacent ranges.
-    void SetHoleSizeLimit(uint64_t hole_size_limit) {
-        hole_size_limit_ = hole_size_limit;
-    }
-
-    /// Returns the maximum size to pre-buffer ahead of the current read position.
-    uint64_t GetPreBufferLimit() const {
-        return pre_buffer_limit_;
-    }
-
-    /// Sets the maximum size to pre-buffer ahead of the current read position.
-    void SetPreBufferLimit(uint64_t pre_buffer_limit) {
-        pre_buffer_limit_ = pre_buffer_limit;
-    }
-
- private:
-    uint64_t buffer_size_limit_;
-    uint64_t range_size_limit_;
-    uint64_t hole_size_limit_;
-    uint64_t pre_buffer_limit_;
+    /// Number of non-zero-sized Read() requests issued to the cache.
+    static inline const char READ_COUNT[] = "read-ahead-cache.read.count";
+    /// Total bytes requested by the Read() requests issued to the cache.
+    static inline const char READ_BYTES[] = "read-ahead-cache.read.bytes";
+    static inline const char READ_HITS[] = "read-ahead-cache.read.hits";
+    static inline const char READ_HIT_BYTES[] = "read-ahead-cache.read.hit-bytes";
+    static inline const char READ_MISSES[] = "read-ahead-cache.read.misses";
+    static inline const char READ_MISS_BYTES[] = "read-ahead-cache.read.miss-bytes";
+    /// Number of prefetch IO requests actually issued to the underlying stream.
+    static inline const char IO_COUNT[] = "read-ahead-cache.io.count";
+    /// Total bytes requested by the prefetch IOs issued to the underlying stream.
+    static inline const char IO_BYTES[] = "read-ahead-cache.io.bytes";
 };
 
 /// A byte range with offset and length.
@@ -132,22 +76,15 @@ struct PAIMON_EXPORT ByteRange {
     }
 };
 
-/// A byte slice with buffer, offset and length.
-struct PAIMON_EXPORT ByteSlice {
-    std::shared_ptr<Bytes> buffer = nullptr;
-    uint64_t offset = 0;
-    uint64_t length = 0;
-};
-
 /// A read cache designed to hide IO latencies when reading.
 /// Prefetching strategy: When a range is read, the cache will prefetch up to
 /// `pre_buffer_range_count` additional adjacent ranges ahead of the requested offset. This helps
 /// hide I/O latency for sequential access. Example: If you read range [0, 100), and
 /// pre_buffer_range_count=2, the next two configured ranges will also be prefetched.
 ///
-/// Eviction policy: The cache uses a simple FIFO eviction policy based on total cached byte size.
-/// When adding new ranges would exceed `buffer_size_limit`, the oldest cached ranges are evicted
-/// first until there is enough space for the new data.
+/// The cache never evicts: every published range stays cached until
+/// ReleaseBuffers() or Reset(). It is meant to hold the prefetched ranges of
+/// a single data file, whose size is bounded by the reader's scan scope.
 class PAIMON_EXPORT ReadAheadCache {
  public:
     /// Construct a read cache with given options
@@ -162,11 +99,30 @@ class PAIMON_EXPORT ReadAheadCache {
     /// on the cache configuration.
     Status Init(std::vector<ByteRange>&& ranges);
 
-    /// Read a range previously provided to Init().
+    /// Read a range previously provided to Init(), copying the cached data
+    /// directly into the given destination buffer.
+    ///
+    /// Multi-segment hits are copied into `dest` segment by segment, without
+    /// an intermediate assembled buffer.
     /// @param range The byte range to read.
-    /// @return The byte slice containing the requested data. If the data is not yet cached
-    /// (cache miss), the returned `ByteSlice` will have a null buffer (`buffer == nullptr`)
-    Result<ByteSlice> Read(const ByteRange& range);
+    /// @param dest Destination buffer with at least `range.length` bytes.
+    /// @return true if the range was served from the cache and `dest` was
+    /// filled; false on cache miss (`dest` is left untouched).
+    Result<bool> Read(const ByteRange& range, char* dest);
+
+    /// Start fetching the first batch of pending ranges immediately.
+    /// Init() only registers the ranges; without Warmup() the first fetch starts
+    /// when the first Read() arrives, racing the caller's own miss fetch.
+    void Warmup();
+
+    /// Collect hit/miss counters of Read() calls and the prefetch IO
+    /// counters into the given metrics as counters named after
+    /// `ReadAheadCacheMetrics`. Only reads issued through Read() are counted
+    /// as hits/misses; prefetch fetches dispatched by the cache itself are
+    /// counted in the fetch counters instead.
+    /// @param metrics The metrics to write the counters into. A null
+    /// pointer or a null shared pointer is a no-op.
+    void CollectMetrics(std::shared_ptr<Metrics>* metrics) const;
 
     /// Reset the cache to its initial state, clearing all cached data and configuration.
     ///
@@ -174,6 +130,14 @@ class PAIMON_EXPORT ReadAheadCache {
     /// clears all cached entries, and resets the internal state so that Init() can be called again.
     /// After calling Reset, the cache can be safely re-initialized with new ranges.
     void Reset();
+
+    /// Release all cached buffers and pending ranges while keeping the hit/miss
+    /// counters intact.
+    ///
+    /// Unlike Reset(), the counters recorded by Read() remain readable through
+    /// CollectMetrics() afterwards, so this is safe to call when the owning reader
+    /// is closed while its metrics are still being aggregated.
+    void ReleaseBuffers();
 
  private:
     class Impl;

@@ -58,6 +58,10 @@ std::map<std::string, std::string> ReadOptimizedSystemTable::ReadOptimizedOption
 
 Result<std::unique_ptr<TableScan>> ReadOptimizedSystemTable::NewScan(
     const std::shared_ptr<ScanContext>& context) const {
+    if (context->GetRealtimeContext() && !table_schema_->PrimaryKeys().empty()) {
+        return Status::NotImplemented(
+            "PK real-time union read does not support read-optimized scans");
+    }
     auto options = ReadOptimizedOptions();
     ScanContextBuilder builder(table_path_);
     builder.SetOptions(options)
@@ -109,7 +113,7 @@ Result<std::unique_ptr<TableRead>> ReadOptimizedSystemTable::NewRead(
         .WithExecutor(context->GetExecutor())
         .WithFileSystem(context->GetSpecificFileSystem())
         .WithFileSystemSchemeToIdentifierMap(context->GetFileSystemSchemeToIdentifierMap())
-        .SetPrefetchCacheMode(context->GetPrefetchCacheMode())
+        .SetReadAheadCacheEnabled(context->ReadAheadCacheEnabled())
         .WithCacheConfig(context->GetCacheConfig())
         .WithCache(context->GetCache())
         .SetReadFieldNames(context->GetReadFieldNames())

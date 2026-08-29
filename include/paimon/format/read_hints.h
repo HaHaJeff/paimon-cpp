@@ -18,18 +18,18 @@
 
 #pragma once
 
+#include "paimon/visibility.h"
+
 namespace paimon {
 
-/// Metrics to measure scan operation.
-class ScanMetrics {
- public:
-    static constexpr char LAST_SCAN_DURATION[] = "lastScanDuration";
-    // Histogram metric for scan plan duration (milliseconds).
-    static constexpr char SCAN_DURATION[] = "scanDuration";
-    static constexpr char LAST_SCANNED_SNAPSHOT_ID[] = "lastScannedSnapshotId";
-    static constexpr char LAST_SCANNED_MANIFESTS[] = "lastScannedManifests";
-    static constexpr char LAST_SCAN_SKIPPED_TABLE_FILES[] = "lastScanSkippedTableFiles";
-    static constexpr char LAST_SCAN_RESULTED_TABLE_FILES[] = "lastScanResultedTableFiles";
+/// Runtime state of the framework read path, passed to format layers via
+/// `ReaderBuilder::WithReadHints` so each format can adapt its internal behavior
+/// (e.g. whether parquet enables its own pre-buffering).
+struct PAIMON_EXPORT ReadHints {
+    /// Whether framework-level prefetch is enabled for this read.
+    bool prefetch_enabled = false;
+    /// Whether the shared read-ahead cache is enabled for this read.
+    bool read_ahead_cache_enabled = false;
 };
 
 }  // namespace paimon

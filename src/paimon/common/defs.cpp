@@ -46,6 +46,7 @@ const char Options::PAGE_SIZE[] = "page-size";
 const char Options::PARTITION_DEFAULT_NAME[] = "partition.default-name";
 const char Options::FILE_COMPRESSION[] = "file.compression";
 const char Options::FILE_COMPRESSION_ZSTD_LEVEL[] = "file.compression.zstd-level";
+const char Options::FILE_BLOCK_SIZE[] = "file.block-size";
 const char Options::MANIFEST_TARGET_FILE_SIZE[] = "manifest.target-file-size";
 const char Options::MANIFEST_FORMAT[] = "manifest.format";
 const char Options::MANIFEST_COMPRESSION[] = "manifest.compression";
@@ -59,6 +60,9 @@ const char Options::SCAN_SNAPSHOT_ID[] = "scan.snapshot-id";
 const char Options::SCAN_MODE[] = "scan.mode";
 const char Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS[] =
     "scan.manifest-entry-cache.max-snapshots";
+const char Options::SCAN_MANIFEST_ENTRY_LAZY_DECODE_ENABLED[] =
+    "scan.manifest-entry.lazy-decode.enabled";
+const char Options::PREFETCH_IO_METRICS_ENABLED[] = "prefetch.io-metrics.enabled";
 const char Options::READ_BATCH_SIZE[] = "read.batch-size";
 const char Options::WRITE_BATCH_SIZE[] = "write.batch-size";
 const char Options::WRITE_BUFFER_SIZE[] = "write-buffer-size";
@@ -92,6 +96,12 @@ const char Options::DELETION_VECTOR_INDEX_FILE_TARGET_SIZE[] =
     "deletion-vector.index-file.target-size";
 const char Options::DELETION_VECTOR_BITMAP64[] = "deletion-vectors.bitmap64";
 const char Options::CHANGELOG_PRODUCER[] = "changelog-producer";
+const char Options::CHANGELOG_PRODUCER_ROW_DEDUPLICATE[] = "changelog-producer.row-deduplicate";
+const char Options::CHANGELOG_PRODUCER_ROW_DEDUPLICATE_IGNORE_FIELDS[] =
+    "changelog-producer.row-deduplicate-ignore-fields";
+const char Options::CHANGELOG_FILE_PREFIX[] = "changelog-file.prefix";
+const char Options::CHANGELOG_FILE_FORMAT[] = "changelog-file.format";
+const char Options::CHANGELOG_FILE_COMPRESSION[] = "changelog-file.compression";
 const char Options::FORCE_LOOKUP[] = "force-lookup";
 const char Options::PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE[] =
     "partial-update.remove-record-on-delete";
@@ -100,6 +110,7 @@ const char Options::PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP[] =
 const char Options::SCAN_FALLBACK_BRANCH[] = "scan.fallback-branch";
 const char Options::BRANCH[] = "branch";
 const char Options::FILE_INDEX_READ_ENABLED[] = "file-index.read.enabled";
+const char Options::FILE_INDEX_IN_MANIFEST_THRESHOLD[] = "file-index.in-manifest-threshold";
 const char Options::DATA_FILE_EXTERNAL_PATHS[] = "data-file.external-paths";
 const char Options::DATA_FILE_EXTERNAL_PATHS_STRATEGY[] = "data-file.external-paths.strategy";
 const char Options::DATA_FILE_PREFIX[] = "data-file.prefix";
@@ -147,7 +158,9 @@ const char Options::AGGREGATION_REMOVE_RECORD_ON_DELETE[] = "aggregation.remove-
 const char Options::TABLE_READ_SEQUENCE_NUMBER_ENABLED[] = "table-read.sequence-number.enabled";
 const char Options::KEY_VALUE_SEQUENCE_NUMBER_ENABLED[] = "key-value.sequence_number.enabled";
 const char Options::SCAN_TIMESTAMP_MILLIS[] = "scan.timestamp-millis";
+const char Options::REALTIME_ENABLED[] = "realtime.enabled";
 const char Options::REALTIME_READ_VIEW_TTL[] = "realtime.read-view-ttl";
+const char Options::REALTIME_STORE_STATS_MODE[] = "realtime.store.stats-mode";
 const char Options::SCAN_TIMESTAMP[] = "scan.timestamp";
 const char Options::SCAN_TAG_NAME[] = "scan.tag-name";
 const char Options::WRITE_ONLY[] = "write-only";
