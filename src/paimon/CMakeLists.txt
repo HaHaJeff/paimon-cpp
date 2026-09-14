@@ -762,6 +762,7 @@ if(PAIMON_BUILD_TESTS)
                     core/casting/cast_executor_test.cpp
                     core/casting/casted_row_test.cpp
                     core/casting/casting_utils_test.cpp
+                    core/catalog/catalog_snapshot_commit_test.cpp
                     core/catalog/commit_table_request_test.cpp
                     core/catalog/renaming_snapshot_commit_test.cpp
                     core/catalog/file_system_catalog_test.cpp
