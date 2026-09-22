@@ -406,6 +406,23 @@ TEST_P(PaimonReadCompatInteTest, ReadsCompatibleTypeValues) {
     }
 }
 
+TEST_P(PaimonReadCompatInteTest, ReadsTimeValues) {
+    const CompatibilityParam& param = GetParam();
+    if (param.file_format != "parquet") {
+        GTEST_SKIP() << "TIME reading is only supported for Parquet";
+    }
+    for (int32_t precision : {0, 3, 6, 9}) {
+        std::string field_name = "f_time_" + std::to_string(precision);
+        ASSERT_OK_AND_ASSIGN(auto result,
+                             ReadTable(param, param.writer_prefix + "_time_types", {field_name}));
+        auto rows = GetOnlyStructChunk(result);
+        ASSERT_TRUE(rows);
+        ASSERT_EQ(rows->length(), 2);
+        AssertFieldEqualsJson(rows, field_name, arrow::time32(arrow::TimeUnit::MILLI),
+                              precision == 0 ? "[45296000, null]" : "[45296123, null]");
+    }
+}
+
 TEST_P(PaimonReadCompatInteTest, ReadsBlobValues) {
     const CompatibilityParam& param = GetParam();
 
@@ -566,20 +583,30 @@ std::vector<UnsupportedReadParam> UnsupportedReadParams() {
     const std::vector<UnsupportedReadCase> read_cases = {
         {"ArrayBlob", "array_blob_types", "f_array_blob",
          "BLOB field must be a top-level field or the direct value of a top-level MAP field"},
-        {"TimePrecision0", "time_types", "f_time_0", "Unsupported type: TIME"},
-        {"TimePrecision3", "time_types", "f_time_3", "Unsupported type: TIME"},
-        {"TimePrecision6", "time_types", "f_time_6", "Unsupported type: TIME"},
-        {"TimePrecision9", "time_types", "f_time_9", "Unsupported type: TIME"},
+        {"TimePrecision0", "time_types", "f_time_0", ""},
+        {"TimePrecision3", "time_types", "f_time_3", ""},
+        {"TimePrecision6", "time_types", "f_time_6", ""},
+        {"TimePrecision9", "time_types", "f_time_9", ""},
     };
     std::vector<UnsupportedReadParam> result;
     for (const CompatibilityParam& param : CompatibilityParams()) {
         for (const UnsupportedReadCase& read_case : read_cases) {
+            bool is_time = read_case.table_suffix == "time_types";
+            if (is_time && param.file_format == "parquet") {
+                continue;
+            }
             // Java Avro cannot create TIME(6/9), so its negative table contains TIME(0/3) only.
             if (param.file_format == "avro" &&
                 (read_case.name == "TimePrecision6" || read_case.name == "TimePrecision9")) {
                 continue;
             }
-            result.push_back({param.file_format, param.writer_prefix, read_case});
+            auto expected_case = read_case;
+            if (is_time) {
+                expected_case.expected_error = param.file_format == "orc"
+                                                   ? "Unknown or unsupported Arrow type: time32[ms]"
+                                                   : "invalid avro logical type";
+            }
+            result.push_back({param.file_format, param.writer_prefix, expected_case});
         }
     }
     return result;
